@@ -1,0 +1,17 @@
+{
+  "productName": "rbxport (Fork)",
+  "identifier": "com.mimen.rbxport.fork",
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "signingIdentity": "Apple Development: Created via API (5VG478JB32)"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZFQ0MzOTE4RjY1NUQzQjcKUldTMzAxWDJHRG5NYnBOaXZWeU91UGVKUnJUbVZtUUt3NjdIamVTMVlxU2h4eUZvNC9tMURVaHAK",
+      "endpoints": ["https://github.com/mimen/rbxport/releases/latest/download/latest.json"]
+    }
+  }
+}
