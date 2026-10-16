@@ -63,6 +63,12 @@ sentry = { version = "0.46", default-features = false, features = ["backtrace", 
 
 zip = { version = "4.6.1", default-features = false, features = ["deflate"] }
 tempfile = "3"
+# fork: server-mode (src-tauri/src/fork/)
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+if-addrs = "0.15"
+tokio = { version = "1", features = ["macros", "net", "sync"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
@@ -71,6 +77,7 @@ rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"]
 tauri = { version = "2", features = ["test"] }
 # The database server's side of a link test: what a player is answered.
 rbl-dbserver = { path = "../crates/rbl-dbserver" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] } # fork: server-mode tests
 
 # macOS builds menu items on the main thread only, and the test harness runs
 # every test on a spawned one. Without a harness, `main` is the main thread.

@@ -52,6 +52,7 @@ pub mod state;
 mod test_port;
 mod elevated_update;
 mod update;
+mod fork; // fork: server-mode
 
 pub use error::{AppError, AppResult, ErrorKind};
 
@@ -418,6 +419,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(window_geometry())
+        .plugin(crate::fork::plugin()) // fork: server-mode
         .manage(Arc::new(AppState::new()))
         .manage(Arc::new(crate::player::Player::default()))
         .manage(Arc::new(crate::preview::Preview::default()))

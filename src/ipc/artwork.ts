@@ -10,11 +10,13 @@
  * scheme, so this returns nothing and the tint stands in.
  */
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { remoteArtworkUrl, remoteHost } from "./fork/remote"; // fork: server-mode
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export function artworkUrl(trackId: string): string | undefined {
   if (!isTauri) return undefined;
+  if (remoteHost()) return remoteArtworkUrl(trackId); // fork: server-mode
   // The scheme's root as this platform's webview spells it: `rbl://localhost/`
   // on macOS and Linux, `http://rbl.localhost/` on Windows, where WebView2
   // does not load custom schemes and `rbl://` fails as an unknown scheme.

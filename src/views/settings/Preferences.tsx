@@ -40,12 +40,13 @@ import { RekordboxPane } from "./RekordboxPane";
 import styles from "./Preferences.module.css";
 import { Button } from "./controls";
 import { ViewPane, VIEW_TABS, type ViewTab } from "./ViewPane";
+import { ServerPane, ServerIcon } from "@/fork/ServerPane"; // fork: server-mode
 
 /**
  * The sidebar, in the capture's order and wording, less PLAN and CLOUD, and
  * with About at the end — ours, for the version and the update check.
  */
-export type Pane = "view" | "audio" | "analysis" | "djSystem" | "link" | "keyboard" | "advanced" | "backups" | "usbExport" | "rekordbox" | "about";
+export type Pane = "view" | "audio" | "analysis" | "djSystem" | "link" | "keyboard" | "advanced" | "backups" | "usbExport" | "rekordbox" | "about" | "server"; // fork: server-mode
 
 /** A place in Preferences that opens a pane at one of its sections. */
 type SectionTarget = "usbExportSync" | "usbExportImport";
@@ -86,6 +87,7 @@ const PANES: readonly { id: Pane; label: string; Icon: ComponentType<SVGProps<SV
   { id: "link", label: "PRO DJ LINK", Icon: LinkIcon },
   { id: "usbExport", label: "USB Export", Icon: UsbStickIcon },
   { id: "backups", label: "Backups", Icon: ArchiveRestore },
+  { id: "server", label: "Server", Icon: ServerIcon }, // fork: server-mode
   { id: "about", label: "About", Icon: PrefAboutIcon },
 ];
 
@@ -332,7 +334,7 @@ export function Preferences({
                   <BackupsPane />
                 ) : pane === "rekordbox" ? (
                   <RekordboxPane />
-                ) : pane === "about" ? (
+                ) : pane === "server" ? <ServerPane /> : pane === "about" ? ( // fork: server-mode
                   <AboutPane />
                 ) : (
                   <AdvancedPane tab={tabs.advanced} summary={summary} />

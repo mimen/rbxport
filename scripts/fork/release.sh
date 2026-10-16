@@ -56,15 +56,8 @@ cd "$work"
 pnpm install --frozen-lockfile
 node scripts/sync-version.mjs --version "$version"
 
-# Bug reports go to upstream's report.rbxport.com worker; fork builds drop it from the CSP,
-# derived from upstream's own CSP at build time so upstream's other CSP changes carry over.
-csp_config="$(node -e '
-const csp = JSON.parse(require("fs").readFileSync("src-tauri/tauri.conf.json", "utf8")).app.security.csp
-  .replaceAll(" https://report.rbxport.com", "")
-  .replace(/frame-src\s*;/, "frame-src \x27none\x27;");
-if (csp.includes("report.rbxport.com")) throw new Error("report.rbxport.com is still in the CSP");
-process.stdout.write(JSON.stringify({ app: { security: { csp } } }));
-')"
+# The CSP overlay: upstream's, less its bug-report origin, plus server mode's host.
+csp_config="$(node scripts/fork/csp.mjs)"
 
 # No DSN means Sentry stays off in both the renderer and the native app.
 unset SENTRY_DSN VITE_SENTRY_DSN SENTRY_AUTH_TOKEN

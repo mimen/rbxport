@@ -1,0 +1,29 @@
+.fields {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.fields label {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--f-size-sm);
+}
+
+.fields input {
+  min-width: 0;
+  padding: 4px 6px;
+  font: inherit;
+  font-family: var(--f-mono, monospace);
+  color: var(--c-text);
+  background: var(--c-bg-input, transparent);
+  border: 1px solid var(--c-border, currentColor);
+  border-radius: 4px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}

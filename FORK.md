@@ -7,7 +7,7 @@ release: scripts/fork/release.sh
 
 # rbxport fork
 
-Milad's fork of [chrisle/rbxport](https://github.com/chrisle/rbxport), started from upstream `v1.8.2` on 2026-10-16. It carries no features of its own yet. It exists to ship its own signed builds and to follow upstream releases. Rules for changing anything here are in the `fork` skill.
+Milad's fork of [chrisle/rbxport](https://github.com/chrisle/rbxport), started from upstream `v1.8.2` on 2026-10-16. It exists to ship its own signed builds, to follow upstream releases, and to carry server mode. Rules for changing anything here are in the `fork` skill.
 
 Upstream releases from `dev`, tags each release `vX.Y.Z`, and fast-forwards `main` to the tag. The fork tracks those tags, never `dev`, so `main` only ever holds released upstream code. The hub's nightly Updates job merges each new tag and runs the release.
 
@@ -21,5 +21,22 @@ Upstream releases from `dev`, tags each release `vX.Y.Z`, and fast-forwards `mai
 
 **Checks.** [`scripts/fork/check.sh`](scripts/fork/check.sh) runs upstream's frontend lint, typecheck, and unit tests and the Rust workspace tests under `RB_LITE_TEST=1`, which refuses writes to an installed rekordbox library.
 
+**Server mode.** One machine serves its library and the fork app on other machines browses and edits it over Tailscale. On the host, Preferences › Server › Serve this library starts a server on port 48650, on 127.0.0.1 and the machine's Tailscale address, saved in `~/Library/Application Support/rbxport/fork-server.json`. Off by default. A client enters the host's MagicDNS address and token under Remote host.
+
+- Commands are not re-implemented. [`src-tauri/src/fork/server.rs`](src-tauri/src/fork/server.rs) turns `POST /invoke/<command>` into the `InvokeRequest` the webview would have sent and delivers it to the main webview, so upstream's `generate_handler!` runs it. The accepted names are that list, read from `lib.rs` at compile time ([`commands.rs`](src-tauri/src/fork/commands.rs)), so upstream adding a command needs no fork edit.
+- `GET /events` is a WebSocket that forwards whichever app events the client names. `GET /artwork/<id>` runs `protocol.rs`. `GET /audio/<id>` serves the file with range requests. `GET /version` names the build.
+- Every request from another machine needs the token. Loopback needs none unless it carries an `Origin` header, so a web page on the host cannot drive it. `/invoke` and `/events` refuse a client built from a different version with a `versionMismatch` error.
+- On a client, [`src/ipc/fork/remote.ts`](src/ipc/fork/remote.ts) routes each command: window, menu, update and audio-engine commands run locally, file dialogs, USB, LINK and the decks are refused with a note, and everything else goes to the host. [`src/fork/remote.css`](src/fork/remote.css) hides the controls for what only the host can do.
+- The CSP allows a host only by its `*.ts.net` name, through the overlay [`scripts/fork/csp.mjs`](scripts/fork/csp.mjs) prints for `tauri build --config`.
+- The check covers it: every name in the table dispatches through the HTTP route, every command the client sends exists on the server, and wrong tokens and other versions are refused.
+
 | Path | Why |
 | ---- | --- |
+| `src-tauri/src/lib.rs` | Server mode: `mod fork;` and `.plugin(crate::fork::plugin())` |
+| `src-tauri/Cargo.toml` | Server mode: axum, tokio, tower, tower-http and if-addrs for the library server |
+| `Cargo.lock` | The server's dependencies |
+| `src/ipc/invoke.ts` | Server mode: `tauriInvoke` wraps its function in `withRemote` |
+| `src/ipc/client.ts` | Server mode: `subscribe` takes host events, `getBackend` wraps the backend, native drag-out off on a client |
+| `src/ipc/artwork.ts` | Server mode: artwork from the host on a client |
+| `src/main.tsx` | Server mode: `import "./fork/boot"` |
+| `src/views/settings/Preferences.tsx` | Server mode: the Server pane |

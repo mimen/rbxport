@@ -1,0 +1,25 @@
+/* With a remote host set: what only the host can do. The selectors are
+   upstream's own aria labels and test ids, not its hashed class names. */
+html[data-rbxfork-remote] [aria-label="Layout"],
+html[data-rbxfork-remote] [aria-label="Master level"],
+html[data-rbxfork-remote] [aria-label="Master output"],
+html[data-rbxfork-remote] [role="tab"][aria-label="Devices"],
+html[data-rbxfork-remote] [role="tab"][aria-label="Explorer"],
+html[data-rbxfork-remote] [aria-label="Sync Manager"],
+html[data-rbxfork-remote] [data-testid="link-deck-strip"] {
+  display: none !important;
+}
+
+html[data-rbxfork-remote] body::after {
+  content: var(--rbxfork-badge);
+  position: fixed;
+  right: 12px;
+  bottom: 30px;
+  z-index: 1000;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: #fff;
+  background: rgb(40 110 220 / 85%);
+  pointer-events: none;
+}

@@ -18,12 +18,14 @@ import type {
   SelectionDetails, TrackDetails, TrackLookups,
 } from "./types";
 import { tauriInvoke } from "./invoke";
+import { remoteBackend } from "./fork/backend"; // fork: server-mode
+import { isHostEvent, remoteHost, remoteSubscribe } from "./fork/remote"; // fork: server-mode
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 /** Native file sources allow one track drag to land in Finder or in our webview. */
 export function nativeTrackDragging(): boolean {
-  return isTauri && detectPlatform().mac;
+  return isTauri && detectPlatform().mac && !remoteHost(); // fork: server-mode
 }
 
 /** Resolves when the native drag finishes, including cancellation. */
@@ -166,6 +168,7 @@ export async function setHistoryMenu(undo: string | null, redo: string | null): 
  * component.
  */
 function subscribe<T>(event: string, listener: (payload: T) => void): () => void {
+  if (isHostEvent(event)) return remoteSubscribe(event, listener); // fork: server-mode
   let live = true;
   let stop: (() => void) | undefined;
   void import("@tauri-apps/api/event").then(async ({ listen }) => {
@@ -676,7 +679,7 @@ let backendPromise: Promise<Backend> | null = null;
 
 export function getBackend(): Promise<Backend> {
   backendPromise ??= isTauri
-    ? realBackend()
+    ? realBackend().then(remoteBackend) // fork: server-mode
     : import("./backend-mock").then((m) => m.createMockBackend());
   return backendPromise;
 }

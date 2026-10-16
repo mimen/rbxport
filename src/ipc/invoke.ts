@@ -1,6 +1,7 @@
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import { errorMessage } from "@/lib/errorMessage";
 import type { AppErrorDto } from "./types";
+import { withRemote } from "./fork/remote"; // fork: server-mode
 
 /**
  * A command failure, as an `Error`. The backend rejects with a plain
@@ -24,11 +25,11 @@ export class IpcError extends Error {
 /** Tauri's `invoke`, rejecting with an `IpcError` rather than a bare object. */
 export async function tauriInvoke(): Promise<<T>(command: string, args?: InvokeArgs) => Promise<T>> {
   const { invoke } = await import("@tauri-apps/api/core");
-  return async <T>(command: string, args?: InvokeArgs) => {
+  return withRemote(async <T>(command: string, args?: InvokeArgs) => { // fork: server-mode
     try {
       return await invoke<T>(command, args);
     } catch (error) {
       throw error instanceof Error ? error : new IpcError(error);
     }
-  };
+  }); // fork: server-mode
 }

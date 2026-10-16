@@ -1,3 +1,4 @@
+import "./fork/boot"; // fork: server-mode
 import { StrictMode, Suspense, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./app/App";
