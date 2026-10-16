@@ -11,8 +11,11 @@ const packageVersion = JSON.parse(readFileSync(new URL("./package.json", import.
 const sentryAuthToken = process.env.SENTRY_AUTH_TOKEN;
 const sentryRelease = `rbxport@${packageVersion}`;
 
-export default defineConfig({
-  define: { __APP_VERSION__: JSON.stringify(packageVersion) },
+export default defineConfig(({ mode }) => ({
+  define: {
+    __APP_VERSION__: JSON.stringify(packageVersion),
+    __RBL_MOCK_BACKEND__: JSON.stringify(mode !== "production" || process.env.RBL_MOCK === "1"),
+  },
   plugins: [react(), {
     name: "obfuscate-production",
     apply: "build",
@@ -92,4 +95,4 @@ export default defineConfig({
     hmr: host ? { protocol: "ws", host, port: 1421 } : undefined,
     watch: { ignored: ["**/src-tauri/**", "**/target/**"] },
   },
-});
+}));

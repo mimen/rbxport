@@ -29,6 +29,28 @@ export type Action =
   // Track > Locate track loaded on deck (command + L): scrolls the list to
   // the track a deck holds and highlights it.
   | "locateLoaded"
+  // Playlist > Renumber Track Order: the open playlist's track numbers are
+  // rewritten to the order the list shows. rekordbox's command 0x500e, which
+  // no preset binds, so it waits for a key from the Keyboard pane.
+  | "renumberTrackOrder"
+  // The Track and Playlist menus' other items (#513), each the command its
+  // context-menu entry runs: rekordbox's 400f, 4012, 4013, 4003, 400b, 400d,
+  // 4014, 400e, 500a-500c, 5004, 5005 and 5006. No preset binds them and the
+  // Keyboard pane does not list them yet.
+  | "importToCollection"
+  | "analysisLockOn"
+  | "analysisLockOff"
+  | "reloadTag"
+  | "removeFromCollection"
+  | "showInFinder"
+  | "autoRelocate"
+  | "relocate"
+  | "createPlaylist"
+  | "createIntelligentPlaylist"
+  | "createFolder"
+  | "deletePlaylist"
+  | "exportPlaylistTxt"
+  | "exportPlaylistM3u8"
   // The deck. Every key below is rekordbox's own, transcribed from the Export
   // preset in `KeyMappings/rekordbox_0000000000030.mappings` — the key map the
   // mode we clone ships with, not a guess at what feels natural. The same
@@ -388,7 +410,7 @@ export function dispatchBinding(
 export interface Binding {
   /** Stable, for the person's own key to be stored against. */
   id: string;
-  group: "Browse" | "Player A" | "Player B" | "General" | "Menu";
+  group: "Browse" | "Player A" | "Player B" | "General" | "Playlist" | "Menu";
   /** rekordbox's description of the command. */
   label: string;
   chord: KeyChord;
@@ -478,6 +500,21 @@ function playerB(row: Omit<Binding, "id" | "group" | "deck">): Binding {
   return shifted;
 }
 
+/**
+ * rekordbox's command for a hot cue pad: Set A to C are `301e`-`3020` and
+ * Clear `3021`-`3023`; D is `3054` and `3055`; E to P run from `307f` (Set)
+ * and `308b` (Clear). Player B's are the same plus `0x100`.
+ */
+function hotCueCommand(kind: "hotCue" | "clearHotCue", letter: string, deck: "a" | "b"): string {
+  const index = letter.charCodeAt(0) - 65;
+  const set = kind === "hotCue";
+  let id: number;
+  if (index < 3) id = (set ? 0x301e : 0x3021) + index;
+  else if (index === 3) id = set ? 0x3054 : 0x3055;
+  else id = (set ? 0x307f : 0x308b) + index - 4;
+  return (id + (deck === "b" ? 0x100 : 0)).toString(16);
+}
+
 export const BINDINGS: readonly Binding[] = [
   { id: "focusSearch", group: "Browse", label: "Search", chord: { key: "f", metaKey: true }, action: "focusSearch", command: "7003" },
   { id: "clearSearch", group: "Browse", label: "Clear Search", chord: { key: "Escape" }, action: "clearSearch", pane: "Browse" },
@@ -496,6 +533,7 @@ export const BINDINGS: readonly Binding[] = [
   { id: "loadPlayer1", group: "Browse", label: "Load on Player 1", chord: { key: "Enter" }, action: "loadPlayer1", pane: "Browse" },
   { id: "loadPlayer1.shift", group: "Browse", label: "Load on Player 1", chord: { key: "Enter", shiftKey: true }, action: "loadPlayer1", alias: true },
   { id: "locateLoaded", group: "Browse", label: "Locate track loaded on deck", chord: { key: "l", metaKey: true }, action: "locateLoaded", command: "b139" },
+  { id: "renumberTrackOrder", group: "Playlist", label: "Renumber Track Order", chord: { key: "" }, action: "renumberTrackOrder", command: "500e" },
   ...PLAYER_A.map((row): Binding => ({ ...row, id: row.action ?? row.label, group: "Player A", deck: "a" })),
   // The preset gives Player B no clears for its pads, no `Adjust
   // BPM/BeatGrid`, and the metronome's sound is the engine's: none of those
@@ -515,8 +553,10 @@ export const BINDINGS: readonly Binding[] = [
       deck,
       pane: deck === "a" ? "Player A" : "Player B",
     }))),
-  // Hot cue pads D to H, and Player B's clears: this app's own and unbound,
-  // since the Export preset binds nothing to them. The person picks the keys.
+  // Hot cue pads D to H, and Player B's clears: unbound, since the Export
+  // preset binds nothing to them, but rekordbox's own commands [OBS static:
+  // `djplay::UiPlayer::getAllCommands` lists them in EXPORT mode, rekordbox
+  // 7.2.19], which the Performance presets do give keys.
   ...(["a", "b"] as const).flatMap((deck): Binding[] => {
     const group = deck === "a" ? "Player A" : "Player B";
     const own = (kind: "hotCue" | "clearHotCue", letter: string): Binding => ({
@@ -526,7 +566,7 @@ export const BINDINGS: readonly Binding[] = [
       chord: { key: "" },
       action: `${kind}${letter}` as Action,
       deck,
-      pane: group,
+      command: hotCueCommand(kind, letter, deck),
     });
     const letters = ["D", "E", "F", "G", "H"];
     return [

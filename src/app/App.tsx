@@ -12,6 +12,7 @@ import { useShowWindowWhenReady } from "@/lib/windowReady";
 import { waveformKindOf } from "@/canvas";
 import { useAutoJoinLink } from "@/store/useAutoJoinLink";
 import { useEventCallback } from "@/store/useEventCallback";
+import { useCommands } from "@/store/useCommands";
 /**
  * Export-mode shell.
  *
@@ -33,10 +34,15 @@ import { ConnectedTopBar } from "@/views/topbar/TopBar";
 import { StatusBar } from "@/views/statusbar/StatusBar";
 import { LinkDeckStrip } from "@/views/statusbar/LinkDeckStrip";
 import styles from "./App.module.css";
-import { detectPlatform, dispatch, isTyping, menuAccelerator } from "@/lib/shortcuts";
+import { locateLoadedTrack } from "@/lib/locateLoaded";
+import { keyMap } from "@/lib/keyPresets";
+import { detectPlatform, dispatch, isTyping, menuAccelerator, type Action } from "@/lib/shortcuts";
+import { hasCommand, runCommand } from "@/lib/commands";
+import { browserFocus, followBrowserFocus, onBrowserFocus } from "@/lib/browserFocus";
+import { menuBarEnabled, menuBarSide, menuBarState, onMenuBarState } from "@/lib/menuBar";
 import { hasEditHistory, runEditHistory, setLibraryEditHistory } from "@/lib/editHistory";
 import { transposeKey } from "@/lib/camelot";
-import { gainToKnob, KNOB_FULL, knobToGain } from "@/lib/volume";
+import { stepMasterGain, toggleMute } from "@/lib/volume";
 import { clampWidth, TREE_BOUNDS } from "@/lib/splitter";
 import { exportSummary } from "@/lib/exportSummary";
 import { deviceId, devicePath, renamedDevice } from "@/lib/devices";
@@ -81,11 +87,17 @@ import type { LibraryQuestion } from "@/views/library/NewLibraryDialog";
 import type { QueueItem } from "@/lib/queue";
 import { TrackFilter } from "@/views/browser/TrackFilter";
 import { EMPTY_FILTER, toSpecFilter, type FilterState } from "@/lib/trackFilter";
-import type { AnalysisResult, DeviceImportMissing, DevicePlaylistEdit, DevicePlaylistImportPlan, FilterValues, LinkPeerSeen, LinkStatus, RelocateSearch, SmartRule, TrackLookups, UnanalysedTracks } from "@/ipc/types";
+import type { AnalysisResult, DeviceImportMissing, DevicePlaylistEdit, DevicePlaylistImportPlan, FilterValues, LinkPeerSeen, LinkStatus, ListTotals, RelocateSearch, SmartRule, TrackLookups, UnanalysedTracks } from "@/ipc/types";
+import { statusBarListText } from "@/lib/format";
 import { autoRelocated, missingAmong, relocateSteps, relocateTracks } from "@/lib/relocate";
 import { useTooltip } from "@/store/usePreferences";
 import { useTranslation } from "@/i18n";
 import { nativeMenuLabels } from "@/lib/nativeMenu";
+
+/** The commands the shell itself registers, and so the keys it runs. */
+const SHELL_COMMANDS: ReadonlySet<Action> = new Set<Action>([
+  "volumeUp", "volumeDown", "mute", "focusSearch", "clearSearch", "analyseSelection",
+]);
 
 /**
  * The metadata fields a row already carries, so an edit to one can be shown
@@ -104,6 +116,7 @@ const NewLibraryDialog = lazy(() => import("@/views/library/NewLibraryDialog").t
 const DevicePanel = lazy(() => import("@/views/devices/DevicePanel").then(m => ({ default: m.DevicePanel })));
 const InfoPanel = lazy(() => import("@/views/info/InfoPanel").then(m => ({ default: m.InfoPanel })));
 const ReportBug = lazy(() => import("@/views/report/ReportBug").then(m => ({ default: m.ReportBug })));
+const LogView = lazy(() => import("@/views/log/LogView").then(m => ({ default: m.LogView })));
 const UpdateManager = lazy(() => import("@/views/update/UpdateManager").then(m => ({ default: m.UpdateManager })));
 const Preferences = lazy(() => import("@/views/settings/Preferences").then(m => ({ default: m.Preferences })));
 const SyncManager = lazy(() => import("@/views/sync/SyncManager").then(m => ({ default: m.SyncManager })));
@@ -230,6 +243,13 @@ function AppBody() {
   // in, and the collection has no more meaningful default.
   const [sortState, setSortState] = useState<SortState>(restored.sort);
   const [selectedCount, setSelectedCount] = useState(0);
+  const [listTotals, setListTotals] = useState<ListTotals | undefined>(undefined);
+  // Whether the tracks were picked in the list now open; see `TrackTable`.
+  const [barShowsSelection, setBarShowsSelection] = useState(false);
+  const changeSelectedCount = useCallback((count: number, picked: boolean) => {
+    setSelectedCount(count);
+    setBarShowsSelection(picked);
+  }, []);
   // The rows behind the selection, so they can be queued for analysis.
   const [selectedTracks, setSelectedTracks] = useState<{ id: string; title: string }[]>([]);
   // The row the player is showing. Set by the browser as the selection moves,
@@ -440,6 +460,13 @@ function AppBody() {
   const [reportOpen, setReportOpen] = useState(false);
   const openReport = useCallback(() => {
     void getBackend().then(backend => backend.openReportWindow()).then(opened => { if (!opened) setReportOpen(true); });
+  }, []);
+  // The Log window, the same way again: clicking the status bar's message
+  // opens it, or brings the open one to the front.
+  const [logOpen, setLogOpen] = useState(false);
+  const openLogWindow = useCallback(() => {
+    void getBackend().then(backend => backend.openLogWindow()).then(opened => { if (!opened) setLogOpen(true); })
+      .catch(() => setLogOpen(true));
   }, []);
   const openSupport = useCallback(() => {
     void getBackend().then(backend => backend.openUrl("https://www.paypal.com/donate/?hosted_button_id=H6GGU8PHP8CJE")).catch(() => {});
@@ -2255,6 +2282,21 @@ function AppBody() {
       setInfoOpen((open) => !open);
       return;
     }
+    if (outcome.action === "locate-loaded") {
+      locateLoadedTrack();
+      return;
+    }
+    if (outcome.action === "bar-command" && outcome.item) {
+      // Track and Playlist menu items: the command the focused list or tree
+      // registered, which its context-menu entry runs too.
+      runCommand(outcome.item.action, { scope: menuBarSide(browserFocus()) });
+      return;
+    }
+    if (outcome.action === "analyze-track") {
+      // Track › Analyze Track: the same command as its key.
+      runCommand("analyseSelection");
+      return;
+    }
     if (outcome.action === "sub") {
       setSubOpen((open) => !open);
       return;
@@ -2283,6 +2325,43 @@ function AppBody() {
     editHistory, runLibraryHistory,
   ]);
 
+  // The Track and Playlist menus' greyed items, worked out from the focus
+  // and what the lists and trees report, and sent on whenever they change.
+  useEffect(() => {
+    const sent: Record<string, boolean> = {};
+    let queued = false;
+    const push = () => {
+      queued = false;
+      const enabled = menuBarEnabled({
+        focus: browserFocus(),
+        ...menuBarState(),
+        // Analyze Track is the shell's own command, not a list's.
+        has: (action, side) => action === "analyseSelection" ? hasCommand(action) : hasCommand(action, side),
+      });
+      const changed: Record<string, boolean> = {};
+      for (const [id, on] of Object.entries(enabled)) {
+        if (sent[id] !== on) changed[id] = on;
+      }
+      if (Object.keys(changed).length === 0) return;
+      Object.assign(sent, changed);
+      void getBackend().then((backend) => backend.setMenuEnabled(changed)).catch(() => undefined);
+    };
+    const schedule = () => {
+      if (queued) return;
+      queued = true;
+      queueMicrotask(push);
+    };
+    const stopFollowing = followBrowserFocus(window);
+    const stopFocus = onBrowserFocus(schedule);
+    const stopState = onMenuBarState(schedule);
+    schedule();
+    return () => {
+      stopFollowing();
+      stopFocus();
+      stopState();
+    };
+  }, []);
+
   // Native menu clicks.
   useEffect(() => {
     let stop: (() => void) | undefined;
@@ -2295,9 +2374,51 @@ function AppBody() {
 
   // The keyboard: the shell's own shortcuts, and the menu accelerators the
   // webview keeps from the native menu on Windows.
-  const keyOverrides = prefs.preferences.keyboard.overrides;
+  const keyOverrides = keyMap(prefs.preferences.keyboard);
   /** The level Mute took the master down from, while it is muted. */
   const mutedFrom = useRef<number | null>(null);
+  // The shell's own commands (see `src/lib/commands.ts`): the keys below, the
+  // Track menu's Analyze Track and anything else that asks run these.
+  useCommands({
+    // A knob reading a step: rekordbox's command + F12 and F11.
+    volumeUp: () => {
+      const gain = stepMasterGain(master.level, 1);
+      if (gain > 0) mutedFrom.current = null;
+      master.setLevel(gain);
+      return true;
+    },
+    volumeDown: () => {
+      const gain = stepMasterGain(master.level, -1);
+      if (gain > 0) mutedFrom.current = null;
+      master.setLevel(gain);
+      return true;
+    },
+    // Mute remembers where the knob was, and a second press puts it back.
+    mute: ({ repeat }) => {
+      if (repeat) return true;
+      const next = toggleMute(master.level, mutedFrom.current);
+      const changed = next.gain !== master.level || next.mutedFrom !== mutedFrom.current;
+      mutedFrom.current = next.mutedFrom;
+      if (changed) master.setLevel(next.gain);
+      return true;
+    },
+    focusSearch: () => {
+      searchRef.current?.focus();
+      searchRef.current?.select();
+      return true;
+    },
+    // Escape in an empty box should blur rather than do nothing, so the next
+    // arrow key reaches the track list.
+    clearSearch: () => {
+      if (query === "") searchRef.current?.blur();
+      else setQuery("");
+      return true;
+    },
+    analyseSelection: () => {
+      analyseSelection();
+      return true;
+    },
+  });
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       // The native menu's accelerators, on the platforms where a keystroke
@@ -2311,60 +2432,20 @@ function AppBody() {
         return;
       }
       const action = dispatch(event, platform, event.target as HTMLElement | null, keyOverrides);
-      if (action === null) return;
-      // Only the actions handled here are swallowed; everything else falls
-      // through to the browser and the OS.
-      switch (action) {
-        case "volumeUp":
-        case "volumeDown": {
-          // A knob reading a step: rekordbox's command + F12 and F11.
-          event.preventDefault();
-          const reading = Math.round(gainToKnob(master.level));
-          const next = action === "volumeUp" ? Math.min(reading + 1, KNOB_FULL) : Math.max(reading - 1, 0);
-          if (next > 0) mutedFrom.current = null;
-          master.setLevel(knobToGain(next));
-          break;
-        }
-        case "mute":
-          // Mute remembers where the knob was, and a second press puts it back.
-          event.preventDefault();
-          if (event.repeat) break;
-          if (mutedFrom.current !== null) {
-            master.setLevel(mutedFrom.current);
-            mutedFrom.current = null;
-          } else if (master.level > 0) {
-            mutedFrom.current = master.level;
-            master.setLevel(0);
-          }
-          break;
-        case "focusSearch":
-          event.preventDefault();
-          searchRef.current?.focus();
-          searchRef.current?.select();
-          break;
-        case "clearSearch":
-          // Escape in an empty box should blur rather than do nothing, so the
-          // next arrow key reaches the track list.
-          if (query === "") {
-            searchRef.current?.blur();
-          } else {
-            setQuery("");
-          }
-          break;
-        case "analyseSelection":
-          event.preventDefault();
-          analyseSelection();
-          break;
-        default:
-          // Movement and selection live in the table; it listens for itself.
-          return;
-      }
+      // Only the shell's own commands are run and swallowed here; movement
+      // and selection live in the table and the deck keys in the decks, which
+      // listen for themselves, and everything else falls through to the
+      // browser and the OS.
+      if (action === null || !SHELL_COMMANDS.has(action)) return;
+      if (!runCommand(action, { repeat: event.repeat })) return;
+      // Escape keeps its default, so whatever else it closes still closes.
+      if (action !== "clearSearch") event.preventDefault();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [platform, query, runMenu, analyseSelection, keyOverrides, master]);
+  }, [platform, runMenu, keyOverrides]);
 
   // The Preferences window asking for what only this window holds.
   useEffect(() => {
@@ -2870,8 +2951,13 @@ function AppBody() {
     [summary, loadError, missingLibrary, restored.count, restored.rows],
   );
 
-  const selectionText =
-    selectedCount > 1 ? `Selected: ${selectedCount} Tracks` : selectedCount === 1 ? "Selected: 1 Track" : "";
+  // One place on the bar, written by whichever changed last, as in
+  // rekordbox: the tracks picked in the open list, else its tally.
+  const selectionText = statusBarListText(
+    { picked: barShowsSelection, selected: selectedCount, totals: listTotals },
+    t,
+    viewPrefs.locale,
+  );
 
   const tip = useTooltip();
   const openViewSettings = useCallback(() => openPreferences("view"), [openPreferences]);
@@ -2925,6 +3011,19 @@ function AppBody() {
     removeTracksFromPlaylist, removeTracksFromHistory, reorderPlaylist, importDroppedFilesTo,
     analyseTracks, refuse, reportSubSelection,
   ]);
+  // What the status bar says, and the error in red over it. Each goes in the
+  // log as it appears, so the Log window still has it once the bar moves on;
+  // a running job's changing progress text is left out.
+  const statusActivity = note !== null && !note.failed ? note.text : "";
+  const statusError = playerError ?? loadError ?? [...exportJobs.values()].find(job => job.state === "failed")?.title
+    ?? (note?.failed === true ? note.text : null);
+  const loggedActivity = note?.busy === true ? "" : statusActivity;
+  useEffect(() => {
+    if (statusError) void getBackend().then(backend => backend.logStatusMessage(true, statusError)).catch(() => {});
+  }, [statusError]);
+  useEffect(() => {
+    if (loggedActivity) void getBackend().then(backend => backend.logStatusMessage(false, loggedActivity)).catch(() => {});
+  }, [loggedActivity]);
   return (
     <PreferencesProvider value={prefs}>
     <MasterOutputConnection mode={viewPrefs.vuMeter} />
@@ -3135,7 +3234,8 @@ function AppBody() {
           deckTrackIds={deckTrackIds}
           onShowCollection={showCollection}
           onSortChange={handleSort}
-          onSelectionChange={setSelectedCount}
+          onSelectionChange={changeSelectedCount}
+          onTotalsChange={setListTotals}
           onSelectedTracks={reportMainSelection}
           onAnalyse={analyseSelection}
           onShowInformation={showInformation}
@@ -3175,6 +3275,8 @@ function AppBody() {
           // The sub-browser's list is left out on purpose: it has a source and
           // a sort of its own, which this gate does not describe.
           onReorder={canReorder ? reorderPlaylistTracks : undefined}
+          // An intelligent playlist's order is its rule's, not a track number.
+          onRenumber={selectedNode?.kind === "playlist" ? reorderPlaylistTracks : undefined}
           onEditField={editTrackField}
           onEditBlocked={readOnly ? explainEditLock : undefined}
           libraryGeneration={libraryGeneration}
@@ -3315,6 +3417,7 @@ function AppBody() {
         />
       ) : null}
       {reportOpen ? <ReportBug onClose={() => setReportOpen(false)} /> : null}
+      {logOpen ? <LogView onClose={() => setLogOpen(false)} /> : null}
       {smartEditor ? (
         <SmartPlaylistEditor
           title={smartEditor.mode === "create" ? "Create New Intelligent Playlist" : "Edit the Intelligent Playlist"}
@@ -3353,6 +3456,7 @@ function AppBody() {
         onReportBug={openReport}
         onSupport={SHOW_MAIN_SUPPORT ? openSupport : undefined}
         onOpenLog={openLog}
+        onShowLog={openLogWindow}
         updateNotice={updateNotice ? (
           <UpdateReadyNotice
             state={updateNotice}
@@ -3369,15 +3473,11 @@ function AppBody() {
           total: analysis.total,
           waiting: analysis.waiting,
         } : undefined}
-        activity={
-          note !== null && !note.failed
-                ? note.text
-                : (summary ? "" : "Loading the library…")
-        }
+        activity={statusActivity || (summary ? "" : "Loading the library…")}
         // Everything that went wrong, in one place and in red: the deck's
         // refusals, a library that would not open, and a write the library
         // turned down.
-        error={playerError ?? loadError ?? [...exportJobs.values()].find(job => job.state === "failed")?.title ?? (note?.failed === true ? note.text : null)}
+        error={statusError}
         onOpenProtection={!playerError && !loadError && note?.failed && note.text === refusal(true) && advancedPrefs.protectLibrary
           ? () => openPreferences("libraryProtection") : undefined}
         onCancelAnalysis={analysis.running ? analysis.cancel : undefined}

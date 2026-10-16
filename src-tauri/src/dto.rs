@@ -26,8 +26,8 @@ pub struct RowDto {
     pub release_date: String,
     /// The track's hot cues, for the badges on the row's preview waveform.
     ///
-    /// A tuple per cue rather than an object: `["A",46,"#3CEB50"]` is 18
-    /// bytes against 45 with field names, and rekordbox 7 allows sixteen a
+    /// A tuple per cue rather than an object: `["A",46,"#3CEB50",false]` is
+    /// 24 bytes against 58 with field names, and rekordbox 7 allows sixteen a
     /// track, so a page of 64 rows stays inside the 64 KB response cap even
     /// when every row is full.
     pub hot_cues: Vec<RowCueDto>,
@@ -154,6 +154,24 @@ pub struct ViewHandleDto {
     pub view_id: u32,
     pub len: u32,
     pub gen: u32,
+    /// The open playlist's status-bar tally; absent for any other list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totals: Option<ListTotalsDto>,
+}
+
+/// `61 Tracks, 5 hours 2 minutes, 759.7 MB`, as numbers.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTotalsDto {
+    pub tracks: u32,
+    pub seconds: u64,
+    pub bytes: u64,
+}
+
+impl From<rbl_index::ListTotals> for ListTotalsDto {
+    fn from(totals: rbl_index::ListTotals) -> Self {
+        Self { tracks: totals.tracks, seconds: totals.seconds, bytes: totals.bytes }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -291,11 +309,13 @@ pub struct CueDto {
     pub colour: Option<String>,
 }
 
-/// A hot cue on a track-list row: letter, position in ms, drawn colour.
+/// A hot cue on a track-list row: letter, position in ms, drawn colour, and
+/// whether it is a hot loop (an uncoloured one draws rekordbox's loop
+/// default rather than its slot's).
 ///
 /// Serialised as a JSON array, not an object — see [`RowDto::hot_cues`].
 #[derive(Debug, Clone, Serialize)]
-pub struct RowCueDto(pub char, pub u32, pub Option<String>);
+pub struct RowCueDto(pub char, pub u32, pub Option<String>, pub bool);
 
 /// `#RRGGBB` for a cue's `ColorTableIndex`, where it has been measured.
 ///

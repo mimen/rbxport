@@ -23,7 +23,29 @@
  *   it was. A list without a saved state opens at the top.
  */
 
+import { registerCommand, runCommand } from "./commands";
 import { isLooseId } from "./explorer";
+
+/**
+ * Registers what Locate track loaded on deck does: the browser that can
+ * answer it (the main track table) claims the command while it is mounted.
+ * Returns the function that releases it. The command lives in the shared
+ * registry (`commands.ts`) like every other.
+ */
+export function registerLocateLoaded(handler: () => void): () => void {
+  return registerCommand("locateLoaded", () => {
+    handler();
+    return true;
+  });
+}
+
+/**
+ * Track › Locate track loaded on deck: the one entry point Command + L and
+ * the Track menu item both call. Resolves false when no browser is mounted.
+ */
+export function locateLoadedTrack(): boolean {
+  return runCommand("locateLoaded");
+}
 
 /** rekordbox's decks: the cursor runs over four whether or not all are shown. */
 export const LOCATE_DECKS = 4;

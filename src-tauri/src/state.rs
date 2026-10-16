@@ -62,6 +62,9 @@ pub(crate) enum LibraryEdit {
     DeletePlaylist(rbl_db::write::PlaylistDeletion),
     RenamePlaylist(rbl_db::write::PlaylistRename),
     MovePlaylist(rbl_db::write::PlaylistMove),
+    /// A folder drop's Replace existing (#426): the replaced list and the
+    /// playlist made in its place, undone and redone as one step.
+    ReplacePlaylist(rbl_db::write::ListReplacement),
     RemovePlaylistTracks(rbl_db::write::PlaylistTrackRemoval),
     Track(Vec<rbl_db::write::TrackEdit>),
     TrackTags(rbl_db::write::TrackTagEdit),
@@ -74,7 +77,7 @@ impl LibraryEdit {
             Self::RemovePlaylistTracks(edit) => edit.is_empty(),
             Self::Track(edits) => edits.is_empty() || edits.iter().all(rbl_db::write::TrackEdit::is_empty),
             Self::TrackTags(edit) => edit.is_empty(),
-            Self::RenamePlaylist(_) | Self::MovePlaylist(_) => false,
+            Self::RenamePlaylist(_) | Self::MovePlaylist(_) | Self::ReplacePlaylist(_) => false,
         }
     }
 }
@@ -543,19 +546,28 @@ impl AppState {
 
     /// Opens a view and returns `(view_id, len, generation)`.
     pub fn open_view(&self, spec: &ViewSpec) -> AppResult<(u32, u32, u32)> {
-        self.open_view_scoped(spec, rbl_index::SearchField::All)
+        let (id, len, generation, _) = self.open_view_scoped(spec, rbl_index::SearchField::All)?;
+        Ok((id, len, generation))
     }
 
-    pub fn open_view_scoped(&self, spec: &ViewSpec, field: rbl_index::SearchField) -> AppResult<(u32, u32, u32)> {
+    /// Opens a view and returns `(view_id, len, generation, totals)`. The
+    /// totals are read before the view is registered, so a burst of other
+    /// opens that evicts it cannot turn this open into an error.
+    pub fn open_view_scoped(
+        &self,
+        spec: &ViewSpec,
+        field: rbl_index::SearchField,
+    ) -> AppResult<(u32, u32, u32, Option<rbl_index::ListTotals>)> {
         let library = self.library()?;
         let view = library.open_view_scoped(spec, field);
         let len = u32::try_from(view.len()).unwrap_or(u32::MAX);
+        let totals = view.totals();
 
         let mut inner = self.inner.write();
         let tag_list = matches!(spec.source, TrackSource::TagList);
         let id = inner.register(Registered::Library(OpenView { view: Arc::new(view), tag_list }));
         let generation = inner.generation;
-        Ok((id, len, generation))
+        Ok((id, len, generation, totals))
     }
 
     /// Opens the Explorer's view of one folder; the same handle shape.
@@ -802,7 +814,7 @@ fn hot_cues_in_slot_order(library: &Library, row: rbl_index::Row) -> Vec<RowCueD
         .iter()
         .filter_map(|cue| {
             let letter = cue.hot_letter()?;
-            Some((cue.kind, RowCueDto(letter, cue.position_ms, cue_colour_css(cue.colour))))
+            Some((cue.kind, RowCueDto(letter, cue.position_ms, cue_colour_css(cue.colour), cue.out_ms > cue.position_ms)))
         })
         .collect();
     hot.sort_by_key(|(kind, _)| *kind);
@@ -867,18 +879,25 @@ mod tests {
             id: 7,
             title: "Take Me Home",
             bpm_x100: 12_800,
-            cues: vec![cue(1, 46, 21), cue(0, 46, 0), cue(6, 24, 18), cue(2, 165_046, 41), cue(0, 1000, 0), cue(3, 2000, 0)],
+            cues: vec![
+                cue(1, 46, 21), cue(0, 46, 0), cue(6, 24, 18), cue(2, 165_046, 41), cue(0, 1000, 0), cue(3, 2000, 0),
+                Cue { out_ms: 9000, ..cue(7, 8000, 0) },
+            ],
             ..TestTrack::default()
         }]);
         let rows = rows_to_dto(&library, &[0], 0);
         let json = serde_json::to_value(&rows[0]).unwrap();
         assert_eq!(json["memoryCues"], serde_json::json!([46, 1000]));
         // In slot order, letters from `Kind` and rekordbox's resolved colour;
-        // a hot cue with no colour carries none, so it is drawn in the default
-        // green rather than the palette's black at index 0.
+        // a hot cue with no colour carries none, so the frontend draws its
+        // slot's HOT CUE color default rather than the palette's black at
+        // index 0, and a hot loop says so, for the loop default (#442).
         assert_eq!(
             json["hotCues"],
-            serde_json::json!([["A", 46, "#3CEB50"], ["B", 165_046, "#E02823"], ["C", 2000, null], ["E", 24, "#10B176"]])
+            serde_json::json!([
+                ["A", 46, "#3CEB50", false], ["B", 165_046, "#E02823", false], ["C", 2000, null, false],
+                ["E", 24, "#10B176", false], ["F", 8000, null, true],
+            ])
         );
     }
 

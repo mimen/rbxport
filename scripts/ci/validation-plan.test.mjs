@@ -34,6 +34,13 @@ test("the library's Windows file-index code runs the Windows-native Rust lane", 
   assert.deepEqual(enabled("crates/rbl-db/Cargo.toml"), ["rust", "windows_rust"]);
 });
 
+test("USB eject's Windows code runs the Windows-native Rust lane", () => {
+  assert.deepEqual(enabled("crates/rbl-devices/src/eject.rs"), ["rust", "windows_rust"]);
+  assert.deepEqual(enabled("crates/rbl-devices/src/eject/windows.rs"), ["rust", "windows_rust"]);
+  assert.deepEqual(enabled("crates/rbl-devices/Cargo.toml"), ["rust", "windows_rust"]);
+  assert.deepEqual(enabled("crates/rbl-devices/src/lib.rs"), ["rust"]);
+});
+
 test("backup changes also run the Windows-native Rust lane", () => {
   assert.deepEqual(enabled("src-tauri/src/backups.rs"), ["rust", "windows_rust"]);
   assert.deepEqual(enabled("crates/rbl-backup/src/restore.rs"), ["rust", "windows_rust"]);
@@ -83,6 +90,10 @@ test("the Vitest-based cleanup script also runs frontend unit tests", () => {
 
 test("packaging action changes defer expensive runtime checks to deploy", () => {
   assert.deepEqual(enabled(".github/actions/package-installer/action.yml"), ["scripts"]);
+});
+
+test("the AppImage GTK plugin runs the Node script suite that tests its hook", () => {
+  assert.deepEqual(enabled("packaging/appimage/linuxdeploy-plugin-gtk.sh"), ["scripts"]);
 });
 
 test("a lane workflow change exercises only that lane on the PR", () => {

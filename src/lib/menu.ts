@@ -6,7 +6,7 @@
  * rather than in a listener. Import writes to the shared library, so it is
  * refused while rekordbox holds it, exactly as the other write paths are.
  */
-
+import { menuBarItem, type MenuBarItem } from "./menuBar";
 
 export type MenuAction =
   | "settings"
@@ -17,6 +17,11 @@ export type MenuAction =
   | "export-xml"
   | "missing"
   | "info"
+  | "analyze-track"
+  | "locate-loaded"
+  // A Track or Playlist menu item that runs a list's or the tree's command
+  // (`menuBar.ts`).
+  | "bar-command"
   | "sub"
   | "layout-one"
   | "layout-two"
@@ -43,6 +48,12 @@ const COMMANDS: Record<string, MenuCommand> = {
   // and they are greyed while the library is read-only.
   missing: { action: "missing", writes: false },
   info: { action: "info", writes: false },
+  // Track › Analyze Track, rekordbox's 4000: the selected tracks go to the
+  // analyser. It writes, but the command refuses a read-only library itself,
+  // in the words its key gets, so the menu does not refuse it first.
+  "analyze-track": { action: "analyze-track", writes: false },
+  // Track › Locate track loaded on deck, rekordbox's b139 (command + L).
+  "locate-loaded": { action: "locate-loaded", writes: false },
   sub: { action: "sub", writes: false },
   // ⌘7/8/9/0, which is where rekordbox's Export key map puts them.
   "layout-one": { action: "layout-one", writes: false },
@@ -70,7 +81,12 @@ export function resolveMenu(
   readOnly: boolean,
   /** Library Protection is on in Preferences: the refusal says so instead. */
   protectedLibrary = false,
-): { action: MenuAction } | { refused: string } | null {
+): { action: MenuAction; item?: MenuBarItem } | { refused: string } | null {
+  const bar = menuBarItem(id);
+  if (bar) {
+    if (bar.writes && readOnly) return { refused: refusal(protectedLibrary) };
+    return { action: "bar-command", item: bar };
+  }
   const command = menuCommand(id);
   if (!command) return null;
   if (command.writes && readOnly) {

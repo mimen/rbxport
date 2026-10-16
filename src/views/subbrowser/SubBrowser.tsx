@@ -268,6 +268,7 @@ export const SubBrowser = memo(function SubBrowser({
       <TreeView
         nodes={nodes}
         selectedId={selectedId}
+        side="sub"
         onSelect={onSelect}
         {...tree}
       />
@@ -307,6 +308,8 @@ export const SubBrowser = memo(function SubBrowser({
             ? reorderPlaylist
             : undefined
         }
+        onRenumber={selected?.kind === "playlist" ? reorderPlaylist : undefined}
+        subBrowser
         onSelectedTracks={onSelectedTracks}
         onAnalyse={analyseSelection}
       />

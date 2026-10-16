@@ -130,7 +130,14 @@ pub fn interface_toward(interfaces: &[Interface], peer: Ipv4Addr) -> Option<Inte
 /// The interfaces a link network could be on: every IPv4 one that is not
 /// loopback, in the order the OS lists them.
 pub fn interfaces() -> Vec<Interface> {
-    alphatheta_connect::utils::network_interfaces()
+    link_candidates(alphatheta_connect::utils::network_interfaces())
+}
+
+/// Which of the discovered adapters a link network could be on: everything
+/// but loopback. Link-local (169.254.x.x) addresses stay: that is where a
+/// player's USB LINK adapter sits when nothing hands it a lease.
+fn link_candidates(found: Vec<alphatheta_connect::utils::InterfaceInfo>) -> Vec<Interface> {
+    found
         .into_iter()
         .filter(|i| !i.internal)
         .map(|i| Interface {
@@ -480,6 +487,40 @@ mod tests {
         fn details(&self, _id: &str) -> Option<rbl_db::details::TrackDetails> {
             None
         }
+    }
+
+    fn found(
+        name: &str,
+        address: Ipv4Addr,
+        internal: bool,
+    ) -> alphatheta_connect::utils::InterfaceInfo {
+        alphatheta_connect::utils::InterfaceInfo {
+            name: name.into(),
+            address,
+            netmask: if address.is_link_local() {
+                Ipv4Addr::new(255, 255, 0, 0)
+            } else {
+                Ipv4Addr::new(255, 255, 255, 0)
+            },
+            mac: [0, 1, 2, 3, 4, 5],
+            internal,
+        }
+    }
+
+    #[test]
+    fn link_candidates_keep_link_local_and_ordinary_adapters_but_not_loopback() {
+        let candidates = link_candidates(vec![
+            found("Loopback", Ipv4Addr::LOCALHOST, true),
+            found("Ethernet", Ipv4Addr::new(192, 168, 1, 10), false),
+            found("Ethernet 2", Ipv4Addr::new(169, 254, 210, 13), false),
+        ]);
+
+        let names: Vec<_> = candidates.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["Ethernet", "Ethernet 2"]);
+        let link_local = &candidates[1];
+        assert_eq!(link_local.address, Ipv4Addr::new(169, 254, 210, 13));
+        assert_eq!(link_local.netmask, Ipv4Addr::new(255, 255, 0, 0));
+        assert_eq!(link_local.broadcast(), Ipv4Addr::new(169, 254, 255, 255));
     }
 
     #[test]

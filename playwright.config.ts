@@ -65,7 +65,7 @@ export default defineConfig({
       // it would be testing Vite rather than the app. A plain static server is
       // sufficient for these hash-route tests and stays alive on the shared
       // macOS runner for the full browser suite.
-      command: `python3 -m http.server ${previewPort} --bind 127.0.0.1 --directory dist`,
+      command: `python3 -m http.server ${previewPort} --bind 127.0.0.1 --directory ${process.env.E2E_PREVIEW_DIR || "dist-mock"}`,
       url: `http://localhost:${previewPort}`,
       reuseExistingServer: true,
       timeout: 60_000,

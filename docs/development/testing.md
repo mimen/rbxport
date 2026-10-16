@@ -55,9 +55,10 @@ Which of these runs when, and where, is in [Test tiers](test-tiers.md).
 | Browser interaction | `pnpm e2e` | Chromium/WebKit UI with the mock backend and production-preview checks. |
 
 Install Playwright browsers once with
-`pnpm exec playwright install chromium webkit`. Build before running budget
-or browser checks; Playwright also serves `dist/` through Python's HTTP server.
-Use `E2E_PORT=1500 pnpm e2e` when another checkout uses the default port.
+`pnpm exec playwright install chromium webkit`. Run `pnpm build` before the
+bundle budget; `pnpm e2e` builds the mock preview into `dist-mock/` and serves
+it through Python's HTTP server. Use `E2E_PORT=1500 pnpm e2e` when another
+checkout uses the default port.
 
 Start small, for example:
 

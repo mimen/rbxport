@@ -9,7 +9,7 @@ import { confirmHandler } from "./confirmHost";
 import type {
   AnalysisResult, AudioDevices, Backend, Backup, BackupProgress, BackupSizes, ConfirmReplace, Cue, SyncEstimate, DeckEvent, Device, DeviceLibrary,
   DevicePlaylistEditResult, DevicePlaylistImportPlan, DevicePlaylistImportResult, DeviceSettings, DeviceSyncState,
-  Diagnostics, Duplicates, GridState, Limiter, PreferencesRequest, SmartRule, SyncDeviceReport, SyncProgress, UpdateCheck,
+  Diagnostics, Duplicates, LogPage, GridState, Limiter, PreferencesRequest, SmartRule, SyncDeviceReport, SyncProgress, UpdateCheck,
   UpdateProgress, UpdateReady, XmlImportReport,
   ExportProgress, ExportReport, ExplorerChildren, ExplorerRoot, FilterValues, FolderPlaylistReport, Phrase, ImportReport,
   DatabaseDrive, EditHistoryState, ItunesLibrary, LibraryProblem, LibrarySummary, LinkPeerSeen, Meters,
@@ -424,6 +424,21 @@ async function realBackend(): Promise<Backend> {
     appDiagnostics: () => invoke<Diagnostics>("app_diagnostics"),
     appVersion: () => invoke<string>("app_version"),
     openLog: () => invoke<void>("open_log"),
+    openLogWindow: async () => { await invoke<void>("open_log_window"); return true; },
+    logLines: (after) => invoke<LogPage>("log_lines", { after }),
+    openLogFolder: () => invoke<void>("open_log_folder"),
+    saveLogText: async (text) => {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const picked = await save({
+        title: "Save the log",
+        defaultPath: "rbxport log.txt",
+        filters: [{ name: "Text", extensions: ["txt", "log"] }],
+      });
+      if (typeof picked !== "string") return null;
+      await invoke<void>("save_log_text", { path: picked, text });
+      return picked;
+    },
+    logStatusMessage: (failed, text) => invoke<void>("log_status_message", { failed, text }),
     revealTrack: (trackId) => invoke<void>("reveal_track", { track: trackId }),
     deckState: () => invoke<Tick>("deck_state"),
     onDeckTick: (listener) => subscribe<Tick>("deck:tick", listener),
@@ -453,6 +468,7 @@ async function realBackend(): Promise<Backend> {
     reloadLibrary: () => invoke<number>("reload_library"),
     onMenu: (listener) => subscribe<string>("menu", listener),
     setMenuLabels: (labels) => invoke<void>("set_menu_labels", { labels }),
+    setMenuEnabled: (items) => invoke<void>("set_menu_enabled", { items }),
     serveScripts: (handle) => {
       // Ready only once the listener is in: a request sent before then would
       // reach nobody and wait out its timeout.
@@ -678,9 +694,13 @@ async function realBackend(): Promise<Backend> {
 let backendPromise: Promise<Backend> | null = null;
 
 export function getBackend(): Promise<Backend> {
+  const mockBackendEnabled = import.meta.env.MODE === "test"
+    || (typeof __RBL_MOCK_BACKEND__ !== "undefined" && __RBL_MOCK_BACKEND__);
   backendPromise ??= isTauri
     ? realBackend().then(remoteBackend) // fork: server-mode
-    : import("./backend-mock").then((m) => m.createMockBackend());
+    : mockBackendEnabled
+      ? import("./backend-mock").then((m) => m.createMockBackend())
+      : Promise.reject(new Error("The browser mock backend is not included in this build."));
   return backendPromise;
 }
 

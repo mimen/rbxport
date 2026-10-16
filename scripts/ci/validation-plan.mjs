@@ -69,6 +69,12 @@ export function planValidation(paths, { all = false } = {}) {
       continue;
     }
 
+    // The AppImage's GTK hook is tested by scripts/appimage-gtk-hook.test.mjs.
+    if (path.startsWith("packaging/appimage/")) {
+      enable(plan, "scripts");
+      continue;
+    }
+
     if (/^(Cargo\.toml|Cargo\.lock|rust-toolchain(?:\.toml)?|\.cargo\/)/.test(path)) {
       enable(plan, "rust");
       continue;
@@ -83,6 +89,13 @@ export function planValidation(paths, { all = false } = {}) {
     // rb_file_id is the NTFS file index on Windows, read through a cfg(windows)
     // Win32 call; the crate manifest holds that dependency.
     if (path === "crates/rbl-db/src/file_id.rs" || path === "crates/rbl-db/Cargo.toml") {
+      enable(plan, "rust", "windows_rust");
+      continue;
+    }
+
+    // USB eject on Windows is cfg(windows) Plug and Play and volume FFI in
+    // rbl-devices; the manifest holds its windows-sys features.
+    if (/^crates\/rbl-devices\/(src\/eject(?:\.rs$|\/)|Cargo\.toml$)/.test(path)) {
       enable(plan, "rust", "windows_rust");
       continue;
     }

@@ -119,6 +119,22 @@ async function sourceFiles(directory) {
 // name. Add a message here when it is shown to the user and must be translated.
 const lowercaseRustStrings = new Set([
   "rekordbox is running. Quit it before making changes.",
+  "rekordbox is running. Quit it before analysing.",
+  "rekordbox is running. Quit it before editing phrases.",
+  "rekordbox changed the device track identities. Reconcile this device before reusing its previous selection.",
+  // Messages built with format! from names or values; the key is the format
+  // string with its arguments named, which the catalog matches as a template.
+  "{label}: '{title}' changed on the USB. Import its changes before syncing.",
+  "{label}: device-only track '{title}' would be lost",
+  "{label}: playlist '{name}' changed on the USB. Import or reconcile it before syncing.",
+  "Device-only playlist '{name}' would be lost",
+  "My Tag '{name}' changed on the USB",
+  "My Tags changed on USB track {id}",
+  "OneLibrary integrity check failed: {integrity}",
+  "Unsupported OneLibrary schema {version}; the device was left unchanged.",
+  "Missing {label} output",
+  "{label} contains device-side deletions. Reconcile them before syncing.",
+  "Cannot read Device Library: {e}",
 ]);
 
 async function rustErrorStrings() {
@@ -132,7 +148,14 @@ async function rustErrorStrings() {
         continue;
       }
       if (extname(entry.name) !== ".rs") continue;
-      for (const line of (await readFile(path, "utf8")).split(/\r?\n/)) {
+      const contents = await readFile(path, "utf8");
+      // A message may sit on a line of its own, away from the AppError::new( or
+      // Conflict( that carries it, so the line filter below would miss it.
+      for (const text of lowercaseRustStrings) {
+        const literal = `"${text.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")}"`;
+        if (contents.includes(literal)) found.add(text);
+      }
+      for (const line of contents.split(/\r?\n/)) {
         if (!/(?:AppError|Conflict|Err\(|error\(|updater_error)/.test(line)) continue;
         for (const match of line.matchAll(/"((?:\\.|[^"\\])*)"/g)) {
           const text = unescapeLang(match[1]);

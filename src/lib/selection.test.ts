@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  applyClick, clickSettles, contextPress, emptySelection, inListOrder, modifierFor, pressModifier, pressSelects, selectAll,
-  selectedTracks,
+  applyClick, clickSettles, contextPress, cursorIn, cursorNeedsList, cursorOf, cursorTarget, emptySelection, extendSelection, inListOrder, modifierFor, pressModifier, pressSelects, selectAll,
+  selectedTracks, type ExtendMove, type SelectionState,
 } from "./selection";
 
 describe("selection", () => {
@@ -121,5 +121,147 @@ describe("selection", () => {
     expect(inListOrder(ids, ["a", "b", "c", "d"])).toEqual(["b", "d", "gone"]);
     // A track listed twice (a playlist may hold one twice) is reported once.
     expect(inListOrder(new Set(["b"]), ["b", "a", "b"])).toEqual(["b"]);
+  });
+});
+
+describe("cursorTarget", () => {
+  it("starts from the top visible row when nothing is highlighted", () => {
+    expect(cursorTarget("moveDown", null, 7, 20, 400)).toBe(7);
+    expect(cursorTarget("moveUp", null, 7, 20, 400)).toBe(7);
+    expect(cursorTarget("moveDown", null, -1, 20, 400)).toBe(0);
+  });
+
+  it("steps from the highlighted row, a page at a time for Page Up and Down", () => {
+    expect(cursorTarget("moveDown", 10, 0, 20, 400)).toBe(11);
+    expect(cursorTarget("moveUp", 10, 0, 20, 400)).toBe(9);
+    expect(cursorTarget("pageDown", 10, 0, 20, 400)).toBe(30);
+    expect(cursorTarget("pageUp", 10, 0, 20, 400)).toBe(-10);
+    expect(cursorTarget("toTop", 10, 0, 20, 400)).toBe(0);
+    expect(cursorTarget("toBottom", 10, 0, 20, 400)).toBe(399);
+  });
+});
+
+/**
+ * Shift + cursor up/down against rekordbox 7.2.19's `browse::CustomListBox::
+ * keyPressed` @0x100e7c180 (static, macOS arm64; the decoding is in the PR
+ * for #514). Rows are named by their index, "r0" to "r9".
+ */
+describe("extendSelection", () => {
+  const listed = Array.from({ length: 10 }, (_, i) => `r${i}`);
+  const rows = (state: SelectionState) => listed.flatMap((id, i) => (state.ids.has(id) ? [i] : []));
+  const press = (state: SelectionState, ...moves: ExtendMove[]) => {
+    let s = state;
+    for (const move of moves) s = extendSelection(s, move, listed)?.selection ?? s;
+    return s;
+  };
+  const click = (index: number) => applyClick(emptySelection, { id: `r${index}`, index }, "none");
+  const toggle = (state: SelectionState, index: number) => applyClick(state, { id: `r${index}`, index }, "toggle");
+
+  it("grows a row at a time from the clicked row and moves the cursor with it", () => {
+    const down = press(click(4), "extendDown", "extendDown");
+    expect(rows(down)).toEqual([4, 5, 6]);
+    expect(cursorOf(down)).toBe(6);
+    const up = press(click(4), "extendUp", "extendUp");
+    expect(rows(up)).toEqual([2, 3, 4]);
+    expect(cursorOf(up)).toBe(2);
+  });
+
+  it("shrinks back when the direction reverses, and grows past the origin the other way", () => {
+    let s = press(click(4), "extendDown", "extendDown", "extendUp");
+    expect(rows(s)).toEqual([4, 5]);
+    expect(cursorOf(s)).toBe(5);
+    s = press(s, "extendUp");
+    expect(rows(s)).toEqual([4]);
+    s = press(s, "extendUp");
+    expect(rows(s)).toEqual([3, 4]);
+    expect(cursorOf(s)).toBe(3);
+    // And from above: down from the top row shrinks from the top.
+    s = press(s, "extendUp", "extendDown");
+    expect(rows(s)).toEqual([3, 4]);
+    expect(cursorOf(s)).toBe(3);
+  });
+
+  it("returns the new cursor row for the list to scroll into view", () => {
+    expect(extendSelection(click(4), "extendDown", listed)?.cursor).toBe(5);
+    expect(extendSelection(press(click(4), "extendDown"), "extendUp", listed)?.cursor).toBe(4);
+  });
+
+  it("stops at either end of the list", () => {
+    const top = press(click(1), "extendUp", "extendUp", "extendUp");
+    expect(rows(top)).toEqual([0, 1]);
+    expect(cursorOf(top)).toBe(0);
+    const bottom = press(click(8), "extendDown", "extendDown");
+    expect(rows(bottom)).toEqual([8, 9]);
+    expect(cursorOf(bottom)).toBe(9);
+  });
+
+  it("extends from the row ⌘-clicked last, keeping the rows apart from it", () => {
+    const s = press(toggle(click(2), 6), "extendDown");
+    expect(rows(s)).toEqual([2, 6, 7]);
+    expect(cursorOf(s)).toBe(7);
+    // Up from the ⌘-clicked row adds above it; the other row is untouched.
+    expect(rows(press(toggle(click(2), 6), "extendUp"))).toEqual([2, 5, 6]);
+  });
+
+  it("shrinking toward a ⌘-clicked row fills the gap between them, as rekordbox does", () => {
+    // 2 and 6 by ⌘-click, then down to 7, then back up: rekordbox drops 7 and
+    // selects every row from the top of the selection to the new cursor.
+    const s = press(toggle(click(2), 6), "extendDown", "extendUp");
+    expect(rows(s)).toEqual([2, 3, 4, 5, 6]);
+    expect(cursorOf(s)).toBe(6);
+    // The mirror image: 7 and 3, up to 2, then back down.
+    const m = press(toggle(click(7), 3), "extendUp", "extendDown");
+    expect(rows(m)).toEqual([3, 4, 5, 6, 7]);
+    expect(cursorOf(m)).toBe(3);
+  });
+
+  it("goes from the top selected row after the cursor row is ⌘-clicked off", () => {
+    let s = toggle(toggle(click(2), 5), 6);
+    s = toggle(s, 6);
+    expect(cursorOf(s)).toBeNull();
+    s = press(s, "extendDown");
+    expect(rows(s)).toEqual([2, 3, 5]);
+    expect(cursorOf(s)).toBe(3);
+  });
+
+  it("puts the plain cursor keys on the top selected row after the cursor row is ⌘-clicked off", () => {
+    // rekordbox's `deselectRow` @0x100e7b360 stores the first selected row
+    // as `lastRowSelected` (0x100e7b4e4), so plain Down goes to the row after it.
+    const s = toggle(toggle(toggle(click(2), 5), 6), 6);
+    expect(cursorNeedsList(s)).toBe(true);
+    const at = cursorIn(s, listed);
+    expect(at).toBe(2);
+    expect(cursorTarget("moveDown", at, 0, 5, listed.length)).toBe(3);
+    expect(cursorTarget("moveUp", at, 0, 5, listed.length)).toBe(1);
+    // Nothing of the list left selected: the top visible row, as with none.
+    expect(cursorIn({ ids: new Set(["gone"]), anchorIndex: 6, cursorIndex: null }, listed)).toBeNull();
+    // Every row ⌘-clicked off: no row is selected, so no lookup is needed.
+    expect(cursorNeedsList(toggle(click(2), 2))).toBe(false);
+    expect(cursorNeedsList(click(2))).toBe(false);
+  });
+
+  it("⌘-clicking off a row that is not the cursor leaves the cursor where it was", () => {
+    const s = toggle(toggle(toggle(click(2), 5), 7), 5);
+    expect(cursorOf(s)).toBe(7);
+  });
+
+  it("goes on from the row shift-clicked, and from the last row after Select All", () => {
+    const shifted = applyClick(click(2), { id: "r5", index: 5 }, "range", ["r2", "r3", "r4", "r5"]);
+    expect(shifted.anchorIndex).toBe(2);
+    expect(rows(press(shifted, "extendDown"))).toEqual([2, 3, 4, 5, 6]);
+    expect(rows(press(shifted, "extendUp"))).toEqual([2, 3, 4]);
+    const all = selectAll(click(4), listed);
+    expect(cursorOf(all)).toBe(9);
+    expect(rows(press(all, "extendUp"))).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+  });
+
+  it("leaves the key to a plain cursor move when no row of the list is selected", () => {
+    expect(extendSelection(emptySelection, "extendDown", listed)).toBeNull();
+    expect(extendSelection({ ids: new Set(["gone"]), anchorIndex: 3 }, "extendDown", listed)).toBeNull();
+  });
+
+  it("keeps selected ids the list does not show", () => {
+    const s = press({ ids: new Set(["gone", "r4"]), anchorIndex: 4 }, "extendDown");
+    expect([...s.ids].sort()).toEqual(["gone", "r4", "r5"]);
   });
 });

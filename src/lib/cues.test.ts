@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Cue } from "@/ipc/types";
 import {
-  MEMORY_TOLERANCE_MS, hotCue, hotLetters, memoryCueAt, memoryCueNumber, nextMemoryCue,
+  MEMORY_TOLERANCE_MS, hotCue, hotLetters, memoryCueAt, memoryCueNumber, memoryLoopAt, nextMemoryCue,
   previousMemoryCue, rowCuesOf,
 } from "./cues";
 
@@ -145,8 +145,8 @@ describe("rowCuesOf", () => {
       hot("a", "A", 5_000, "#f00"),
     ];
     expect(rowCuesOf(coloured)).toEqual([
-      ["A", 5_000, "#f00"],
-      ["B", 60_000, "#00f"],
+      ["A", 5_000, "#f00", false],
+      ["B", 60_000, "#00f", false],
     ]);
   });
 
@@ -154,6 +154,11 @@ describe("rowCuesOf", () => {
     expect(rowCuesOf([memory("m", 1_000)])).toEqual([]);
     expect(rowCuesOf([hot("blank", "", 1_000)])).toEqual([]);
     expect(rowCuesOf([])).toEqual([]);
+  });
+
+  it("marks a hot loop, which an uncoloured badge draws in the loop default", () => {
+    const loop = { ...hot("l", "C", 4_000), outMs: 6_000 };
+    expect(rowCuesOf([loop])[0]?.[3]).toBe(true);
   });
 
   it("agrees with hotLetters, which is built from it", () => {
@@ -164,7 +169,19 @@ describe("rowCuesOf", () => {
     // The backend hands the list back in position order, so the first row
     // for a slot is also the earliest — the same one `hotCue` gives the pad.
     const sorted = [hot("early", "A", 2_000, "#f00"), hot("late", "A", 9_000, "#0f0")];
-    expect(rowCuesOf(sorted)).toEqual([["A", 2_000, "#f00"]]);
+    expect(rowCuesOf(sorted)).toEqual([["A", 2_000, "#f00", false]]);
     expect(rowCuesOf(sorted)[0]?.[1]).toBe(hotCue(sorted, "A")?.positionMs);
+  });
+});
+
+describe("memoryLoopAt (#411)", () => {
+  const at = (positionMs: number, outMs: number, memory = true) =>
+    ({ id: `${positionMs}`, positionMs, outMs, letter: memory ? "" : "A", memory, colour: null }) satisfies Cue;
+  it("finds a memory loop by both ends, never a plain cue or a hot loop", () => {
+    const cues = [at(30_000, 0), at(60_000, 64_000), at(80_000, 84_000, false)];
+    expect(memoryLoopAt(cues, 60_010, 63_990)?.id).toBe("60000");
+    expect(memoryLoopAt(cues, 60_000, 62_000)).toBeNull();
+    expect(memoryLoopAt(cues, 30_000, 32_000)).toBeNull();
+    expect(memoryLoopAt(cues, 80_000, 84_000)).toBeNull();
   });
 });

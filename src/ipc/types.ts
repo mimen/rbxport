@@ -118,6 +118,18 @@ export interface ViewHandle {
   len: number;
   /** Bumped whenever the underlying library changes; stale pages are dropped. */
   gen: number;
+  /**
+   * The open playlist's status-bar tally, before any search or filter;
+   * absent for every other list, which rekordbox does not tally.
+   */
+  totals?: ListTotals;
+}
+
+/** `61 Tracks, 5 hours 2 minutes, 759.7 MB`, as numbers. */
+export interface ListTotals {
+  tracks: number;
+  seconds: number;
+  bytes: number;
 }
 
 export interface TreeNode {
@@ -184,6 +196,28 @@ export interface LibrarySummary {
   readOnly: boolean;
   /** rekordbox's own DB schema version, e.g. 6000. */
   dbVersion: number | null;
+}
+
+/** A log line's level, most severe first. */
+export type LogLevel = "error" | "warn" | "info" | "debug" | "trace";
+
+/** One line this process logged, for the Log window. */
+export interface LogLine {
+  /** Counts up from 1 for every line the process logs. */
+  seq: number;
+  /** Milliseconds since the Unix epoch. */
+  timeMs: number;
+  level: LogLevel;
+  /** The module that logged it. */
+  target: string;
+  /** The message, then its fields as `name=value`. */
+  message: string;
+}
+
+/** The lines after a given one, and the `seq` of the oldest still held. */
+export interface LogPage {
+  lines: LogLine[];
+  oldest: number;
 }
 
 /** What the app is costing, for the title bar's readout. */
@@ -596,6 +630,9 @@ export interface Backend {
   /** Rebuilds the native application menu with the active UI translations. */
   setMenuLabels(labels: Readonly<Record<string, string>>): Promise<void>;
 
+  /** Greys or enables native menu items by id (the Track and Playlist menus). */
+  setMenuEnabled(items: Readonly<Record<string, boolean>>): Promise<void>;
+
   /**
    * AppleScript's requests to the window: each is run with `handle` and its
    * reply sent back, and the backend is told once they can be heard.
@@ -788,6 +825,19 @@ export interface Backend {
   appVersion(): Promise<string>;
   /** Opens the current application log with the OS default handler. */
   openLog(): Promise<void>;
+  /**
+   * Opens the Log window, or brings the open one to the front. False where
+   * there are no windows — a browser — and the shell draws the log over itself.
+   */
+  openLogWindow(): Promise<boolean>;
+  /** The lines this process has logged after line `after`; 0 for all held. */
+  logLines(after: number): Promise<LogPage>;
+  /** Opens the folder the daily log files are in. */
+  openLogFolder(): Promise<void>;
+  /** Asks where with the save dialog and writes `text` there; null when cancelled. */
+  saveLogText(text: string): Promise<string | null>;
+  /** Puts a status-bar message in the log, so it can be read after it is gone. */
+  logStatusMessage(failed: boolean, text: string): Promise<void>;
 
   /** Shows a track's file in the Finder. */
   revealTrack(trackId: string): Promise<void>;
@@ -1114,6 +1164,11 @@ export interface UpdateCheck {
    * server; `version` is null.
    */
   nixInstall: boolean;
+  /**
+   * Why the last update, installed after the app quit, did not install.
+   * Given once, by the first check after the launch that found it.
+   */
+  previousFailure?: string | null;
 }
 
 /** A downloaded update, and whether it is already in the app's place. */
@@ -1261,8 +1316,11 @@ export interface Cue {
 /** Which slot a new cue goes in: a memory cue, or a hot cue by its letter. */
 export type CueKind = "memory" | { hot: string };
 
-/** A hot cue on a track-list row: letter, position in ms, drawn colour. */
-export type RowCue = readonly [letter: string, positionMs: number, colour: string | null];
+/**
+ * A hot cue on a track-list row: letter, position in ms, drawn colour (`null`
+ * for none of its own), and whether it is a hot loop.
+ */
+export type RowCue = readonly [letter: string, positionMs: number, colour: string | null, loop?: boolean];
 
 /** A volume an export could be written to. */
 export interface Device {
@@ -1905,8 +1963,9 @@ export interface Edits {
   addCue(track: string, kind: CueKind, positionMs: number): Promise<string>;
   /**
    * Adds a loop: a cue with an out point. `beats` is the loop's length in
-   * beats when known; left out, In and Out are all that is recorded, which
-   * is what most of the library's loops do.
+   * beats when known — a whole number, or 1/2 to 1/64 for a short Auto Beat
+   * Loop; left out, In and Out are all that is recorded, which is what most
+   * of the library's loops do.
    */
   addLoop(track: string, kind: CueKind, inMs: number, outMs: number, beats?: number): Promise<string>;
   moveCue(cue: string, positionMs: number): Promise<void>;

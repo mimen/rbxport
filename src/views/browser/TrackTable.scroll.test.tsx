@@ -5,6 +5,8 @@
  * track a deck holds, as rekordbox 7.2.19 does (#338; see
  * `src/lib/locateLoaded.ts` for the functions read).
  */
+import { locateLoadedTrack } from "@/lib/locateLoaded";
+import { hasCommand, runCommand } from "@/lib/commands";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -185,6 +187,20 @@ describe("Locate track loaded on deck (command + L)", () => {
     expect(selected()).toBe(1);
   });
 
+  it("does the same when the Track menu runs the shared command", async () => {
+    const rows: (RowDto | null)[] = [];
+    render({ deckTrackIds: ["100300", null], onSelectedRow: (row) => rows.push(row) });
+    await settle();
+    await settle();
+    act(() => {
+      expect(locateLoadedTrack()).toBe(true);
+    });
+    await settle();
+    await settle();
+    expect(rows.at(-1)?.id).toBe("100300");
+    expect(selected()).toBe(1);
+  });
+
   it("leaves the list where it is when the row is already on screen", async () => {
     const rows: (RowDto | null)[] = [];
     render({ deckTrackIds: ["100003", null], onSelectedRow: (row) => rows.push(row) });
@@ -248,5 +264,179 @@ describe("Locate track loaded on deck (command + L)", () => {
     await settle();
     expect(shown).toBe(0);
     expect(selected()).toBe(0);
+  });
+});
+
+describe("the list's commands, from a key and from anywhere else (#431)", () => {
+  const key = (init: KeyboardEventInit) => {
+    const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    return event;
+  };
+  const selectedIds = () =>
+    [...host.querySelectorAll('[role="row"][aria-selected="true"]')].map((row) => row.textContent);
+
+  it("moves the cursor the same way for Cursor Down and its command", async () => {
+    const rows: (RowDto | null)[] = [];
+    render({ onSelectedRow: (row) => rows.push(row) });
+    await settle();
+    await settle();
+    expect(key({ key: "ArrowDown", code: "ArrowDown" }).defaultPrevented).toBe(true);
+    await settle();
+    const byKey = rows.at(-1)?.id;
+    expect(key({ key: "ArrowDown", code: "ArrowDown" }).defaultPrevented).toBe(true);
+    await settle();
+    const secondByKey = rows.at(-1)?.id;
+    act(() => {
+      expect(runCommand("moveUp", { scope: "main" })).toBe(true);
+    });
+    await settle();
+    expect(rows.at(-1)?.id).toBe(byKey);
+    act(() => {
+      expect(runCommand("moveDown", { scope: "main" })).toBe(true);
+    });
+    await settle();
+    expect(rows.at(-1)?.id).toBe(secondByKey);
+  });
+
+  it("selects the whole list the same way for Select All and its command", async () => {
+    render({});
+    await settle();
+    await settle();
+    expect(key({ key: "a", code: "KeyA", ctrlKey: true }).defaultPrevented).toBe(true);
+    await settle();
+    const byKey = selectedIds();
+    expect(byKey.length).toBeGreaterThan(1);
+    // Home rather than Down: after Select All the cursor is on the last row,
+    // as rekordbox's is, so Down would scroll the list to its end.
+    key({ key: "Home", code: "Home" });
+    await settle();
+    expect(selectedIds()).toHaveLength(1);
+    act(() => {
+      expect(runCommand("selectAll", { scope: "main" })).toBe(true);
+    });
+    await settle();
+    expect(selectedIds()).toEqual(byKey);
+  });
+
+  it("extends and shrinks the selection the same way for shift + cursor and its commands (#514)", async () => {
+    render({});
+    await settle();
+    await settle();
+    key({ key: "ArrowDown", code: "ArrowDown" });
+    await settle();
+    const first = selectedIds();
+    expect(first).toHaveLength(1);
+    expect(key({ key: "ArrowDown", code: "ArrowDown", shiftKey: true }).defaultPrevented).toBe(true);
+    await settle();
+    expect(key({ key: "ArrowDown", code: "ArrowDown", shiftKey: true }).defaultPrevented).toBe(true);
+    await settle();
+    const three = selectedIds();
+    expect(three).toHaveLength(3);
+    expect(three[0]).toBe(first[0]);
+    // Reversing shrinks back toward the row it started from.
+    expect(key({ key: "ArrowUp", code: "ArrowUp", shiftKey: true }).defaultPrevented).toBe(true);
+    await settle();
+    expect(selectedIds()).toEqual(three.slice(0, 2));
+    act(() => {
+      expect(runCommand("extendDown", { scope: "main" })).toBe(true);
+    });
+    await settle();
+    expect(selectedIds()).toEqual(three);
+    act(() => {
+      expect(runCommand("extendUp", { scope: "main" })).toBe(true);
+      expect(runCommand("extendUp", { scope: "main" })).toBe(true);
+    });
+    await settle();
+    expect(selectedIds()).toEqual(first);
+  });
+
+  const listRows = () => [...host.querySelectorAll('[role="row"][aria-selected]')];
+  const mouse = (row: Element | undefined, init: MouseEventInit = {}) => {
+    act(() => {
+      row?.firstElementChild?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0, ...init }));
+    });
+  };
+
+  it("makes shift + cursor a plain cursor move when no row of the list is selected (#514)", async () => {
+    render({});
+    await settle();
+    await settle();
+    key({ key: "ArrowDown", code: "ArrowDown" });
+    await settle();
+    const picked = selectedIds();
+    expect(picked).toHaveLength(1);
+    // The row picked in All Tracks stays selected, but the playlist lacks it.
+    render({ spec: PLAYLIST });
+    await settle();
+    await settle();
+    expect(selectedIds()).toEqual([]);
+    expect(key({ key: "ArrowDown", code: "ArrowDown", shiftKey: true }).defaultPrevented).toBe(true);
+    await settle();
+    const moved = selectedIds();
+    expect(moved).toHaveLength(1);
+    expect(moved).not.toEqual(picked);
+    // The plain move is not an extension: a later Select All, whose cursor is
+    // the last row, must not scroll the list there.
+    const scroller = host.querySelector('[data-testid="track-scroll"]') as HTMLElement;
+    const top = scroller.scrollTop;
+    act(() => {
+      expect(runCommand("selectAll", { scope: "main" })).toBe(true);
+    });
+    await settle();
+    expect(selectedIds().length).toBeGreaterThan(1);
+    expect(scroller.scrollTop).toBe(top);
+  });
+
+  it("puts the cursor keys on the top selected row after the cursor row is ⌘-clicked off (#514)", async () => {
+    render({});
+    await settle();
+    await settle();
+    const before = listRows().map((row) => row.textContent);
+    mouse(listRows()[2]);
+    mouse(listRows()[5], { metaKey: true, ctrlKey: true });
+    mouse(listRows()[6], { metaKey: true, ctrlKey: true });
+    mouse(listRows()[6], { metaKey: true, ctrlKey: true });
+    await settle();
+    expect(selectedIds()).toEqual([before[2], before[5]]);
+    key({ key: "ArrowDown", code: "ArrowDown" });
+    await settle();
+    expect(selectedIds()).toEqual([before[3]]);
+  });
+
+  it("asks for the view's ids once for a run of shift + cursor presses (#514)", async () => {
+    const mock = createMockBackend({ trackCount: 400, latencyMs: 0, writable: true });
+    let asked = 0;
+    __setBackend({
+      ...mock,
+      viewIdsInRange: (viewId: number, from: number, to: number) => {
+        if (from === 0 && to >= 400) asked += 1;
+        return mock.viewIdsInRange(viewId, from, to);
+      },
+    });
+    render({});
+    await settle();
+    await settle();
+    key({ key: "ArrowDown", code: "ArrowDown" });
+    await settle();
+    for (let i = 0; i < 4; i++) {
+      key({ key: "ArrowDown", code: "ArrowDown", shiftKey: true });
+      await settle();
+    }
+    expect(selectedIds()).toHaveLength(5);
+    expect(asked).toBe(1);
+  });
+
+  it("answers only for the list it is, and not once the list has gone", async () => {
+    render({});
+    await settle();
+    expect(hasCommand("selectAll", "main")).toBe(true);
+    expect(hasCommand("selectAll", "sub")).toBe(false);
+    act(() => {
+      root.render(<></>);
+    });
+    expect(hasCommand("selectAll", "main")).toBe(false);
   });
 });

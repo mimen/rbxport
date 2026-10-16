@@ -178,7 +178,9 @@ test("dragging a selection drops every row in it, not just the one under the han
   // A plain click on a selected row, released without a drag, does collapse
   // to it — the ordinary click still works.
   await rows(page).nth(2).locator('[data-col="title"]').click();
-  await expect(page.getByText("Selected: 1 Track")).toBeVisible();
+  await expect(rows(page).and(page.locator('[aria-selected="true"]'))).toHaveCount(1);
+  // One track is fewer than rekordbox counts, so the bar goes blank.
+  await expect(page.getByRole("contentinfo")).not.toContainText("Selected:");
 
   await made.click();
   await expect(page.getByTestId("browser-title")).toHaveText("New playlist (3 Tracks)");
@@ -729,4 +731,108 @@ test("the tree will not be rearranged while rekordbox holds the library", async 
   // Undraggable rather than refused on the drop: a write that cannot happen
   // should not be offered in the first place.
   await expect(item(page, "Melodic Vox")).not.toHaveAttribute("draggable", "true");
+});
+
+// rekordbox's Renumber Track Order (#413): over a playlist sorted by another
+// column, the header menu writes the order on show as the playlist's own.
+test("Renumber Track Order writes the sorted order as the playlist's track numbers", async ({ page }) => {
+  await open(page);
+  await openPlaylist(page);
+  const before = await titles(page);
+  const header = page.getByRole("columnheader", { name: /Track Title/ });
+  const menu = page.getByRole("menu", { name: "Columns" });
+  const renumber = menu.getByRole("menuitem", { name: "Renumber Track Order" });
+
+  // In its own order there is nothing to renumber: rekordbox leaves it out.
+  await header.click({ button: "right" });
+  await expect(menu).toBeVisible();
+  await expect(renumber).toHaveCount(0);
+  await page.keyboard.press("Escape");
+
+  await header.click();
+  await expect(header).toHaveAttribute("data-sorted", "true");
+  const sorted = await titles(page);
+  expect(sorted.length).toBeGreaterThan(2);
+  // Otherwise the test would pass with nothing written.
+  expect(sorted).not.toEqual(before);
+
+  // Greyed while the search box holds text, as rekordbox greys it.
+  const search = page.getByRole("searchbox", { name: "Search within this track list", exact: true }).first();
+  await search.fill(sorted[0] ?? "");
+  await header.click({ button: "right" });
+  await expect(renumber).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await search.fill("");
+
+  await header.click({ button: "right" });
+  await renumber.click();
+  await expect(page.getByRole("contentinfo")).toContainText("Playlist reordered.");
+
+  // Back in track-number order, the rows are the order the title sort showed.
+  await page.getByRole("columnheader", { name: "#" }).click();
+  await expect.poll(() => titles(page)).toEqual(sorted);
+});
+
+test("Renumber Track Order answers the key the Keyboard pane gave it", async ({ page }) => {
+  // rekordbox binds no key to it; this is one a person picked.
+  await page.addInitScript(() => localStorage.setItem("rbl.preferences", JSON.stringify({
+    advanced: { protectLibrary: false },
+    keyboard: { overrides: { renumberTrackOrder: { key: "r", metaKey: true, altKey: true } } },
+  })));
+  await open(page);
+  await openPlaylist(page);
+  const header = page.getByRole("columnheader", { name: /Track Title/ });
+  await header.click();
+  await expect(header).toHaveAttribute("data-sorted", "true");
+  const sorted = await titles(page);
+
+  await page.getByRole("row").filter({ has: page.getByRole("gridcell") }).first().click();
+  await page.keyboard.press("ControlOrMeta+Alt+KeyR");
+  await expect(page.getByRole("contentinfo")).toContainText("Playlist reordered.");
+
+  await page.getByRole("columnheader", { name: "#" }).click();
+  await expect.poll(() => titles(page)).toEqual(sorted);
+});
+
+test("the status bar tallies the open playlist as rekordbox does, and the collection not at all", async ({ page }) => {
+  await open(page);
+  const bar = page.getByRole("contentinfo");
+  const title = page.getByTestId("browser-title");
+  // rekordbox clears the bar for the collection (`isCollectionList`).
+  await collection(page).click();
+  await expect(title).toContainText("(2000 Tracks)");
+  await expect(bar).not.toContainText(/\d+ Tracks, /);
+
+  await item(page, "Eurodance").click();
+  await expect(title).toContainText("Eurodance (");
+  const count = Number(/\((\d+) Tracks\)/.exec(await title.innerText())?.[1]);
+  // `61 Tracks, 5 hours 2 minutes, 759.7 MB`: every track, whole minutes,
+  // binary megabytes with at most one decimal.
+  const tally = new RegExp(`^${count} Tracks, (\\d+ hours )?\\d+ minutes, [\\d,]+(\\.\\d)? (MB|GB)$`);
+  const shown = bar.getByText(tally);
+  await expect(shown).toBeVisible();
+  const before = await shown.innerText();
+
+  // Picking tracks writes the bar instead, as rekordbox's
+  // `updateStatusBarWithSelectedTrackNum` does: one track is counted as none
+  // and clears it, two or more say so, and letting go leaves it blank.
+  await rows(page).first().locator('[data-col="title"]').click();
+  await expect(bar.getByText(tally)).toHaveCount(0);
+  await expect(bar).not.toContainText("Selected:");
+  await rows(page).nth(1).locator('[data-col="title"]').click({ modifiers: ["Shift"] });
+  await expect(bar.getByText("Selected: 2 Tracks", { exact: true })).toBeVisible();
+  await rows(page).first().locator('[data-col="title"]').click({ modifiers: ["ControlOrMeta"] });
+  await expect(bar).not.toContainText("Selected:");
+  await expect(bar.getByText(tally)).toHaveCount(0);
+
+  // A new, empty playlist is `0 Tracks`, with no time or size.
+  await chooseFromTreeMenu(page, item(page, "Hardstyle"), "Create New Playlist");
+  const made = item(page, "New playlist");
+  await made.click();
+  await expect(title).toHaveText("New playlist (0 Tracks)");
+  await expect(bar.getByText("0 Tracks", { exact: true })).toBeVisible();
+
+  // Picking the playlist in the tree again brings its tally back.
+  await item(page, "Eurodance").click();
+  await expect(bar.getByText(before, { exact: true })).toBeVisible();
 });

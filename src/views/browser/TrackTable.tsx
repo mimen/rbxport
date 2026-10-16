@@ -15,14 +15,14 @@ import { TRACK_SEARCH_OPTIONS, type TrackSearchField } from "@/lib/search";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { defaultRangeExtractor, useVirtualizer, type Range } from "@tanstack/react-virtual";
-import type { DeckId, RowDto, SortColumn, TrackField, ViewSpec } from "@/ipc/types";
+import type { DeckId, ListTotals, RowDto, SortColumn, TrackField, ViewSpec } from "@/ipc/types";
 import { useTrackView, type PendingEdits, type Seed } from "@/store/useTrackView";
 import { PAGE_SIZE } from "@/lib/rowCache";
 import { SEEDED_ROWS } from "@/lib/session";
 import { formatBitrate, formatBpm, formatBytes, formatDuration, formatEpochDate, formatShortDate } from "@/lib/format";
 import {
-  applyClick, clickSettles, emptySelection, inListOrder, pressModifier, pressSelects, selectAll, selectedTracks,
-  type SelectionState,
+  applyClick, clickSettles, cursorIn, cursorNeedsList, cursorOf, cursorTarget, emptySelection, extendSelection, inListOrder, pressModifier, pressSelects, selectAll,
+  selectedTracks, type CursorMove, type ExtendMove, type SelectionState,
 } from "@/lib/selection";
 import { ContextMenu } from "@/components/ContextMenu";
 import {
@@ -47,10 +47,18 @@ import type { KeyDisplay } from "@/ipc/types";
 import { ColumnMenu } from "./ColumnMenu";
 import { createDragAutoscroll } from "@/lib/dragAutoscroll";
 import { setRowDragImage } from "./dragGhost";
-import { detectPlatform, dispatch, isTyping } from "@/lib/shortcuts";
-import { locateStep, needsCentering, restoredScrollTop, type SavedScroll } from "@/lib/locateLoaded";
+import { keyMap } from "@/lib/keyPresets";
+import { detectPlatform, dispatch, isTyping, type Action } from "@/lib/shortcuts";
+import { runCommand, type CommandScope } from "@/lib/commands";
+import { useCommands } from "@/store/useCommands";
+import { publishListMenuState } from "@/lib/menuBar";
+import { locateLoadedTrack, locateStep, needsCentering, registerLocateLoaded, restoredScrollTop, type SavedScroll } from "@/lib/locateLoaded";
 
 const ROW_H = 25; // --s-row-height
+/** The list's commands its keyboard handler runs: selection and the cursor. */
+const LIST_COMMANDS: ReadonlySet<Action> = new Set<Action>([
+  "selectAll", "moveUp", "moveDown", "pageUp", "pageDown", "toTop", "toBottom", "extendUp", "extendDown",
+]);
 /**
  * A removal the list asks for: resolves true once the tracks are gone, false
  * when the person declined or the write was refused.
@@ -779,7 +787,13 @@ export interface TrackTableProps {
   onShowCollection?: () => void;
   spec: ViewSpec;
   onSortChange: (column: SortColumn) => void;
-  onSelectionChange?: (count: number) => void;
+  /**
+   * `picked`: the tracks were picked in this list since it was opened, so the
+   * status bar says what is selected rather than the list's tally.
+   */
+  onSelectionChange?: (count: number, picked: boolean) => void;
+  /** The open playlist's tally for the status bar; undefined for other lists. */
+  onTotalsChange?: (totals: ListTotals | undefined) => void;
   title: string;
   /** The live search text. Rust does the filtering; this is only the box. */
   query: string;
@@ -829,6 +843,18 @@ export interface TrackTableProps {
    * order rather than sorted by a column.
    */
   onReorder?: ((order: readonly string[]) => void) | undefined;
+  /**
+   * Playlist > Renumber Track Order: write the order the list shows, sorted
+   * by whatever column, as the playlist's own.
+   *
+   * Absent unless the list is an ordinary playlist that can be written.
+   * rekordbox's `ListViewer::renumberOrderId` hands its database the rows
+   * on show, then any the list does not show, in their old order; the
+   * backend's reorder keeps the rest the same way.
+   */
+  onRenumber?: ((order: readonly string[]) => void) | undefined;
+  /** This list is the sub-browser's, which keys reach only while it has the focus. */
+  subBrowser?: boolean;
   /**
    * Write a metadata field typed over in the list.
    *
@@ -947,6 +973,12 @@ const TRAFFIC_SOURCES: readonly { id: TrafficLightSource; label: string; short: 
  * a second copy on screen is keyed by its slot too: two siblings with one key
  * leave a stale row behind when the list changes.
  */
+/**
+ * Whether the sub-browser holds the focus: the last press landed in it.
+ * One flag for the window, since only one sub-browser is ever open.
+ */
+let subBrowserEngaged = false;
+
 function rowKey(row: RowDto | undefined, slot: number | string | bigint, keyed: Set<string>): string {
   if (!row) return `slot-${String(slot)}`;
   if (!keyed.has(row.id)) {
@@ -957,9 +989,9 @@ function rowKey(row: RowDto | undefined, slot: number | string | bigint, keyed: 
 }
 
 export const TrackTable = memo(function TrackTable({
-  deckTrackIds = NO_DECKS, onShowCollection, spec, onSortChange, onSelectionChange, title, query, onQueryChange, searchRef, searchField = "all", onSearchFieldChange,
+  deckTrackIds = NO_DECKS, onShowCollection, spec, onSortChange, onSelectionChange, onTotalsChange, title, query, onQueryChange, searchRef, searchField = "all", onSearchFieldChange,
   columns, onColumnMove, onColumnResize, onColumnToggle, onColumnAutoSize,
-  onColumnAutoSizeAll, onFocusedRow, onDragTracks, dragging = false, onDropTracks, onDropFiles, onDragError, onRate, onComment, onReorder, onEditField, onEditBlocked, seed, onFirstRows,
+  onColumnAutoSizeAll, onFocusedRow, onDragTracks, dragging = false, onDropTracks, onDropFiles, onDragError, onRate, onComment, onReorder, onRenumber, subBrowser = false, onEditField, onEditBlocked, seed, onFirstRows,
   libraryGeneration, pendingEdits, pendingRows = 0, onSelectedTracks, onAnalyse,
   onShowInformation, onShowInFinder, onRemoveFromPlaylist, onRemoveFromHistory, onResetPlayCount,
   onRemoveFromCollection, onAutoRelocate, onRelocate, onConvertMemoryCues, readOnly = false,
@@ -972,6 +1004,8 @@ export const TrackTable = memo(function TrackTable({
   const view = useTrackView(spec, libraryGeneration, pendingEdits, seed, extraColumns);
   const preferences = usePreferences();
   const { keyDisplay, previewCueMarkers, tooltips } = preferences.view;
+  // The keys the Keyboard pane's preset and the person's own changes give.
+  const keyOverrides = keyMap(preferences.keyboard);
   const tip = useTooltip();
   // The Key cell's list, fetched the first time one opens so the table does
   // not ask for it at startup.
@@ -1256,7 +1290,7 @@ export const TrackTable = memo(function TrackTable({
         const id = ids[0];
         setSelection(
           id === undefined
-            ? (s) => ({ ...s, anchorIndex: index })
+            ? (s) => ({ ...s, anchorIndex: index, cursorIndex: index })
             : { ids: new Set([id]), anchorIndex: index },
         );
       });
@@ -1292,6 +1326,14 @@ export const TrackTable = memo(function TrackTable({
       onShowCollection();
     });
   }, [deckTrackIds, locateHere, showsCollection, onShowCollection]);
+  // The shared command: Command + L and Track › Locate track loaded on deck
+  // both reach this through `locateLoadedTrack`. Only the table that is given
+  // the decks (the main browser) answers it.
+  const answersLocate = deckTrackIds !== NO_DECKS;
+  useEffect(() => {
+    if (!answersLocate) return;
+    return registerLocateLoaded(locateLoaded);
+  }, [answersLocate, locateLoaded]);
   // All Tracks has opened for a track the list before it lacked.
   useEffect(() => {
     if (view.loading) return;
@@ -1300,70 +1342,119 @@ export const TrackTable = memo(function TrackTable({
     pendingLocate.current = null;
     if (showsCollection) void locateHere(id);
   }, [view.loading, view.sourceKey, showsCollection, locateHere]);
+  // This list's own commands (see `src/lib/commands.ts`), the main
+  // browser's or the sub-browser's: the keys below run them, and so can
+  // anything else that asks for the same list.
+  const listScope: CommandScope = subBrowser ? "sub" : "main";
+  // The view's ids top to bottom, asked of the backend once per view: the
+  // token changes with any re-sort, search or library edit, so an answer
+  // held against it is the list as it stands. A held Shift + Down and the
+  // list-order report its selection changes trigger then share one fetch
+  // rather than each asking for every id on every repeat.
+  const listedCache = useRef<{ token: string; count: number; ids: Promise<string[]> } | null>(null);
+  const listedIds = useCallback((): Promise<string[]> => {
+    const held = listedCache.current;
+    if (held && held.token === view.token && held.count === view.count) return held.ids;
+    const entry = { token: view.token, count: view.count, ids: view.idsInRange(0, view.count) };
+    listedCache.current = entry;
+    entry.ids.catch(() => {
+      if (listedCache.current === entry) listedCache.current = null;
+    });
+    return entry.ids;
+  }, [view]);
+  const cursorCommand = (move: CursorMove) => () => {
+    if (view.count === 0) return false;
+    const page = Math.max(1, Math.floor((scrollRef.current?.clientHeight ?? 0) / rowH) - 1);
+    const go = (at: number | null) => moveCursor(cursorTarget(move, at, firstIndex, page, view.count));
+    // With the cursor row ⌘-clicked off, the keys go from the topmost
+    // selected row (see `SelectionState.cursorIndex`), which takes the ids.
+    if (cursorNeedsList(selection) && move !== "toTop" && move !== "toBottom") {
+      const state = selection;
+      void listedIds().then((listed) => go(cursorIn(state, listed)));
+    } else {
+      go(cursorOf(selection));
+    }
+    return true;
+  };
+  // Shift + cursor up/down (see `extendSelection`). The whole view's ids are
+  // asked for, since the selection is by id and may hold rows never fetched;
+  // the change is applied to the selection as it is when they arrive, so a
+  // held key's repeats each take a step. With no row of this list selected
+  // (nothing at all, or only rows of the list shown before or hidden by a
+  // search) the key is a plain cursor move, as rekordbox's is.
+  const followCursor = useRef(false);
+  const extendCommand = (move: ExtendMove) => () => {
+    if (view.count === 0) return false;
+    const plain = cursorCommand(move === "extendUp" ? "moveUp" : "moveDown");
+    if (selection.ids.size === 0) return plain();
+    const state = selection;
+    void listedIds().then((listed) => {
+      if (extendSelection(state, move, listed) === null) {
+        plain();
+        return;
+      }
+      setSelection((s) => {
+        const extended = extendSelection(s, move, listed);
+        if (!extended) return s;
+        followCursor.current = true;
+        return extended.selection;
+      });
+    });
+    return true;
+  };
+  // The extended row is scrolled into view, as rekordbox's
+  // `selectRowInternal` does for it.
+  useEffect(() => {
+    if (!followCursor.current) return;
+    followCursor.current = false;
+    const at = cursorOf(selection);
+    if (at !== null && at < view.count) virtualizer.scrollToIndex(at);
+  }, [selection, view.count, virtualizer]);
+  useCommands({
+    // The ids come from the backend, which resolves them for every row of
+    // the view — including the ones that were never scrolled into range and
+    // so never fetched.
+    selectAll: () => {
+      if (view.count === 0) return false;
+      void view.idsInRange(0, view.count).then((ids) => {
+        setSelection((s) => selectAll(s, ids));
+      });
+      return true;
+    },
+    moveUp: cursorCommand("moveUp"),
+    moveDown: cursorCommand("moveDown"),
+    pageUp: cursorCommand("pageUp"),
+    pageDown: cursorCommand("pageDown"),
+    toTop: cursorCommand("toTop"),
+    toBottom: cursorCommand("toBottom"),
+    extendUp: extendCommand("extendUp"),
+    extendDown: extendCommand("extendDown"),
+  }, listScope);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      const action = dispatch(event, platform, target, preferences.keyboard.overrides);
+      const action = dispatch(event, platform, target, keyOverrides);
       // Command + L: whatever the open list holds, even nothing, since a
       // track it lacks is found in All Tracks.
       if (action === "locateLoaded") {
         event.preventDefault();
-        locateLoaded();
+        if (answersLocate) locateLoadedTrack();
         return;
       }
-      if (action === null || view.count === 0) return;
+      if (action === null || !LIST_COMMANDS.has(action)) return;
       // A focused knob or fader owns the up/down keys — turning one must not
       // also walk the track list. `dispatch` already yields the text fields.
       const role = target?.getAttribute?.("role");
       if (role === "slider" || role === "spinbutton") return;
-      // Ctrl/⌘+A selects the whole list. The ids come from the backend, which
-      // resolves them for every row of the view — including the ones that were
-      // never scrolled into range and so never fetched. preventDefault stops
-      // the webview's own "select all text" from highlighting the interface
-      // instead, which is what a plain Ctrl+A did before this.
-      if (action === "selectAll") {
-        event.preventDefault();
-        void view.idsInRange(0, view.count).then((ids) => {
-          setSelection((s) => selectAll(s, ids));
-        });
-        return;
-      }
-      // The first press with nothing highlighted picks the top visible row;
-      // after that the keys step from where the highlight is.
-      const start = firstIndex < 0 ? 0 : firstIndex;
-      const cursor = selection.anchorIndex ?? start;
-      const page = Math.max(1, Math.floor((scrollRef.current?.clientHeight ?? 0) / rowH) - 1);
-      let to: number;
-      switch (action) {
-        case "moveDown":
-          to = selection.anchorIndex === null ? start : cursor + 1;
-          break;
-        case "moveUp":
-          to = selection.anchorIndex === null ? start : cursor - 1;
-          break;
-        case "pageDown":
-          to = cursor + page;
-          break;
-        case "pageUp":
-          to = cursor - page;
-          break;
-        case "toTop":
-          to = 0;
-          break;
-        case "toBottom":
-          to = view.count - 1;
-          break;
-        default:
-          return;
-      }
-      event.preventDefault();
-      moveCursor(to);
+      // preventDefault stops the webview's own "select all text" from
+      // highlighting the interface on Ctrl/⌘+A, and the arrows from scrolling.
+      if (runCommand(action, { scope: listScope, repeat: event.repeat })) event.preventDefault();
     };
     window.addEventListener("keydown", onKey);
     return () => {
       window.removeEventListener("keydown", onKey);
     };
-  }, [platform, selection.anchorIndex, firstIndex, rowH, view, view.count, moveCursor, preferences.keyboard.overrides, locateLoaded]);
+  }, [platform, keyOverrides, answersLocate, listScope]);
 
   const startDragOut = useCallback(
     (row: RowDto) => {
@@ -1578,9 +1669,25 @@ export const TrackTable = memo(function TrackTable({
     },
   );
 
+  // rekordbox's bar has one label, written by whichever changed last:
+  // picking a list puts up its tally (`changedSelectedFolItem`), picking
+  // tracks the selection (`selectedRowsChanged`). A selection carried over
+  // from the list before is not a pick in this one.
+  const counted = useRef<{ ids: ReadonlySet<string>; source: string } | null>(null);
+  const pickedIn = useRef<string | null>(null);
   useEffect(() => {
-    onSelectionChange?.(selection.ids.size);
-  }, [selection.ids, onSelectionChange]);
+    const was = counted.current;
+    if (was !== null && was.source !== view.sourceKey) pickedIn.current = null;
+    else if (was !== null && was.ids !== selection.ids) pickedIn.current = view.sourceKey;
+    counted.current = { ids: selection.ids, source: view.sourceKey };
+    onSelectionChange?.(selection.ids.size, pickedIn.current === view.sourceKey);
+  }, [selection.ids, view.sourceKey, onSelectionChange]);
+
+  useEffect(() => {
+    onTotalsChange?.(view.totals);
+  }, [view.totals, onTotalsChange]);
+  // A list that is no longer shown has nothing to tally.
+  useEffect(() => () => onTotalsChange?.(undefined), [onTotalsChange]);
 
   const reportedRow = useRef<string | null>(null);
   useEffect(() => {
@@ -1625,6 +1732,64 @@ export const TrackTable = memo(function TrackTable({
     [],
   );
 
+  // The track menu's commands (see `src/lib/commands.ts`): its entries and
+  // the native Track menu's items (`src/lib/menuBar.ts`) both run these, on
+  // the selection.
+  const selectedRows = useCallback((): RowDto[] => {
+    const found: RowDto[] = [];
+    if (selection.ids.size === 0) return found;
+    for (let i = 0; i < view.count && found.length < selection.ids.size; i++) {
+      const row = view.rowAt(i);
+      if (row !== undefined && selection.ids.has(row.id)) found.push(row);
+    }
+    return found;
+  }, [selection.ids, view]);
+  const onSelection = (run: ((ids: string[]) => unknown) | undefined) => () => {
+    if (!run || selection.ids.size === 0) return false;
+    run([...selection.ids]);
+    return true;
+  };
+  useCommands({
+    importToCollection: onSelection(onImportToCollection),
+    analysisLockOn: onSelection(onAnalysisLock && ((ids) => onAnalysisLock(ids, true))),
+    analysisLockOff: onSelection(onAnalysisLock && ((ids) => onAnalysisLock(ids, false))),
+    reloadTag: onSelection(onReloadTag),
+    removeFromCollection: onSelection(onRemoveFromCollection && ((ids) => void onRemoveFromCollection(ids))),
+    autoRelocate: onSelection(onAutoRelocate),
+    // Relocate goes through the tracks in the order the list shows them.
+    relocate: () => {
+      if (!onRelocate || selection.ids.size === 0) return false;
+      const chosen = selection.ids;
+      void view.idsInRange(0, view.count)
+        .then((listed) => onRelocate(inListOrder(chosen, listed)))
+        .catch(() => onRelocate([...chosen]));
+      return true;
+    },
+    // The one selected row (rekordbox's menu bar wants exactly one).
+    showInFinder: () => {
+      if (!onShowInFinder || selection.ids.size !== 1) return false;
+      const row = selectedRows()[0];
+      if (row === undefined) return false;
+      onShowInFinder(row);
+      return true;
+    },
+  }, listScope);
+  // What the native Track menu needs to grey its items, kept current.
+  useEffect(() => {
+    if (spec.source.kind === "device") {
+      publishListMenuState(listScope, { source: "device", selected: selection.ids.size, rows: [], loose: false });
+      return;
+    }
+    const rows = selectedRows().map((row) => ({ missing: row.missing === true }));
+    publishListMenuState(listScope, {
+      source: spec.source.kind,
+      selected: selection.ids.size,
+      rows,
+      loose: hasLooseId(selection.ids),
+    });
+  }, [listScope, spec.source.kind, selection.ids, view.token, selectedRows]);
+  useEffect(() => () => publishListMenuState(listScope, null), [listScope]);
+
   // Whether the Delete key speaks to this list: rekordbox's list hears it
   // only while it has the focus. The last press landed in this list, and
   // nowhere else since — not the tree, the other list, a deck, a waveform or
@@ -1644,6 +1809,60 @@ export const TrackTable = memo(function TrackTable({
     };
   }, []);
 
+  // Playlist > Renumber Track Order: the ids in the order on show, every
+  // row of the view and not only those fetched. rekordbox refuses it as it
+  // refuses any edit while the library is protected.
+  const renumber = useEventCallback(() => {
+    if (!onRenumber) return;
+    if (readOnly) {
+      onEditBlocked?.();
+      return;
+    }
+    if (view.count === 0) return;
+    void view.idsInRange(0, view.count).then((ids) => {
+      if (ids.length > 0) onRenumber(ids);
+    });
+  });
+  // The command its key and anything else asking for this list's renumber
+  // run; one press is one renumber.
+  useCommands({
+    renumberTrackOrder: ({ repeat }) => {
+      if (!onRenumber) return false;
+      if (!repeat) renumber();
+      return true;
+    },
+  }, subBrowser ? "sub" : "main");
+  // Its key, once the Keyboard pane gives it one. rekordbox hands the
+  // command to the sub-browser's list while the sub-browser has the focus
+  // and to the main list otherwise [OBS: `BrowseBasicView::performCommand`
+  // @0x1003186f8, rekordbox 7.2.19 macOS]; the focus here is where the last
+  // press landed, the sub-browser's tree included.
+  useEffect(() => {
+    const onDown = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target === null || target.closest('[role="menu"], [role="dialog"]')) return;
+      const pane = rootRef.current?.parentElement ?? rootRef.current;
+      subBrowserEngaged = pane?.contains(target) === true;
+    };
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (dispatch(event, platform, target, keyOverrides) !== "renumberTrackOrder") return;
+      if (subBrowser !== subBrowserEngaged) return;
+      if (runCommand("renumberTrackOrder", { scope: subBrowser ? "sub" : "main", repeat: event.repeat })) {
+        event.preventDefault();
+      }
+    };
+    if (subBrowser) window.addEventListener("mousedown", onDown, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      if (subBrowser) {
+        window.removeEventListener("mousedown", onDown, true);
+        subBrowserEngaged = false;
+      }
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [subBrowser, platform, keyOverrides]);
+
   // Delete and ⌫ remove the whole selection the way this list's own menu
   // entry does, asking first as it does: from the collection, a playlist, a
   // history or the Tag List. rekordbox's list does the same with either key
@@ -1660,7 +1879,7 @@ export const TrackTable = memo(function TrackTable({
     if (target !== null && !inList && target !== document.body && target !== document.documentElement) return;
     if (isTyping(target) || target?.closest('[role="tree"], [role="dialog"], [role="menu"], button, [role="slider"], [role="spinbutton"]')) return;
     // A key the person bound to something else in the Keyboard pane is theirs.
-    if (dispatch(event, platform, target, preferences.keyboard.overrides) !== null) return;
+    if (dispatch(event, platform, target, keyOverrides) !== null) return;
     const action = deleteKeyAction(spec.source.kind);
     if (action === null || selection.ids.size === 0 || hasLooseId(selection.ids)) return;
     event.preventDefault();
@@ -1746,7 +1965,7 @@ export const TrackTable = memo(function TrackTable({
     if (selection.ids.size < 2) return;
     const asked = { ids: selection.ids, token: view.token, order: null as string[] | null };
     listOrder.current = asked;
-    void view.idsInRange(0, view.count).then((listed) => {
+    void listedIds().then((listed) => {
       if (listOrder.current !== asked) return;
       asked.order = inListOrder(asked.ids, listed);
       report(asked.order);
@@ -1754,7 +1973,7 @@ export const TrackTable = memo(function TrackTable({
       // The order only decides which track's colour the information panel
       // shows; the selection already reported stands.
     });
-  }, [selection.ids, view, onSelectedTracks]);
+  }, [selection.ids, view, onSelectedTracks, listedIds]);
 
   // An arrow drawn to rekordbox's geometry rather than the text arrows that
   // stood in for it: those render in the body font and sit off the baseline.
@@ -1838,6 +2057,8 @@ export const TrackTable = memo(function TrackTable({
   return (
     <div
       ref={rootRef}
+      data-browser-pane="list"
+      data-browser-side={listScope}
       className={styles.browser}
       style={{
         ["--cols" as string]: gridOf(columns),
@@ -2105,13 +2326,13 @@ export const TrackTable = memo(function TrackTable({
             }
             switch (action) {
               case "importToCollection":
-                onImportToCollection?.(ids);
+                runCommand("importToCollection", { scope: listScope });
                 break;
               case "analysisLock":
-                onAnalysisLock?.(ids, true);
+                runCommand("analysisLockOn", { scope: listScope });
                 break;
               case "analysisUnlock":
-                onAnalysisLock?.(ids, false);
+                runCommand("analysisLockOff", { scope: listScope });
                 break;
               case "addToTagList":
                 onAddToTagList?.(ids);
@@ -2120,7 +2341,7 @@ export const TrackTable = memo(function TrackTable({
                 void onRemoveFromTagList?.(ids);
                 break;
               case "reloadTag":
-                onReloadTag?.(ids);
+                runCommand("reloadTag", { scope: listScope });
                 break;
               case "analyse":
                 onAnalyse?.();
@@ -2144,18 +2365,14 @@ export const TrackTable = memo(function TrackTable({
                 onConvertMemoryCues?.(trackMenu.row);
                 break;
               case "removeFromCollection":
-                void onRemoveFromCollection?.(ids);
+                runCommand("removeFromCollection", { scope: listScope });
                 break;
               case "autoRelocate":
-                onAutoRelocate?.(ids);
+                runCommand("autoRelocate", { scope: listScope });
                 break;
-              case "relocate": {
-                const chosen = selection.ids;
-                void view.idsInRange(0, view.count)
-                  .then((listed) => onRelocate?.(inListOrder(chosen, listed)))
-                  .catch(() => onRelocate?.(ids));
+              case "relocate":
+                runCommand("relocate", { scope: listScope });
                 break;
-              }
               case "loadPlayer1":
                 onLoadTrack?.("a", trackMenu.row);
                 break;
@@ -2179,6 +2396,7 @@ export const TrackTable = memo(function TrackTable({
           onToggle={onColumnToggle}
           onAutoSize={onColumnAutoSize}
           onAutoSizeAll={onColumnAutoSizeAll}
+          renumber={onRenumber && spec.sort !== "trackNo" ? { disabled: query !== "", onRenumber: renumber } : undefined}
           onClose={() => setMenu(null)}
         />
       ) : null}

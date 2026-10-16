@@ -383,7 +383,11 @@ flowchart LR
   companions during the export, and only for tracks whose analysis must be
   written. A missing DAT keeps a usable existing USB analysis
   (`analysis-kept`) or exports the track without analysis
-  (`analysis-unavailable`).
+  (`analysis-unavailable`). "Usable" means every companion still parses; it
+  need not match the last sync's stamp, since a player's cue or grid edit
+  changes that and dropping the files would delete the stick's waveforms,
+  grid and cues with nothing to write instead (#522). Library cues still go
+  over the kept files.
 - `cues` is always `Some(extra.cues)`, read from `djmdCue` through
   `rbl_db::export_info::track_extras`. Library cues therefore always replace
   the cue lists in the exported analysis files.
@@ -478,7 +482,7 @@ is reported as `ExportError::Cancelled`.
 | 25 | Write staged `export.pdb`, then `exportExt.pdb`, then `exportLibrary.db` (`database`). | `build_pdb`, `ext_pdb::build`, `write_one_library` | See [DeviceSQL](usb-export-db.md#4-exportpdb--the-devicesql-database), [My Tags](usb-export-db.md#5-exportextpdb--my-tags), [OneLibrary](usb-export-db.md#6-exportlibrarydb--the-onelibrary-database). |
 | 26 | Stage MY SETTINGS from rekordbox's settings directory, only for files absent from the stick. | `MY_SETTINGS_FILES`, `rbl_core::paths::rekordbox_settings_dir` | See [My Settings preservation](usb-export-db.md#my-settings-preservation). |
 | 27 | Stage `playlists3.sync` and `playlists3Plus.sync`. | `sync_record::render_with_ids` | Only when `sync` is passed. First-tick timestamps are kept from the stick's previous record. |
-| 28 | Read the staged databases back and check them against the "before" snapshot. | `Snapshot::read_at(stage)`, `check_retained_history`, `check_changes` | Refuses if the run would drop history tracks, My Tag edits, or OneLibrary cue edits made on the stick. |
+| 28 | Read the staged databases back and check them against the "before" snapshot. | `Snapshot::read_at(stage)`, `check_retained_history`, `check_changes` | Refuses if the run would drop history tracks, My Tag edits, or OneLibrary cue rows a player added to a track the run removes (also checked before the per-track loop). |
 | 29 | Verify the staged generation (`verifying`). | `verification::verify_staged_incremental` | Both databases are present and agree, ids are unique, referenced files exist (stage, then staged moves, then the stick), changed analysis parses, the playlist tree is valid. Trusted reused outputs are not parsed again. On failure: "The export did not verify, so the USB was left as it was". |
 | 30 | Stage the Tauri layer's settings images. | `settings_files` | Only My Settings names and `DEVSETTING.DAT` are accepted. They overwrite step 26's copy of the same file. |
 | 31 | Write the manifest into the stage: generation (request, inputs, recipes, warnings), baseline = staged snapshot, structure digest. | `Manifest::save_at` | Output receipts and database signatures are filled in after publication (step 37). |
@@ -549,19 +553,80 @@ is reported as `ExportError::Cancelled`.
 - If neither database exists, reconcile does nothing (`merged_library` returns
   `None`).
 
-**A synced playlist edited on the stick.** rekordbox and rbxport differ
-here. This is recorded, not changed (#309):
+**A synced playlist edited on the stick.** On a stick rbxport synced
+before, a sync now does what rekordbox's does with a track added on the
+stick to a synced playlist (#429, after the research in #309):
 
-| A track was added on the stick to a synced playlist, then… | rekordbox 7.2.14 [OBS] | rbxport, stick with its manifest [OBS] | rbxport, stick without a manifest (as rekordbox leaves one) [OBS] |
+| A track was added on the stick to a synced playlist, then… | rekordbox 7.2.14 [OBS] | rbxport, stick with its manifest | rbxport, stick rekordbox synced, no manifest (#471) |
 | --- | --- | --- | --- |
-| …sync, library playlist unchanged | keeps the added entry; writes nothing to the databases | refuses the sync ("playlist … changed on the USB. Import or reconcile it before syncing."); writes nothing | takes the entry out; the track stays on the stick |
-| …sync, library playlist changed | rewrites the playlist from the library: the entry is gone, the track stays on the stick | refuses, as above | rewrites the playlist from the library, as rekordbox does |
+| …sync, library playlist unchanged | keeps the added entry; writes nothing to the databases | keeps the added entry, in both databases, and at every later sync while the library's playlist stays unchanged | keeps the added entry, in both databases; later syncs go by the manifest this one writes |
+| …sync, library playlist changed | rewrites the playlist from the library: the entry is gone, the track stays on the stick | rewrites the playlist from the library; the track stays on the stick, in no playlist | rewrites the playlist from the library; the track stays on the stick, in no playlist |
 
-The rbxport columns come from fixture probes that were not committed; their
-output is in `rbxport-worktrees/parity/issue-309/`
-(`values-rbx-same-steps-309.txt`, `values-rbx-no-manifest-stick-309.txt`).
-They were recorded before the selective sync landed and have not been
-re-run against it.
+`reconcile::device_additions` makes the call. The manifest records each
+selected playlist's library entries, by track key
+(`ManifestPlaylist::library_entries`); a playlist whose library entries
+equal the recorded ones is unchanged. [ASSUME] That stands in for
+rekordbox's own test, which goes by the `Timestamp` its sync record keeps
+(the time the library playlist's entries last changed). A manifest from an
+older build has no such field; that build wrote every selected playlist as
+the library had it, so the stick's copy at that sync, mapped back to track
+keys, stands in. A playlist written as the stick has it, or rewritten over
+the stick's additions, is left out of the device-edit check
+(`Snapshot::check_changes_except`).
+
+The rule applies only to what was observed: the stick's playlist holds the
+library's entries in their order plus entries added on the stick, has the
+name and place the last sync left, and both databases on the stick agree on
+it. Anything else stays a device edit the sync refuses to overwrite, as
+before: an entry of the library's removed or moved on the stick, a rename,
+or an edit in one database alone, as a player makes [UNKNOWN: what
+rekordbox does with each of those; observing one needs the #309 setup with
+that edit in step 2].
+
+A stick rekordbox synced has no manifest, only rekordbox's sync record.
+There `reconcile::rekordbox_device_additions` goes by the record's
+`Timestamp` for the playlist, which is when the library playlist's entries
+last changed ([§10](usb-export-db.md#10-sync-records)). The export is given
+the library's own time for each plain playlist,
+`SourcePlaylist::entries_changed_ms`
+(`rbl_db::export_info::playlist_entries_changed`): the latest of its live
+`djmdSongPlaylist` rows' `created_at` and of every row's `updated_at`,
+removed rows included. Where the library only added entries, that is the
+latest `created_at`, which is what rekordbox recorded; its syncs left every
+entry's `updated_at` equal to its `created_at` [OBS #309 scratch library
+after three syncs, `rbxport-worktrees/parity/issue-471/values-scratch-entries-471.txt`].
+A removal stamps the removed row's `updated_at` and renumbers the rows after
+it, and a reorder stamps the rows it moves, so either moves the time and the
+playlist is written from the library.
+When the two times are within 2 ms (`SAME_CHANGE_MS`; rekordbox recorded
+`.155` for an entry created at `.154` and `.399` for one at `.399` [OBS
+#309]), the library playlist is unchanged and the stick's copy is written
+as it is, under the same rule as above: the library's entries in their
+order plus entries added on the stick, the same in both databases.
+Otherwise, or with no record from this library, no time for the playlist
+(an empty one, or an intelligent playlist), or a time with no offset, the
+playlist is written from the library, as the first sync from here always
+did. The record keeps rekordbox's time
+([`sync_record::write`](../../crates/rbl-export/src/sync_record.rs)), and
+later syncs go by the manifest. [ASSUME] rekordbox's own test is the same:
+the `Timestamp` matched both observed records, but a removal or reorder in
+the library was not tried with rekordbox, and neither was an entry removed
+before a rekordbox sync (its stamped row makes the playlist read as changed
+here, which writes it from the library). [UNKNOWN: whether rekordbox
+deletes an entry's row outright in some path; a removal of the newest
+entry with no row left would still move the time back, and any other with
+the later entries renumbered would still stamp them.]
+
+When a playlist is rewritten over entries added on the stick, the added
+tracks stay on the stick as the stick's (`preserved`), as rekordbox leaves
+them. That holds for a track an earlier export put there for another
+playlist that this sync no longer selects: the #317 cleanup of this app's
+own deselected tracks would otherwise take it off (#471). [ASSUME]
+rekordbox does the same, since it kept the added track in no playlist at
+step 4; its handling of a deselected playlist's tracks was not observed.
+
+`crates/rbl-export/tests/device_playlist_edits.rs` runs the rekordbox steps
+on a temporary stick, with and without a manifest, using the #309 times.
 
 rekordbox's side is in
 [usb-export-db.md](usb-export-db.md#what-a-later-sync-does-to-a-playlist-edited-on-the-device).
@@ -635,10 +700,12 @@ In loop order:
    none of its analysis companions did, the old waveforms and cues no longer
    match the audio. The track is exported without analysis and cues, and an
    `analysis-stale` warning asks for re-analysis.
-10. `snapshot::check_analysis`: for a carried track whose companions are not
-    trusted, if the stick's analysis changed since the last sync in its cue
-    or beat-grid sections, the run is refused ("USB cues or beat grids
-    changed since the last sync"). A missing companion file can be repaired.
+10. Cues and beat grids edited on a player since the last sync are not a
+    conflict: an export goes from the computer to the USB, so the library's
+    cue lists and grid replace them (#439, #522). Until #522 this step
+    refused the run part-way through the copies ("USB cues or beat grids
+    changed since the last sync"). Bringing player edits back is Import's
+    job. A missing companion file is repaired as before.
 11. Analysis is staged only if it is not reused and differs from what the
     stick holds. Companions that the library no longer has are queued for
     removal.
@@ -901,10 +968,10 @@ stays as it was:
 | "Full integrity check failed" | step 6 (Verify all files) |
 | "Source changed while it was being prepared", "Source changed during conversion" | `PreparationCache`, step 33 |
 | "Conversion would create duplicate audio path", "Analysis directory space exhausted" | per-track loop |
-| "USB cues or beat grids changed since the last sync" | `snapshot::check_analysis` |
 | "… longer than export.pdb can hold" | row-length checks |
 | "A track being removed is still referenced by USB history" | `Snapshot::check_retained_history` |
-| "My Tag '…' changed on the USB", "OneLibrary contains cue records…" | `Snapshot::check_changes` |
+| "My Tag '…' changed on the USB" | `Snapshot::check_changes` |
+| "'…' has cue points added or changed on a player, and this sync would take it off the USB" | `Snapshot::check_removed_cues`, before the per-track loop and again in `check_changes`: a cue row added or changed on the stick since the last sync, on a track this sync takes off the stick. Rows on tracks the sync keeps are replaced by the library's (#522). Import does not clear it (no import rewrites `manifest.baseline`); keeping the track in the sync or deleting it from the USB does. |
 | "The export did not verify, so the USB was left as it was" | `verify_staged_incremental` |
 | "Exported media changed during sync", "The device changed during sync. Close other writers and retry." | step 33 |
 
@@ -999,7 +1066,7 @@ Before handing off, run the checks in [Testing](../development/testing.md#before
 | Space preview | `plan::from_baseline`, `estimate::estimate_inspected` | `estimate_sync`, `SyncEstimateDto`, `SyncManager.tsx` space bars |
 | Shared preparation or conversion caching | `cache.rs` | `EXPORT_CACHE` in `commands.rs`; `rbl_audio::compatibility` |
 | File names or layout | `layout`, `layouts`, `fat_safe`, `fat_file_name`, `dir_name`, `analysis_directory` | `staged_files`; `tests/export.rs`; [Audio naming](usb-export-db.md#audio-naming-and-conversion) |
-| Analysis written to the stick | The `exported_analysis` block; `incremental::analysis_recipe`, `load_analysis` | `rbl-anlz`; `snapshot::check_analysis`; `TRANSFORM_VERSION` |
+| Analysis written to the stick | The `exported_analysis` block; `incremental::analysis_recipe`, `load_analysis` | `rbl-anlz`; `TRANSFORM_VERSION`; `tests/player_cue_edits.rs` |
 | Cue export | `rbl_db::export_info` (cues), `rbl_anlz::cues::sections` | `rbl_onelibrary::build::Builder::replace_cues` / `preserve_cues` |
 | Artwork | `artwork_path`, `write_artwork` | `artwork_row`; `Builder::add_image` |
 | Format conversion | `rbl_audio::compatibility` | Conversion naming in the per-track loop; `cache.rs`; [user guide](../user/usb-export.md#maximum-cdj-compatibility) |

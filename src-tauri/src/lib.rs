@@ -35,6 +35,7 @@ mod link;
 mod rx3_link;
 mod network_labels;
 pub mod logging;
+mod log_window;
 pub mod menu;
 pub mod player;
 pub mod preview;
@@ -94,6 +95,7 @@ pub(crate) fn spawn_library_load(app: tauri::AppHandle) {
                 return;
             }
         }
+        backups::sweep_discarded(&app.state::<Arc<state::AppState>>().backup_destination());
         let cache_path = cache_path(&app);
         let snapshot = cache_path.clone().and_then(|path| {
             std::thread::Builder::new().name("startup-snapshot".into())
@@ -481,7 +483,7 @@ pub fn run() {
         // Windows, where the main window's close box is the way out).
         .on_window_event(|window, event| {
             if window.label() == MAIN_WINDOW && matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                for label in [crate::preferences::WINDOW, crate::sync_window::WINDOW] {
+                for label in [crate::preferences::WINDOW, crate::sync_window::WINDOW, crate::log_window::WINDOW] {
                     if let Some(extra) = window.app_handle().get_webview_window(label) {
                         let _ = extra.close();
                     }
@@ -512,6 +514,7 @@ pub fn run() {
             file_drag::drag_tracks,
             menu::set_history_menu,
             menu::set_menu_labels,
+            menu::set_menu_enabled,
             commands::library_summary,
             commands::disable_read_only,
             new_library::library_problem,
@@ -562,6 +565,11 @@ pub fn run() {
             commands::app_diagnostics,
             commands::app_version,
             commands::open_log,
+            log_window::open_log_window,
+            log_window::log_lines,
+            log_window::log_status_message,
+            log_window::open_log_folder,
+            log_window::save_log_text,
             commands::reveal_track,
             commands::set_master_level,
             commands::audio_devices,

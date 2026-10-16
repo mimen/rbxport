@@ -74,6 +74,17 @@ export function memoryCueAt(cues: readonly Cue[], positionMs: number): Cue | nul
 }
 
 /**
+ * The memory loop running from `inMs` to `outMs`, within the same tolerance
+ * at both ends, or `null`. A plain memory cue at `inMs` is not one: what
+ * MEMORY checks before it saves a loop.
+ */
+export function memoryLoopAt(cues: readonly Cue[], inMs: number, outMs: number): Cue | null {
+  return cues.find((cue) => cue.memory && cue.outMs > cue.positionMs
+    && Math.abs(cue.positionMs - inMs) <= MEMORY_TOLERANCE_MS
+    && Math.abs(cue.outMs - outMs) <= MEMORY_TOLERANCE_MS) ?? null;
+}
+
+/**
  * The hot cue in a slot, or `null` when the pad is empty.
  *
  * A slot holds one cue. The writer does not stop a second row landing in the
@@ -114,7 +125,7 @@ export function rowCuesOf(cues: readonly Cue[]): RowCue[] {
   for (const cue of cues) {
     if (cue.memory || cue.letter === "" || seen.has(cue.letter)) continue;
     seen.add(cue.letter);
-    out.push([cue.letter, cue.positionMs, cue.colour]);
+    out.push([cue.letter, cue.positionMs, cue.colour, cue.outMs > cue.positionMs]);
   }
   return out.sort((a, b) => a[0].localeCompare(b[0]));
 }

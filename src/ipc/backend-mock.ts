@@ -17,7 +17,7 @@ import type {
   DatabaseDrive, EditHistoryState, FilterValues, GridState, LibraryProblem, LibrarySummary, Limiter, LinkPeerSeen, LinkStatus, RelatedCriterion, RowDto, SortKey,
   SelectionDetails, SmartRule, StickDefaults, SyncPlaylist, SyncProgress, Tick, TrackDetails, TrackField,
   PreferencesRequest, RelocateSearch, UpdateCheck, UpdateProgress, UpdateReady, ExportProgress,
-  DeckId, TrackFilter, TreeNode, ViewHandle, ViewSpec, WaveformKind,
+  DeckId, TrackFilter, TreeNode, ViewHandle, ViewSpec, WaveformKind, LogLine, LogLevel,
 } from "./types";
 import { TREE_ROOT } from "./types";
 import { applyEditFrom, validateEdit, isDynamicFrom, tempoX100, type EditableBeat } from "@/lib/gridEdit";
@@ -151,6 +151,7 @@ function makeRows(count: number): RowDto[] {
     const rating = Math.floor(rnd() * 6);
     const dateAdded = `2026-0${1 + Math.floor(rnd() * 9)}-${String(day).padStart(2, "0")}`;
     const releaseDate = rnd() > 0.3 ? `2026-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}` : "";
+    const defaultCueColours = readFlagFromUrl("defaultCueColours");
     const cueSet = analysed ? (CUE_SETS[Math.floor(rnd() * CUE_SETS.length)] ?? []) : [];
     rows[i] = {
       id: String(100000 + i),
@@ -169,7 +170,10 @@ function makeRows(count: number): RowDto[] {
       dateAdded,
       releaseDate,
       memoryCues: analysed ? [Math.round(durationSec * 1000 * 0.02)] : [],
-      hotCues: cueSet.map(([letter, at, colour]) => [letter, Math.round(durationSec * 1000 * at), colour]),
+      // `?defaultCueColours`: hot cues with no colour of their own, as
+      // rekordbox leaves the ones it colours by HOT CUE color (#442).
+      hotCues: cueSet.map(([letter, at, colour]) =>
+        [letter, Math.round(durationSec * 1000 * at), defaultCueColours ? null : colour]),
       artworkHue: Math.floor(rnd() * 360),
       // The mock has no files to serve, so every row falls back to the tint.
       hasArtwork: false,
@@ -393,6 +397,14 @@ export interface MockOptions {
 export function createMockBackend(options: MockOptions = {}): Backend {
   const trackCount = options.trackCount ?? readCountFromUrl() ?? 2000;
   const latency = options.latencyMs ?? readLatencyFromUrl() ?? 0;
+  // What the Log window reads in a browser: a start-up line, then whatever
+  // the status bar said.
+  const mockLog: LogLine[] = [];
+  let mockLogNext = 1;
+  const mockLogLine = (level: LogLevel, target: string, message: string) => {
+    mockLog.push({ seq: mockLogNext++, timeMs: Date.now(), level, target, message });
+  };
+  mockLogLine("debug", "rbxport_lib::logging", "logging to the browser preview");
   const playlistFixture = options.playlistFixture ?? readPlaylistFixtureFromUrl();
   const all = makeRows(trackCount);
   const missingEvery = options.missingEvery ?? readMissingFromUrl();
@@ -1001,17 +1013,20 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       });
     },
     undoEdit: async () => {
-      const edit = editUndo.pop();
+      const edit = editUndo.at(-1);
       if (!edit) throw new Error("There is no library edit to undo.");
+      // A refused undo stays on the stack, as in the real backend.
       edit.undo();
+      editUndo.pop();
       editRedo.push(edit);
       await bump(false);
       return announceHistory();
     },
     redoEdit: async () => {
-      const edit = editRedo.pop();
+      const edit = editRedo.at(-1);
       if (!edit) throw new Error("There is no library edit to redo.");
       edit.redo();
+      editRedo.pop();
       editUndo.push(edit);
       await bump(false);
       return announceHistory();
@@ -1526,7 +1541,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     row.hotCues = cuesOf(trackId)
       .filter((cue) => !cue.memory)
       .sort((a, b) => a.letter.localeCompare(b.letter))
-      .map((cue) => [cue.letter, cue.positionMs, cue.colour]);
+      .map((cue) => [cue.letter, cue.positionMs, cue.colour, cue.outMs > cue.positionMs]);
   };
   const findCue = (id: string): { track: string; cue: Cue } | null => {
     for (const [track, list] of cueStore) {
@@ -1864,7 +1879,20 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         ...(spec.source.kind === "playlist" ? { trackNos: Uint32Array.from(sorted.map(({ trackNo }) => trackNo)) } : {}),
         gen: 1,
       });
-      return wait<ViewHandle>({ viewId, len: sorted.length, gen: 1 });
+      // The whole playlist, as the backend tallies it: a search narrows the
+      // rows, not the status bar's total.
+      const totals = spec.source.kind === "playlist"
+        ? candidatesFor({ ...spec, query: "" }).reduce((sum, i) => {
+          const row = all[i];
+          const size = row?.extra?.size;
+          return {
+            tracks: sum.tracks + 1,
+            seconds: sum.seconds + (row?.durationSec ?? 0),
+            bytes: sum.bytes + (typeof size === "number" ? size : 0),
+          };
+        }, { tracks: 0, seconds: 0, bytes: 0 })
+        : undefined;
+      return wait<ViewHandle>({ viewId, len: sorted.length, gen: 1, ...(totals ? { totals } : {}) });
     },
 
     fetchRows: (viewId, offset, len, extraColumns = []) => {
@@ -2538,6 +2566,18 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     // costs nothing, so every figure the platform will not give is null.
     appVersion: () => wait("0.4.0"),
     openLog: () => wait(undefined),
+    // The browser preview's own log: what the app said since the page loaded.
+    openLogWindow: () => wait(false),
+    logLines: (after) => {
+      const oldest = mockLog[0]?.seq ?? mockLogNext;
+      return wait({ lines: mockLog.filter(line => line.seq > after).map(line => ({ ...line })), oldest });
+    },
+    openLogFolder: () => Promise.reject(new Error("Opening the log folder requires the desktop app.")),
+    saveLogText: () => wait(null),
+    logStatusMessage: (failed, text) => {
+      mockLogLine(failed ? "warn" : "info", "rbxport::status", text);
+      return wait(undefined);
+    },
     appDiagnostics: () =>
       wait({ audioLoad: 0, audioXruns: 0, cpu: 0, memoryMb: 0, threads: null, openFiles: null, gpu: null }),
     // A browser has no Finder to open. Refusing is the truth; succeeding
@@ -2636,6 +2676,12 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       };
     },
     setMenuLabels: () => wait(undefined),
+    // Kept where a test can read which items the shell would grey.
+    setMenuEnabled: (items) => {
+      const w = window as unknown as { __menuEnabled?: Record<string, boolean> };
+      w.__menuEnabled = { ...w.__menuEnabled, ...items };
+      return wait(undefined);
+    },
 
     // No network in a browser, so LINK cannot turn on. Saying why is better
     // than a switch that silently does nothing.
@@ -2778,10 +2824,25 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       if (clash && clash.id !== replace && !copy) return wait({ ...report, folder: true, conflict: clash.id, at });
       let listName = name;
       let replaced: { lists: number; tracks: number } | null = null;
+      let replacing: {
+        nodes: TreeNode[]; members: Map<string, string[] | undefined>; before: string[];
+      } | null = null;
+      // A folder import is not in the history (the real backend only
+      // clears redo); the delete and move below record entries of their
+      // own, taken out again after.
+      const history = [...editUndo];
       if (clash && clash.id === replace) {
         if (siblings.indexOf(clash) < at) at -= 1;
         const start = tree.findIndex((n) => n.id === clash.id);
         const doomed = tree.slice(start, start + subtreeLength(start));
+        replacing = {
+          nodes: doomed.map((n) => ({ ...n })),
+          members: new Map(doomed.map((n) => {
+            const held = membership.get(n.id);
+            return [n.id, held && [...held]];
+          })),
+          before: siblings.map((n) => n.id),
+        };
         replaced = {
           lists: doomed.length,
           tracks: doomed.reduce((sum, n) => sum + (membership.get(n.id)?.length ?? 0), 0),
@@ -2794,6 +2855,77 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       await edits.createPlaylist(listName, parent);
       const made = tree.find((n) => !before.has(n.id))?.id ?? null;
       if (made && childrenOf(parent).findIndex((n) => n.id === made) !== at) await edits.movePlaylist(made, parent, at);
+      editUndo.splice(0, editUndo.length, ...history);
+      if (replacing) {
+        // One step of history, as the real backend records it (#426).
+        // Like the real backend, Undo and Redo touch only the replaced and
+        // made lists: siblings added or removed since (the drop's other
+        // folders, a playlist made later) stay, and each list goes back in
+        // its place among the siblings it had. They refuse once those lists
+        // hold something else.
+        const { nodes, members } = replacing;
+        const beforeIds = replacing.before.filter((id) => findNode(id)?.kind !== "history");
+        const madeNode = made ? findNode(made) : undefined;
+        if (made && madeNode) {
+          const madeCopy = { ...madeNode };
+          const madeMembers = [...membersOf(made)];
+          // The flat tree counts the Histories' year folders as top-level;
+          // they are not playlists, so they are left out.
+          const listsUnder = () => childrenOf(parent).filter((n) => n.kind !== "history").map((n) => n.id);
+          const afterIds = listsUnder();
+          const root = nodes[0]?.id ?? "";
+          const refuse = (undo: boolean) => new Error(
+            `that replacement can no longer be ${undo ? "undone" : "redone"}`);
+          const sameList = (a: readonly string[], b: readonly string[]) =>
+            a.length === b.length && a.every((value, i) => value === b[i]);
+          // `entering` (a node and what is under it) put back right after the
+          // nearest sibling before it in `recorded` still under `parent`, or
+          // else right before the nearest one after it, or else last.
+          const placeAmong = (entering: TreeNode[], recorded: readonly string[]) => {
+            const staying = listsUnder();
+            const place = recorded.indexOf(entering[0]?.id ?? "");
+            let index: number | undefined;
+            const earlier = recorded.slice(0, Math.max(place, 0)).reverse().find((id) => staying.includes(id));
+            const later = recorded.slice(place + 1).find((id) => staying.includes(id));
+            if (place >= 0 && earlier !== undefined) index = staying.indexOf(earlier) + 1;
+            else if (place >= 0 && later !== undefined) index = staying.indexOf(later);
+            const depth = parent === TREE_ROOT ? 1 : (findNode(parent)?.depth ?? 0) + 1;
+            const shift = depth - (entering[0]?.depth ?? depth);
+            const copies = entering.map((n) => ({ ...n, depth: n.depth + shift }));
+            const [head, ...rest] = copies;
+            if (!head) return;
+            // Last goes before the Histories, as `insertUnder` puts it.
+            insertUnder(parent, head, index !== undefined && index < staying.length ? index : undefined);
+            tree.splice(tree.indexOf(head) + 1, 0, ...rest);
+          };
+          await recordEdit({
+            label: "Replace Playlist",
+            undo: () => {
+              if (!childrenOf(parent).some((n) => n.id === made) || findNode(root)
+                || !sameList(membersOf(made), madeMembers)) throw refuse(true);
+              tree.splice(tree.findIndex((n) => n.id === made), 1);
+              membership.delete(made);
+              placeAmong(nodes, beforeIds);
+              for (const [id, tracks] of members) {
+                if (tracks) membership.set(id, [...tracks]);
+                else membership.delete(id);
+              }
+            },
+            redo: () => {
+              const start = tree.findIndex((n) => n.id === root);
+              const live = start < 0 || !childrenOf(parent).some((n) => n.id === root)
+                ? [] : tree.slice(start, start + subtreeLength(start));
+              const unchanged = live.length === nodes.length
+                && live.every((n, i) => n.id === nodes[i]?.id && sameList(membersOf(n.id), members.get(n.id) ?? membersOf(n.id)));
+              if (!unchanged || findNode(made)) throw refuse(false);
+              tree.splice(start, live.length);
+              for (const n of live) membership.delete(n.id);
+              placeAmong([madeCopy], afterIds);
+              membership.set(made, [...madeMembers]);
+            },
+          });
+        }
+      }
       return wait({ ...report, folder: true, playlist: made, at, renamed: listName === name ? null : listName, replaced });
     },
     exportLoopWav: () => wait(null),
