@@ -19,7 +19,7 @@ Upstream releases from `dev`, tags each release `vX.Y.Z`, and fast-forwards `mai
 
 **Shared with upstream's app.** rbxport names its data directory `~/Library/Application Support/rbxport` in code rather than from the bundle id, so the fork and upstream's app share preferences, logs, and backups, and they act on the same rekordbox library and USB sticks. Install one or the other on a machine, never both.
 
-**Checks.** [`scripts/fork/check.sh`](scripts/fork/check.sh) runs upstream's frontend lint, typecheck, and unit tests and the Rust workspace tests under `RB_LITE_TEST=1`, which refuses writes to an installed rekordbox library.
+**Checks.** [`scripts/fork/check.sh`](scripts/fork/check.sh) runs upstream's frontend lint, typecheck, and unit tests and the Rust workspace tests under `RB_LITE_TEST=1`, which refuses writes to an installed rekordbox library. It skips two wall-clock deck tests that upstream CI runs but the hub's headless sessions fail on timer coalescing; their reasons are in the script.
 
 **Server mode.** One machine serves its library and the fork app on other machines browses and edits it over Tailscale. On the host, Preferences › Server › Serve this library starts a server on port 48650, on 127.0.0.1 and the machine's Tailscale address, saved in `~/Library/Application Support/rbxport/fork-server.json`. Off by default. A client enters the host's MagicDNS address and token under Remote host.
 
