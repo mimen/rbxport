@@ -73,7 +73,7 @@ fi
 saved="$(seed get)"
 python3 -I "$dir/host.py" "$ip" "$PORT" >"$dir/host.log" 2>&1 &
 host_pid=$!
-trap 'quit; seed set "$saved"; kill $host_pid; wait $host_pid 2>/dev/null; rm -rf "$dir"' EXIT
+trap 'quit; seed set "$saved"; kill $host_pid; wait $host_pid 2>/dev/null || true; rm -rf "$dir"' EXIT
 sleep 1
 
 seed set "{\"url\":\"http://$name:$PORT\",\"token\":\"$token\"}"
