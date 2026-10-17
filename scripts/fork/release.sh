@@ -47,7 +47,10 @@ work="$cache/src-$sha"
 out="$cache/out-$sha"
 export CARGO_TARGET_DIR="$cache/target"
 bundle="$CARGO_TARGET_DIR/$TARGET/release/bundle"
-if [[ ! -d "$work" ]]; then
+# A run killed before its trap leaves the directory without a worktree in it.
+if [[ ! -e "$work/.git" ]]; then
+  rm -rf "$work"
+  git -C "$root" worktree prune
   git -C "$root" worktree add -q --detach "$work" "$sha"
 fi
 trap 'git -C "$root" worktree remove --force "$work" >/dev/null 2>&1 || true' EXIT
