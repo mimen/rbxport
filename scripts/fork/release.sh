@@ -78,6 +78,7 @@ grep -aq "github.com/mimen/rbxport/releases/latest/download/latest.json" "$app/C
 codesign --verify --deep --strict "$app"
 signature="$(codesign -dv "$app" 2>&1)"
 [[ "$signature" == *"TeamIdentifier=458KZD965T"* ]] || { echo "release: app is not signed by team 458KZD965T" >&2; exit 1; }
+scripts/fork/e2e-client.sh "$app"
 
 mkdir -p "$out"
 cp "$(ls "$bundle"/dmg/*.dmg)" "$out/$name.dmg"
