@@ -27,8 +27,9 @@ Upstream releases from `dev`, tags each release `vX.Y.Z`, and fast-forwards `mai
 - `GET /events` is a WebSocket that forwards whichever app events the client names. `GET /artwork/<id>` runs `protocol.rs`. `GET /audio/<id>` serves the file with range requests. `GET /version` names the build.
 - Every request from another machine needs the token. Loopback needs none unless it carries an `Origin` header, so a web page on the host cannot drive it. `/invoke` and `/events` refuse a client built from a different version with a `versionMismatch` error.
 - On a client, [`src/ipc/fork/remote.ts`](src/ipc/fork/remote.ts) routes each command: window, menu, update and audio-engine commands run locally, file dialogs, USB, LINK and the decks are refused with a note, and everything else goes to the host. [`src/fork/remote.css`](src/fork/remote.css) hides the controls for what only the host can do.
-- The CSP allows a host only by its `*.ts.net` name, through the overlay [`scripts/fork/csp.mjs`](scripts/fork/csp.mjs) prints for `tauri build --config`.
-- The check covers it: every name in the table dispatches through the HTTP route, every command the client sends exists on the server, and wrong tokens and other versions are refused.
+- A client's page never talks to the host itself. A release window's page is `tauri://localhost`, which WebKit treats as secure, so it blocks `http://` and `ws://` to another machine as mixed content (a debug window, at `http://localhost:1420`, does not). [`src-tauri/src/fork/forward.rs`](src-tauri/src/fork/forward.rs) holds a port on 127.0.0.1 for each host, asked for over `rbxfork://localhost/forward`, and pipes its bytes to the host unchanged. It forwards only to a `*.ts.net` name.
+- The CSP allows that forward, `127.0.0.1`, through the overlay [`scripts/fork/csp.mjs`](scripts/fork/csp.mjs) prints for `tauri build --config`.
+- The check covers it: every name in the table dispatches through the HTTP route, every command the client sends exists on the server, and wrong tokens and other versions are refused. Before publishing, `release.sh` runs [`scripts/fork/e2e-client.sh`](scripts/fork/e2e-client.sh), which launches the built release app as a client of a stub host and fails unless the host sees its invoke and its events socket.
 
 | Path | Why |
 | ---- | --- |

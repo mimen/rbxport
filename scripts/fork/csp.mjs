@@ -2,15 +2,17 @@
 // Prints the fork's CSP as a `tauri build --config` overlay, derived from upstream's
 // tauri.conf.json at build time so upstream's own CSP changes carry over:
 //   - report.rbxport.com dropped: bug reports go to upstream's worker.
-//   - server mode: the rbxfork: scheme (Preferences › Server), and a library host
-//     on the tailnet by its MagicDNS name, for invoke, events, artwork and audio.
+//   - server mode: the rbxfork: scheme (Preferences › Server and the forward), and
+//     127.0.0.1, where the forward to a library host listens, for invoke, events,
+//     artwork and audio. The page never reaches the host directly: from
+//     tauri://localhost WebKit blocks http:// and ws:// to another machine.
 import { readFileSync } from "node:fs";
 
-const TAILNET = ["http://*.ts.net:*", "https://*.ts.net:*"];
+const FORWARD = ["http://127.0.0.1:*"];
 const ADD = {
-  "connect-src": ["rbxfork:", "http://rbxfork.localhost", ...TAILNET, "ws://*.ts.net:*", "wss://*.ts.net:*"],
-  "img-src": TAILNET,
-  "media-src": TAILNET,
+  "connect-src": ["rbxfork:", "http://rbxfork.localhost", ...FORWARD, "ws://127.0.0.1:*"],
+  "img-src": FORWARD,
+  "media-src": FORWARD,
 };
 
 const conf = new URL("../../src-tauri/tauri.conf.json", import.meta.url);

@@ -11,7 +11,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { IpcError } from "../invoke";
 
 export interface RemoteHost {
-  /** `http://<tailscale name>:<port>`, no trailing slash. */
+  /** `http://<tailscale name>:<port>`, no trailing slash. The page reaches it through `reachHost`. */
   url: string;
   token: string;
 }
@@ -29,7 +29,7 @@ function parseHost(raw: unknown): RemoteHost | null {
   if (typeof url !== "string" || typeof token !== "string") return null;
   try {
     const parsed = new URL(url);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.protocol !== "http:") return null;
     return { url: parsed.origin, token };
   } catch {
     return null;
@@ -169,9 +169,39 @@ function hostName(host: RemoteHost): string {
   return new URL(host.url).hostname;
 }
 
+const forwards = new Map<string, Promise<string>>();
+const forwarded = new Map<string, string>();
+
+/**
+ * Where this page reaches `host`: `http://127.0.0.1:<port>`, which the fork's
+ * Rust side pipes to the host (`forward.rs`). A release window's page is
+ * `tauri://localhost`, a secure origin, so WebKit blocks `http://` and `ws://`
+ * to another machine as mixed content and allows them to 127.0.0.1.
+ */
+export function reachHost(host: RemoteHost): Promise<string> {
+  let base = forwards.get(host.url);
+  if (base === undefined) {
+    const { hostname, port } = new URL(host.url);
+    base = fetch(`${convertFileSrc("", "rbxfork")}forward`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: JSON.stringify({ host: hostname, port: Number(port || 80) }),
+    }).then(async (response) => {
+      const body: unknown = await response.json();
+      if (!response.ok) throw new IpcError(body);
+      const local = `http://127.0.0.1:${(body as { port: number }).port}`;
+      forwarded.set(host.url, local);
+      return local;
+    });
+    forwards.set(host.url, base);
+    base.catch(() => forwards.delete(host.url));
+  }
+  return base;
+}
+
 async function hostFetch(host: RemoteHost, path: string, init: RequestInit = {}): Promise<Response> {
   try {
-    return await fetch(`${host.url}${path}`, {
+    return await fetch(`${await reachHost(host)}${path}`, {
       ...init,
       headers: {
         authorization: `Bearer ${host.token}`,
@@ -179,7 +209,8 @@ async function hostFetch(host: RemoteHost, path: string, init: RequestInit = {})
         [VERSION_HEADER]: BUILD_VERSION,
       },
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof IpcError) throw error;
     throw new IpcError({ kind: "remote", message: `Could not reach the library host ${hostName(host)}.` });
   }
 }
@@ -220,33 +251,37 @@ type Listener = (payload: unknown) => void;
 const hostEvents = (() => {
   const listeners = new Map<string, Set<Listener>>();
   let socket: WebSocket | null = null;
+  let started = false;
   let retryMs = 500;
 
   const send = (message: object) => {
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
   };
 
+  const retry = (host: RemoteHost) => {
+    socket = null;
+    setTimeout(() => connect(host), retryMs);
+    retryMs = Math.min(retryMs * 2, 10_000);
+  };
+
   const connect = (host: RemoteHost) => {
-    const url = new URL("/events", host.url);
-    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    url.searchParams.set("token", host.token);
-    url.searchParams.set("v", BUILD_VERSION);
-    const opened = new WebSocket(url);
-    socket = opened;
-    opened.onopen = () => {
-      retryMs = 500;
-      for (const event of listeners.keys()) send({ listen: event });
-    };
-    opened.onmessage = (message) => {
-      const { event, payload } = JSON.parse(String(message.data)) as { event: string; payload: unknown };
-      for (const listener of listeners.get(event) ?? []) listener(payload);
-    };
-    opened.onclose = () => {
-      if (socket !== opened) return;
-      socket = null;
-      setTimeout(() => connect(host), retryMs);
-      retryMs = Math.min(retryMs * 2, 10_000);
-    };
+    void reachHost(host).then((base) => {
+      const url = new URL("/events", base);
+      url.protocol = "ws:";
+      url.searchParams.set("token", host.token);
+      url.searchParams.set("v", BUILD_VERSION);
+      const opened = new WebSocket(url);
+      socket = opened;
+      opened.onopen = () => {
+        retryMs = 500;
+        for (const event of listeners.keys()) send({ listen: event });
+      };
+      opened.onmessage = (message) => {
+        const { event, payload } = JSON.parse(String(message.data)) as { event: string; payload: unknown };
+        for (const listener of listeners.get(event) ?? []) listener(payload);
+      };
+      opened.onclose = () => retry(host);
+    }).catch(() => retry(host));
   };
 
   return (host: RemoteHost, event: string, listener: Listener): (() => void) => {
@@ -257,7 +292,10 @@ const hostEvents = (() => {
       send({ listen: event });
     }
     set.add(listener);
-    if (socket === null) connect(host);
+    if (!started) {
+      started = true;
+      connect(host);
+    }
     return () => {
       set.delete(listener);
       if (set.size === 0 && listeners.get(event) === set) {
@@ -274,10 +312,12 @@ export function remoteSubscribe<T>(event: string, listener: (payload: T) => void
   return hostEvents(host, event, listener as Listener);
 }
 
+/** Synchronous for `<img src>`; `boot.ts` waits for `reachHost` before the first render. */
 function mediaUrl(kind: "artwork" | "audio", trackId: string): string | undefined {
   const host = remoteHost();
-  if (host === null || !/^\d+$/.test(trackId)) return undefined;
-  return `${host.url}/${kind}/${trackId}?token=${encodeURIComponent(host.token)}`;
+  const base = host && forwarded.get(host.url);
+  if (!host || !base || !/^\d+$/.test(trackId)) return undefined;
+  return `${base}/${kind}/${trackId}?token=${encodeURIComponent(host.token)}`;
 }
 
 export const remoteArtworkUrl = (trackId: string) => mediaUrl("artwork", trackId);

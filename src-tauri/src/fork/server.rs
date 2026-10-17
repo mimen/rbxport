@@ -100,6 +100,7 @@ async fn authorized<R: Runtime>(
         Some(token) => same_secret(token.as_bytes(), ctx.token.as_bytes()),
         None => trusted_local(peer, request.headers()),
     };
+    tracing::debug!(%peer, path = request.uri().path(), allowed, "library server request");
     if allowed {
         next.run(request).await
     } else {

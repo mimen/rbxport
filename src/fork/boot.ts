@@ -2,8 +2,9 @@
  * Runs before the first render in every window. With a remote host set, it
  * marks the document so `remote.css` hides what only the host can do, and
  * opens the main window on the browser layout, since the decks play there.
+ * It holds the render until the forward to the host is up.
  */
-import { remoteHost } from "@/ipc/fork/remote";
+import { reachHost, remoteHost } from "@/ipc/fork/remote";
 import "./remote.css";
 
 const SESSION_KEY = "rbl.session";
@@ -19,6 +20,8 @@ if (host) {
   } catch {
     // An unreadable session falls back to upstream's defaults.
   }
+  // The first render asks for artwork URLs, which name the local forward's port.
+  await reachHost(host).catch(() => undefined);
 }
 
 if ("__TAURI_INTERNALS__" in window) {

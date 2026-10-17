@@ -3,9 +3,10 @@
 //!
 //! Upstream reaches this through one plugin, registered in `run`. The plugin
 //! starts the server when Serve library is on, and answers the Preferences
-//! pane on the `rbxfork://` scheme.
+//! pane and a client's forward to its host on the `rbxfork://` scheme.
 
 pub mod commands;
+pub mod forward;
 pub mod server;
 pub mod settings;
 
@@ -45,6 +46,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     tauri::plugin::Builder::new("rbxfork")
         .setup(|app, _api| {
             app.manage(ForkServer::default());
+            app.manage(forward::Forwards::default());
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 apply(&app).await;
@@ -54,7 +56,12 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
         .register_asynchronous_uri_scheme_protocol("rbxfork", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
             tauri::async_runtime::spawn(async move {
-                responder.respond(preferences(&app, request).await);
+                let response = if request.uri().path() == "/forward" {
+                    forward_to(&app, &request)
+                } else {
+                    preferences(&app, request).await
+                };
+                responder.respond(response);
             });
         })
         .build()
@@ -160,10 +167,31 @@ async fn preferences<R: Runtime>(app: &AppHandle<R>, request: Request<Vec<u8>>) 
     } else {
         app.state::<ForkServer>().0.lock().await.status.clone()
     };
+    json(StatusCode::OK, &status)
+}
+
+#[derive(Deserialize)]
+struct Target {
+    host: String,
+    port: u16,
+}
+
+/// `rbxfork://localhost/forward`: POST a `Target`, get the local port that reaches it.
+fn forward_to<R: Runtime>(app: &AppHandle<R>, request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
+    let answer = serde_json::from_slice::<Target>(request.body())
+        .map_err(|e| e.to_string())
+        .and_then(|target| forward::local_port(&app.state::<forward::Forwards>(), &target.host, target.port));
+    match answer {
+        Ok(port) => json(StatusCode::OK, &serde_json::json!({ "port": port })),
+        Err(message) => json(StatusCode::BAD_REQUEST, &serde_json::json!({ "kind": "remote", "message": message })),
+    }
+}
+
+fn json(status: StatusCode, body: &impl Serialize) -> Response<Vec<u8>> {
     Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header("Content-Type", "application/json")
         .header("Access-Control-Allow-Origin", "*")
-        .body(serde_json::to_vec(&status).unwrap_or_default())
+        .body(serde_json::to_vec(body).unwrap_or_default())
         .unwrap_or_default()
 }
