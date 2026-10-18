@@ -68,7 +68,7 @@ tempfile = "3"
 # fork: server-mode (src-tauri/src/fork/)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 if-addrs = "0.15"
-tokio = { version = "1", features = ["macros", "net", "sync"] }
+tokio = { version = "1", features = ["macros", "net", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 

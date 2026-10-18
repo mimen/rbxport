@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IpcError } from "../invoke";
-import { BUILD_VERSION, isHostEvent, reachHost, remoteArtworkUrl, remoteHost, setRemoteHost, withRemote } from "./remote";
+import { BUILD_VERSION, checkHost, isHostEvent, reachHost, remoteArtworkUrl, remoteHost, setRemoteHost, watchHost, withRemote } from "./remote";
 
 const store = new Map<string, string>();
 vi.stubGlobal("localStorage", {
@@ -10,6 +10,7 @@ vi.stubGlobal("localStorage", {
 });
 vi.stubGlobal("window", { __TAURI_INTERNALS__: { convertFileSrc: (path: string, scheme: string) => `${scheme}://localhost/${path}` } });
 const FORWARD = "rbxfork://localhost/forward";
+const REACH = "rbxfork://localhost/reach";
 const fetch = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>();
 const forward = (url: string, init?: RequestInit) =>
   url === FORWARD ? Promise.resolve(Response.json({ port: 50123 })) : Promise.reject(new Error(`unexpected fetch ${url} ${init?.method}`));
@@ -103,5 +104,45 @@ describe("media and events", () => {
   it("takes library events from the host and window events from here", () => {
     expect(isHostEvent("library:changed")).toBe(true);
     expect(isHostEvent("menu")).toBe(false);
+  });
+});
+
+describe("checking the host", () => {
+  const host = { url: "http://host.example.ts.net:48650", token: "t0k" };
+  /** The forward's check answers `reached`, and the host's `/version` answers `version`. */
+  const answers = (reached: unknown, version?: () => Promise<Response>) =>
+    fetch.mockImplementation((url, init) => {
+      if (url === FORWARD) return forward(url, init);
+      if (url === REACH) return Promise.resolve(Response.json(reached));
+      return version ? version() : Promise.reject(new Error(`unexpected fetch ${url}`));
+    });
+
+  it("passes when the host answers with this build", async () => {
+    answers(null, () => Promise.resolve(Response.json({ version: BUILD_VERSION })));
+    await expect(checkHost(host)).resolves.toEqual({ ok: true });
+    const reach = fetch.mock.calls.find(([url]) => url === REACH);
+    expect(reach?.[1]?.body).toBe('{"host":"host.example.ts.net","port":48650}');
+  });
+
+  it("names a refused or silent connection as the forward saw it", async () => {
+    answers({ reason: "timedOut", message: "No answer in 3 seconds." });
+    await expect(checkHost(host)).resolves.toEqual({ ok: false, reason: "timedOut", message: "No answer in 3 seconds." });
+    expect(fetch.mock.calls.some(([url]) => String(url).includes("/version"))).toBe(false);
+  });
+
+  it("names a refused token and another build", async () => {
+    answers(null, () => Promise.resolve(Response.json({ kind: "unauthorized", message: "The host refused the token." }, { status: 401 })));
+    await expect(checkHost(host)).resolves.toMatchObject({ ok: false, reason: "tokenRefused" });
+    answers(null, () => Promise.resolve(Response.json({ version: "0.0.1" })));
+    await expect(checkHost(host)).resolves.toMatchObject({ ok: false, reason: "versionMismatch", message: expect.stringContaining("0.0.1") });
+  });
+
+  it("checks when a request to the host fails", async () => {
+    answers(null, () => Promise.resolve(Response.json({ version: BUILD_VERSION })));
+    const link = watchHost(() => {});
+    await vi.waitFor(() => expect(link?.state().status).toBe("connected"));
+    answers({ reason: "refused", message: "Connection refused" });
+    await expect(withRemote(local)("playlist_tree")).rejects.toMatchObject({ kind: "remote" });
+    await vi.waitFor(() => expect(link?.state()).toMatchObject({ status: "unreachable", reason: "refused" }));
   });
 });

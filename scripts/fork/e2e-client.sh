@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Server mode end to end with a RELEASE client: launches the built app as a client of a stub
-# host on this machine's Tailscale name and fails unless the host receives the client's
-# invoke (with its token) and its events WebSocket. A debug client runs at
+# host on this machine's Tailscale name. With the stub stopped, the client must log that it
+# cannot reach the host within seconds. Once the stub starts, without a restart, the client
+# must say it reached the host again and the stub must receive the client's invoke (with its
+# token) and its events WebSocket. A debug client runs at
 # http://localhost:1420, where WebKit allows what a release page at tauri://localhost
 # blocks as mixed content, so only a release build proves the client reaches a host.
 #
@@ -11,6 +13,7 @@
 set -euo pipefail
 
 app="${1:?usage: e2e-client.sh <app>}"
+version="$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")"
 BUNDLE_ID=com.mimen.rbxport.fork
 PORT=48659
 [[ -e "$HOME/Library/Pioneer/rekordbox" ]] && { echo "e2e: this machine has a rekordbox library; run it on the Mini" >&2; exit 1; }
@@ -24,7 +27,7 @@ ip="$(jq -r '.Self.TailscaleIPs[] | select(test("^100\\."))' <<<"$self")"
 dir="$(mktemp -d)"
 token="e2e$(uuidgen | tr -d -)"
 cat >"$dir/host.py" <<'EOF'
-import http.server, sys
+import http.server, json, sys
 class Host(http.server.BaseHTTPRequestHandler):
     def answer(self, status, body=b""):
         self.send_response(status)
@@ -34,7 +37,9 @@ class Host(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
     def do_OPTIONS(self): self.answer(204)
-    def do_GET(self): self.answer(404)
+    def do_GET(self):
+        if self.path == "/version": self.answer(200, json.dumps({"version": sys.argv[3]}).encode())
+        else: self.answer(404)
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
         self.answer(200, b"null")
@@ -71,22 +76,33 @@ if ! seed get >/dev/null 2>&1; then
   open -n "$app"; sleep 8; quit
 fi
 saved="$(seed get)"
-python3 -I "$dir/host.py" "$ip" "$PORT" >"$dir/host.log" 2>&1 &
-host_pid=$!
-trap 'quit; seed set "$saved"; kill $host_pid; wait $host_pid 2>/dev/null || true; rm -rf "$dir"' EXIT
-sleep 1
+host_pid=
+trap 'quit; seed set "$saved"; if [[ -n "$host_pid" ]]; then kill $host_pid; wait $host_pid 2>/dev/null || true; fi; rm -rf "$dir"' EXIT
+
+# Within a few seconds of `seconds`, or fail with `what`.
+wait_for() {
+  local seconds="$1" what="$2"; shift 2
+  for _ in $(seq $((seconds * 2))); do "$@" && return 0; sleep 0.5; done
+  echo "e2e: FAIL, $what" >&2
+  exit 1
+}
+logged() { cat "$dir"/logs/rbxport* 2>/dev/null | grep -q "$1"; }
 
 seed set "{\"url\":\"http://$name:$PORT\",\"token\":\"$token\"}"
-open -n "$app"
-invoked=false events=false
-for _ in $(seq 60); do
-  grep -q "^POST /invoke/[a-z_]* Bearer $token " "$dir/host.log" && invoked=true
-  grep -q "^GET /events .* websocket" "$dir/host.log" && events=true
-  $invoked && $events && break
-  sleep 0.5
-done
+started=$SECONDS
+open -n --env RBXPORT_LOG_DIR="$dir/logs" "$app"
+wait_for 12 "the client never said it could not reach the stopped host" logged "Can't reach the library on $name (refused)"
+echo "e2e: with the host stopped, the client showed it unreachable after $((SECONDS - started)) s"
+
+python3 -I "$dir/host.py" "$ip" "$PORT" "$version" >"$dir/host.log" 2>&1 &
+host_pid=$!
+started=$SECONDS
+wait_for 30 "the client did not recover once the host started" logged "Reached the library on $name again."
+echo "e2e: the client recovered $((SECONDS - started)) s after the host started"
+reached() {
+  grep -q "^POST /invoke/[a-z_]* Bearer $token " "$dir/host.log" && grep -q "^GET /events .* websocket" "$dir/host.log"
+}
+wait_for 30 "no invoke with the token and events WebSocket reached the host" reached
 echo "e2e: the stub host at http://$name:$PORT saw:"
 sort "$dir/host.log" | uniq -c | sed "s/$token/<token>/" | head -20
-$invoked || { echo "e2e: FAIL, no invoke with the token reached the host" >&2; exit 1; }
-$events || { echo "e2e: FAIL, no events WebSocket reached the host" >&2; exit 1; }
-echo "e2e: pass, a release client reached the host"
+echo "e2e: pass, a release client showed the host unreachable and then reached it"

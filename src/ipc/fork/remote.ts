@@ -9,6 +9,7 @@
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { IpcError } from "../invoke";
+import { createLink, type Link, type Outcome } from "./link";
 
 export interface RemoteHost {
   /** `http://<tailscale name>:<port>`, no trailing slash. The page reaches it through `reachHost`. */
@@ -220,8 +221,17 @@ async function refusal(response: Response): Promise<IpcError> {
   return new IpcError(body ?? { kind: "remote", message: `The library host answered ${response.status}.` });
 }
 
+/** Set in the main window only, by `watchHost`; the other windows have nothing to show it in. */
+let link: Link | null = null;
+
 async function callHost<T>(host: RemoteHost, command: string, args?: InvokeArgs): Promise<T> {
-  const response = await hostFetch(host, `/invoke/${command}`, { method: "POST", body: JSON.stringify(args ?? {}) });
+  const response = await hostFetch(host, `/invoke/${command}`, { method: "POST", body: JSON.stringify(args ?? {}) })
+    .catch((error: unknown) => {
+      link?.failed();
+      throw error;
+    });
+  if (response.status === 401 || response.status === 409) link?.failed();
+  else link?.answered();
   if (!response.ok) throw await refusal(response);
   if (response.headers.get("content-type")?.includes("json")) return (await response.json()) as T;
   return (await response.arrayBuffer()) as T;
@@ -272,7 +282,10 @@ const hostEvents = (() => {
       url.searchParams.set("v", BUILD_VERSION);
       const opened = new WebSocket(url);
       socket = opened;
+      let open = false;
       opened.onopen = () => {
+        open = true;
+        link?.answered();
         retryMs = 500;
         for (const event of listeners.keys()) send({ listen: event });
       };
@@ -280,7 +293,11 @@ const hostEvents = (() => {
         const { event, payload } = JSON.parse(String(message.data)) as { event: string; payload: unknown };
         for (const listener of listeners.get(event) ?? []) listener(payload);
       };
-      opened.onclose = () => retry(host);
+      opened.onclose = () => {
+        // One that never opened is the host still away, and the link is already checking.
+        if (open) link?.failed();
+        retry(host);
+      };
     }).catch(() => retry(host));
   };
 
@@ -334,6 +351,39 @@ export async function probeHost(host: RemoteHost): Promise<void> {
       message: `The host runs rbxport ${version}, and this app is ${BUILD_VERSION}. Install the same version on both machines.`,
     });
   }
+}
+
+/** The forward's own connection to the host, then `probeHost`. */
+export async function checkHost(host: RemoteHost): Promise<Outcome> {
+  const { hostname, port } = new URL(host.url);
+  const response = await fetch(`${convertFileSrc("", "rbxfork")}reach`, {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: JSON.stringify({ host: hostname, port: Number(port || 80) }),
+  });
+  const unreachable = (await response.json()) as { reason: "refused" | "timedOut" | "other"; message: string } | null;
+  if (unreachable) return { ok: false, ...unreachable };
+  try {
+    await probeHost(host);
+    return { ok: true };
+  } catch (error) {
+    const kind = error instanceof IpcError ? error.kind as string | undefined : undefined;
+    const reason = kind === "unauthorized" ? "tokenRefused" : kind === "versionMismatch" ? "versionMismatch" : "other";
+    return { ok: false, reason, message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Starts checking the host for the main window's notice, and returns what
+ * the notice follows. `recovered` runs when the host answers again after
+ * it could not be reached.
+ */
+export function watchHost(recovered: () => void): Link | null {
+  const host = remoteHost();
+  if (host === null) return null;
+  link ??= createLink({ check: () => checkHost(host), recovered });
+  link.check();
+  return link;
 }
 
 /** This machine's own server, as the host's Preferences pane shows it. */

@@ -5,10 +5,26 @@
 //! unchanged, so the token, range requests and WebSocket upgrades pass as sent.
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::sync::Mutex;
+use std::time::Duration;
 
+use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
+
+/// A host behind a firewall that drops packets never refuses, and the
+/// system's own connect timeout is over a minute. The client shows the host
+/// unreachable after one of these, so it stays short.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Why a connection to the host failed, as the client's notice names it.
+#[derive(Debug, Serialize)]
+pub struct Unreachable {
+    /// `refused`, `timedOut` or `other`.
+    pub reason: &'static str,
+    pub message: String,
+}
 
 /// Host `name:port` to the local port that reaches it.
 #[derive(Default)]
@@ -20,6 +36,29 @@ fn tailnet_name(host: &str) -> bool {
     host.len() > ".ts.net".len()
         && host.ends_with(".ts.net")
         && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+}
+
+async fn connect(target: &str) -> Result<TcpStream, Unreachable> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => {
+            let reason = match e.kind() {
+                ErrorKind::ConnectionRefused => "refused",
+                ErrorKind::TimedOut => "timedOut",
+                _ => "other",
+            };
+            Err(Unreachable { reason, message: e.to_string() })
+        }
+        Err(_) => Err(Unreachable { reason: "timedOut", message: format!("No answer in {} seconds.", CONNECT_TIMEOUT.as_secs()) }),
+    }
+}
+
+/// Opens and closes one connection to `host:port`, for the client's check.
+pub async fn reach(host: &str, port: u16) -> Result<(), Unreachable> {
+    if !tailnet_name(host) {
+        return Err(Unreachable { reason: "other", message: format!("{host} is not a Tailscale name.") });
+    }
+    connect(&format!("{host}:{port}")).await.map(drop)
 }
 
 /// The local port for `host:port`, listening from the first call on.
@@ -59,17 +98,18 @@ async fn serve(listener: StdTcpListener, target: String) {
         };
         let target = target.clone();
         tauri::async_runtime::spawn(async move {
-            match TcpStream::connect(&target).await {
+            match connect(&target).await {
                 Ok(mut host) => {
                     let _ = tokio::io::copy_bidirectional(&mut page, &mut host).await;
                 }
-                Err(e) => tracing::warn!(error = %e, %target, "could not reach the library host"),
+                Err(e) => tracing::warn!(reason = e.reason, error = %e.message, %target, "could not reach the library host"),
             }
         });
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -80,5 +120,21 @@ mod tests {
             assert!(!tailnet_name(host), "{host}");
             assert!(local_port(&Forwards::default(), host, 80).is_err(), "{host}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_port_reads_as_refused() {
+        let port = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
+        let failed = connect(&format!("127.0.0.1:{port}")).await.unwrap_err();
+        assert_eq!(failed.reason, "refused", "{}", failed.message);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_that_drops_packets_times_out_in_seconds() {
+        // TEST-NET-1 is never routed, so the connect hangs as it does behind a dropping firewall.
+        let started = std::time::Instant::now();
+        let failed = connect("192.0.2.1:48650").await.unwrap_err();
+        assert!(matches!(failed.reason, "timedOut" | "other"), "{failed:?}");
+        assert!(started.elapsed() < CONNECT_TIMEOUT + Duration::from_secs(1));
     }
 }

@@ -3,7 +3,8 @@
 //!
 //! Upstream reaches this through one plugin, registered in `run`. The plugin
 //! starts the server when Serve library is on, and answers the Preferences
-//! pane and a client's forward to its host on the `rbxfork://` scheme.
+//! pane, and a client's forward to its host and check of it, on the
+//! `rbxfork://` scheme.
 
 pub mod commands;
 pub mod forward;
@@ -56,10 +57,10 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
         .register_asynchronous_uri_scheme_protocol("rbxfork", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
             tauri::async_runtime::spawn(async move {
-                let response = if request.uri().path() == "/forward" {
-                    forward_to(&app, &request)
-                } else {
-                    preferences(&app, request).await
+                let response = match request.uri().path() {
+                    "/forward" => forward_to(&app, &request),
+                    "/reach" => reach(&request).await,
+                    _ => preferences(&app, request).await,
                 };
                 responder.respond(response);
             });
@@ -185,6 +186,15 @@ fn forward_to<R: Runtime>(app: &AppHandle<R>, request: &Request<Vec<u8>>) -> Res
         Ok(port) => json(StatusCode::OK, &serde_json::json!({ "port": port })),
         Err(message) => json(StatusCode::BAD_REQUEST, &serde_json::json!({ "kind": "remote", "message": message })),
     }
+}
+
+/// `rbxfork://localhost/reach`: POST a `Target`; `null` when it answers, else why not.
+async fn reach(request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
+    let answer = match serde_json::from_slice::<Target>(request.body()) {
+        Ok(target) => forward::reach(&target.host, target.port).await.err(),
+        Err(e) => Some(forward::Unreachable { reason: "other", message: e.to_string() }),
+    };
+    json(StatusCode::OK, &answer)
 }
 
 fn json(status: StatusCode, body: &impl Serialize) -> Response<Vec<u8>> {

@@ -23,3 +23,69 @@ html[data-rbxfork-remote] body::after {
   background: rgb(40 110 220 / 85%);
   pointer-events: none;
 }
+
+/* unreachable.ts's notice, over the whole main window. */
+#rbxfork-unreachable {
+  display: none;
+}
+
+html[data-rbxfork-link="unreachable"] #rbxfork-unreachable {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 55%);
+}
+
+#rbxfork-unreachable > div {
+  max-width: 440px;
+  padding: 20px 24px;
+  border-radius: 10px;
+  color: var(--c-text, #e6e6e6);
+  background: var(--c-panel, #1e1e1e);
+  box-shadow: 0 12px 40px rgb(0 0 0 / 50%);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+#rbxfork-unreachable h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+#rbxfork-unreachable p {
+  margin: 0 0 8px;
+}
+
+#rbxfork-unreachable p:empty {
+  display: none;
+}
+
+#rbxfork-unreachable [data-status] {
+  color: var(--c-text-dim, #9a9a9a);
+}
+
+#rbxfork-unreachable > div > div {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+#rbxfork-unreachable button {
+  padding: 4px 12px;
+  border: 1px solid rgb(255 255 255 / 20%);
+  border-radius: 5px;
+  font: inherit;
+  color: inherit;
+  background: rgb(255 255 255 / 8%);
+}
+
+#rbxfork-unreachable button[data-retry] {
+  border-color: transparent;
+  background: var(--c-accent, #1373eb);
+}
+
+#rbxfork-unreachable button:disabled {
+  opacity: 0.5;
+}
