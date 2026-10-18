@@ -12,9 +12,37 @@ const DIALOGS = [
   "exportLoopWav", "exportPlaylistFile", "chooseRelocateFile", "pickImage", "pickFolder",
 ] as const satisfies readonly (keyof Backend)[];
 
-function preview(): Pick<Backend, "previewPlay" | "previewStop" | "previewState"> {
+/** How long a preview may wait for audio from the host before it is called failed. */
+const STALL_MS = 8000;
+
+function preview(tell: Backend["tell"]): Pick<Backend, "previewPlay" | "previewStop" | "previewState"> {
   const audio = new Audio();
   let track: string | null = null;
+  let stall: ReturnType<typeof setTimeout> | undefined;
+  let refuseStart: ((error: Error) => void) | null = null;
+
+  // A failure pauses the element, so `previewState` reads not playing. A
+  // start still waiting rejects, which the row shows as the preview's error;
+  // one already playing has nowhere to show it but a dialog.
+  const fail = (message: string) => {
+    clearTimeout(stall);
+    if (track === null) return;
+    audio.pause();
+    if (refuseStart) refuseStart(new Error(message));
+    else void tell(message, "Preview stopped");
+    refuseStart = null;
+  };
+  const waitForAudio = () => {
+    clearTimeout(stall);
+    stall = setTimeout(() => fail(`The host sent no audio for ${STALL_MS / 1000} seconds.`), STALL_MS);
+  };
+  audio.addEventListener("error", () => {
+    fail(`The preview could not load from the host${audio.error?.message ? `: ${audio.error.message}` : "."}`);
+  });
+  audio.addEventListener("waiting", waitForAudio);
+  audio.addEventListener("playing", () => clearTimeout(stall));
+  audio.addEventListener("pause", () => clearTimeout(stall));
+
   return {
     previewPlay: async (trackId, positionMs) => {
       const src = remoteAudioUrl(trackId);
@@ -22,7 +50,15 @@ function preview(): Pick<Backend, "previewPlay" | "previewStop" | "previewState"
       track = trackId;
       audio.src = src;
       audio.currentTime = positionMs / 1000;
-      await audio.play();
+      const refused = new Promise<never>((_, reject) => {
+        refuseStart = reject;
+      });
+      waitForAudio();
+      try {
+        await Promise.race([audio.play(), refused]);
+      } finally {
+        refuseStart = null;
+      }
     },
     previewStop: () => {
       track = null;
@@ -47,7 +83,7 @@ export function remoteBackend(backend: Backend): Backend {
   return {
     ...backend,
     ...Object.fromEntries(DIALOGS.map((name) => [name, refuse])),
-    ...preview(),
+    ...preview((message, title) => backend.tell(message, title)),
     listDevices: () => Promise.resolve([]),
     onDevicesChanged: () => () => {},
     explorerRoots: () => Promise.resolve([]),
