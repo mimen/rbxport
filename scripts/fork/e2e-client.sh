@@ -18,8 +18,10 @@ BUNDLE_ID=com.mimen.rbxport.fork
 PORT=48659
 [[ -e "$HOME/Library/Pioneer/rekordbox" ]] && { echo "e2e: this machine has a rekordbox library; run it on the Mini" >&2; exit 1; }
 
-tailscale=$(command -v tailscale || echo /Applications/Tailscale.app/Contents/MacOS/Tailscale)
-self="$("$tailscale" status --self --peers=false --json 2>/dev/null)"
+# The app's own CLI first: a Homebrew tailscale cannot reach the app's daemon (IPNExtension).
+tailscale=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+[[ -x "$tailscale" ]] || tailscale=$(command -v tailscale)
+self="$("$tailscale" status --self --peers=false --json 2>/dev/null || true)"
 name="$(jq -r '.Self.DNSName | rtrimstr(".")' <<<"$self")"
 ip="$(jq -r '.Self.TailscaleIPs[] | select(test("^100\\."))' <<<"$self")"
 [[ "$name" == *.ts.net && -n "$ip" ]] || { echo "e2e: no Tailscale name on this machine" >&2; exit 1; }
