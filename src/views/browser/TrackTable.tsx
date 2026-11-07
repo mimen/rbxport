@@ -12,7 +12,7 @@ import { reportStartupPaint } from "@/lib/startup";
 import { useEventCallback } from "@/store/useEventCallback";
 import { TRACK_SEARCH_OPTIONS, type TrackSearchField } from "@/lib/search";
 
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { defaultRangeExtractor, useVirtualizer, type Range } from "@tanstack/react-virtual";
 import type { DeckId, ListTotals, RowDto, SortColumn, TrackField, ViewSpec } from "@/ipc/types";
@@ -31,18 +31,21 @@ import {
 import { hasLooseId } from "@/lib/explorer";
 import { previewFromClick, WaveformPreview } from "./WaveformPreview";
 import styles from "./TrackTable.module.css";
-import { FilterIcon, SortDownIcon, SortUpIcon } from "@/components/icons";
+import { ArtworkAllIcon, ArtworkPartIcon, FilterIcon, SortDownIcon, SortUpIcon } from "@/components/icons";
 import { Artwork } from "@/components/Artwork";
 import { RatingStar } from "@/components/RatingStar";
 import { RecordIcon } from "@/components/icons";
-import { EXTRA_COLUMNS, reorderTarget, type ColumnKey, type ColumnSpec } from "@/lib/columns";
+import { EXTRA_COLUMNS, FIXED_WIDTH, reorderTarget, type ColumnKey, type ColumnSpec } from "@/lib/columns";
 import { COLOR_NAMES } from "@/lib/trackFilter";
+import { COLORS } from "@/views/info/fields";
+import { useTranslation } from "@/i18n";
 import { browseListVars, browseScale, formatKey } from "@/lib/preferences";
 import { trafficLightLit, type TrafficLightReach } from "@/lib/camelot";
 import { TickIcon } from "@/components/icons";
-import type { TrafficLightSource } from "@/lib/session";
+import type { ArtworkMode, TrafficLightSource } from "@/lib/session";
 import type { ListPosition } from "@/lib/continuousPlay";
 import { usePreferences, useTooltip } from "@/store/usePreferences";
+import { usePlayedTracks } from "@/store/usePlayedTracks";
 import type { KeyDisplay } from "@/ipc/types";
 import { ColumnMenu } from "./ColumnMenu";
 import { createDragAutoscroll } from "@/lib/dragAutoscroll";
@@ -83,9 +86,6 @@ const SKELETON_WIDTHS = ["42%", "66%", "54%"];
 const COL_HEADER_H = 24;
 /** No deck holds anything: the table outside the app's own decks. */
 const NO_DECKS: readonly (string | null)[] = [];
-/// --s-preview-band-h: the strip the row's waveform and its cue badges share.
-/// The canvas needs the number for its backing store; the cell's CSS places it.
-const PREVIEW_BAND_H = 15;
 
 export type Column = ColumnSpec;
 
@@ -225,11 +225,12 @@ const Stars = memo(function Stars({
  * safe.
  */
 const EditableCell = memo(function EditableCell({
-  value, label, col, onCommit, onClick, tip, doubleClickLoads = false, onEditBlocked, choices, choiceLabel, display, lit, onOpen,
+  value, label, col, onCommit, onClick, tip, doubleClickLoads = false, onEditBlocked, choices, choiceLabel, display, lit, onOpen, className,
 }: {
   value: string;
   /** What the cell shows when it is not being edited; the value itself when absent. */
-  display?: string;
+  display?: ReactNode;
+  className?: string;
   label: string;
   /**
    * The values the field accepts. Present, the cell opens a list rather than
@@ -306,7 +307,7 @@ const EditableCell = memo(function EditableCell({
     };
     return (
       <div
-        className={styles.cell}
+        className={className ?? styles.cell}
         data-col={col}
         data-lit={lit || undefined}
         role="gridcell"
@@ -416,13 +417,21 @@ const EditableCell = memo(function EditableCell({
 });
 
 const TrackRow = memo(function TrackRow({
-  row, top, selected, onSelect, onOpen, onDragStart, onDragEnd, index, columns, onRate,
-  onComment, onEditField, onEditBlocked, onMenu, keyDisplay, keyChoices, onOpenKeys, previewCues, clickToEdit, tooltips, trafficKey, trafficReach,
-  reorderable, isLocalDrag, dropEdge, onReorderOver, onReorderDrop, startupCache,
+  row, top, selected, played, onSelect, onOpen, onDragStart, onDragEnd, index, columns, onRate,
+  onComment, onEditField, onEditColor, onEditBlocked, onMenu, keyDisplay, keyChoices, onOpenKeys, previewCues, clickToEdit, tooltips, trafficKey, trafficReach,
+  reorderable, isLocalDrag, dropEdge, onReorderOver, onReorderDrop, startupCache, previewHeight,
 }: {
   row: RowDto | undefined;
   top: number;
+  /**
+   * The strip the row's waveform and its cue badges share, from
+   * `previewBand`. The canvas needs the number for its backing store; the
+   * cell's CSS places it.
+   */
+  previewHeight: number;
   selected: boolean;
+  /** Played (#540): the row's text is drawn in rekordbox's played green. */
+  played: boolean;
   index: number;
   columns: readonly ColumnSpec[];
   /** Preferences: `Ebm` or `2A`. */
@@ -450,6 +459,7 @@ const TrackRow = memo(function TrackRow({
   onComment: ((id: string, comment: string) => void) | undefined;
   /** Write a metadata field typed over in the row. */
   onEditField: ((id: string, field: TrackField, value: string) => void) | undefined;
+  onEditColor: ((id: string, color: string) => void) | undefined;
   onEditBlocked?: (() => void) | undefined;
   onMenu: (index: number, row: RowDto, at: { x: number; y: number }) => void;
   onDragEnd: () => void;
@@ -463,6 +473,7 @@ const TrackRow = memo(function TrackRow({
   onReorderDrop: (at: { index: number; below: boolean }) => void;
   startupCache: boolean;
 }) {
+  const t = useTranslation();
   // Stops watching a press that might become a native drag. The pointer is
   // followed on the window: a quick flick leaves a row before the row sees
   // the 5px of travel, and the drag then never started.
@@ -523,6 +534,7 @@ const TrackRow = memo(function TrackRow({
     <div
       className={styles.row}
       data-selected={selected || undefined}
+      data-played={played || undefined}
       data-even={index % 2 === 1 || undefined}
       style={{ transform: `translate3d(0, ${top}px, 0)` }}
       onMouseDown={(e) => {
@@ -642,6 +654,24 @@ const TrackRow = memo(function TrackRow({
             </div>
           );
         }
+        if (col.key === "summary") {
+          // rekordbox's `ListViewer::paintHybridColumn` @0x1003f1934: the
+          // title in the list's font on the first line; the artist, the BPM
+          // and the key a size smaller on the second, both in the row's text
+          // colour (`getTextColumnColor`), left-aligned and centred on their
+          // lines, with the row's spare height shared equally above, between
+          // and below them [OBS static, rekordbox 7.2.19].
+          return (
+            <div key={col.key} className={`${styles.cell} ${styles.summary}`} data-col={col.key} role="gridcell">
+              <span className={styles.summaryTitle}>{row.title}</span>
+              <span className={styles.summaryLine}>
+                <span className={styles.summaryText}>{row.artist}</span>
+                <span className={styles.summaryText}>{cellText(row, "bpm")}</span>
+                <span className={styles.summaryText}>{formatKey(row.key, keyDisplay)}</span>
+              </span>
+            </div>
+          );
+        }
         if (col.key === "comment" && onComment) {
           return (
             <EditableCell
@@ -701,9 +731,10 @@ const TrackRow = memo(function TrackRow({
                 <WaveformPreview
                   trackId={row.id}
                   width={col.width - 6}
-                  height={PREVIEW_BAND_H}
+                  height={previewHeight}
                   hotCues={previewCues ? row.hotCues : NO_CUES}
                   memoryCues={previewCues ? row.memoryCues : undefined}
+                  memoryCueColours={previewCues ? row.memoryCueColours : undefined}
                   durationSec={row.durationSec}
                   startupCache={startupCache}
                 />
@@ -722,6 +753,27 @@ const TrackRow = memo(function TrackRow({
           // rekordbox's ListViewer::paintColourColumn: the colour's ball, then
           // its name; a track with no colour leaves the cell empty.
           const name = cellText(row, col.key);
+          if (onEditColor) {
+            return (
+              <EditableCell
+                key={col.key}
+                value={String(row.extra?.color ?? 0)}
+                className={`${styles.cell} ${styles.colorCell}`}
+                display={<>
+                  {name ? <span className={styles.colorBall} data-color={name} aria-hidden /> : null}
+                  {t(name)}
+                </>}
+                label={col.label}
+                col={col.key}
+                choices={["0", ...COLORS.map((color) => color.id)]}
+                choiceLabel={(color) => t(color === "0" ? "No Color" : COLORS.find((entry) => entry.id === color)?.name ?? "")}
+                onCommit={(color) => onEditColor(row.id, color)}
+                onClick={clickToEdit && selected}
+                onEditBlocked={onEditBlocked}
+                tip={undefined}
+              />
+            );
+          }
           return (
             <div key={col.key} className={`${styles.cell} ${styles.colorCell}`} data-col={col.key} role="gridcell">
               {name ? <span className={styles.colorBall} data-color={name} aria-hidden /> : null}
@@ -769,12 +821,16 @@ const TrackRow = memo(function TrackRow({
 export interface TrackDrag {
   /** Every track travelling: the selection, or the one row grabbed outside it. */
   ids: readonly string[];
+  /** Where the row ids came from; device ids cannot be treated as collection ids. */
+  sourceKind: ViewSpec["source"]["kind"];
   /**
    * The one a deck takes: the topmost of them in the list, as rekordbox
    * loads the first of a dropped selection rather than the row the hand
    * was on [OBS].
    */
   row: RowDto;
+  /** Position of the row the deck loads, including for a selected group. */
+  position: ListPosition;
 }
 
 export interface TrackTableProps {
@@ -835,6 +891,8 @@ export interface TrackTableProps {
   /** Edit a track's rating or comment. Absent where writes are impossible. */
   onRate?: (id: string, stars: number) => void;
   onComment?: (id: string, comment: string) => void;
+  /** Set one track's Color from a Collection or Playlist cell. */
+  onEditColor?: (id: string, color: string) => void;
   /**
    * Write the playlist's new order, dragged by hand.
    *
@@ -956,6 +1014,75 @@ export interface TrackTableProps {
   trafficLight?: TrafficLightSource;
   onTrafficLight?: (source: TrafficLightSource) => void;
   trafficKey?: string | null;
+  /**
+   * The artwork display pattern and its two buttons beside the MASTER menu.
+   * The main browser passes these; without them the list shows the upper part
+   * of the artwork and offers no buttons.
+   */
+  artworkMode?: ArtworkMode;
+  onArtworkMode?: (mode: ArtworkMode) => void;
+}
+
+/**
+ * The two artwork buttons, in rekordbox's order and wording: its manual's
+ * browser panel lists the upper-part button first, and these are the
+ * tooltips `SelectPartialArtworkButton` and `SelectFullArtworkButton` carry.
+ */
+const ARTWORK_MODES: readonly { mode: ArtworkMode; label: string; Icon: typeof ArtworkPartIcon }[] = [
+  { mode: "partial", label: "Show the upper part of the artwork.", Icon: ArtworkPartIcon },
+  { mode: "full", label: "Show the entire artwork.", Icon: ArtworkAllIcon },
+];
+
+/**
+ * The whole-artwork Artwork column's width for a row height. rekordbox's
+ * `ListViewer::updateRowHeight` @0x10040a268 sets header column 61 to twice
+ * the line height, the whole-artwork row's height, and JUCE's
+ * `TableHeaderComponent::setColumnWidth` holds it between the minimum and
+ * maximum the column was added with, 25 and 85 [OBS static, rekordbox
+ * 7.2.19: the width table at 0x1037b50ac]. Every row height this app draws
+ * falls inside, so the cell is always a square.
+ */
+export function fullArtworkWidth(rowHeight: number): number {
+  return Math.min(85, Math.max(25, rowHeight));
+}
+
+/**
+ * The columns as the list draws them. The caller passes the artwork mode's
+ * own layout (rekordbox keeps one per mode); showing the whole artwork, the
+ * Artwork column is as wide as a row is tall, so every cell is a square
+ * holding the whole sleeve, and its heading is blank, as rekordbox adds
+ * column 61 with no name [OBS static, rekordbox 7.2.19: the name table at
+ * 0x1053aab68 holds "" for it].
+ */
+export function columnsForArtworkMode(
+  columns: readonly ColumnSpec[],
+  mode: ArtworkMode,
+  rowHeight: number,
+): readonly ColumnSpec[] {
+  if (mode !== "full" || !columns.some((col) => col.key === "artwork")) return columns;
+  return columns.map((col) =>
+    col.key === "artwork" ? { ...col, label: "", width: fullArtworkWidth(rowHeight) } : col,
+  );
+}
+
+/**
+ * Where the Preview column's waveform sits in a row of this height.
+ * rekordbox's `PreviewComponent::resized` @0x101d2309c insets the waveform
+ * by a fifth of the cell's height above and below, and `paint` centres it
+ * there, so it is 15 high, 5 down, in a 25-point row and twice that in the
+ * whole artwork's [OBS static, rekordbox 7.2.19].
+ */
+export function previewBand(rowHeight: number): { top: number; height: number } {
+  const top = Math.trunc(rowHeight * 0.2);
+  return { top, height: rowHeight - 2 * top };
+}
+
+/**
+ * A row's height for the artwork mode: rekordbox's `getFullArtworkRowHeight`
+ * is twice `getPartialArtworkRowHeight`, the browse line height.
+ */
+export function rowHeightForArtworkMode(lineHeight: number, mode: ArtworkMode): number {
+  return mode === "full" ? lineHeight * 2 : lineHeight;
 }
 
 /** The MASTER menu's rows, in rekordbox's wording [OBS]. */
@@ -990,19 +1117,32 @@ function rowKey(row: RowDto | undefined, slot: number | string | bigint, keyed: 
 
 export const TrackTable = memo(function TrackTable({
   deckTrackIds = NO_DECKS, onShowCollection, spec, onSortChange, onSelectionChange, onTotalsChange, title, query, onQueryChange, searchRef, searchField = "all", onSearchFieldChange,
-  columns, onColumnMove, onColumnResize, onColumnToggle, onColumnAutoSize,
-  onColumnAutoSizeAll, onFocusedRow, onDragTracks, dragging = false, onDropTracks, onDropFiles, onDragError, onRate, onComment, onReorder, onRenumber, subBrowser = false, onEditField, onEditBlocked, seed, onFirstRows,
+  columns: layoutColumns, onColumnMove, onColumnResize, onColumnToggle, onColumnAutoSize,
+  onColumnAutoSizeAll, onFocusedRow, onDragTracks, dragging = false, onDropTracks, onDropFiles, onDragError, onRate, onComment, onReorder, onRenumber, subBrowser = false, onEditField, onEditColor, onEditBlocked, seed, onFirstRows,
   libraryGeneration, pendingEdits, pendingRows = 0, onSelectedTracks, onAnalyse,
   onShowInformation, onShowInFinder, onRemoveFromPlaylist, onRemoveFromHistory, onResetPlayCount,
   onRemoveFromCollection, onAutoRelocate, onRelocate, onConvertMemoryCues, readOnly = false,
   onImportToCollection, onAnalysisLock, onAddToPlaylist, onAddToTagList, onRemoveFromTagList, onExportTrack, onReloadTag,
   playlists = [], devices = [], deviceMenu,
   players = 0, onLoadTrack, onSelectedRow, filterOpen = false, onToggleFilter, filterBar,
-  trafficLight, onTrafficLight, trafficKey = null,
+  trafficLight, onTrafficLight, trafficKey = null, artworkMode = "partial", onArtworkMode,
 }: TrackTableProps) {
+  // Browse › FontSize and Line Space scale the measured tokens; the
+  // virtualizer has to be told the same height the CSS draws. The whole
+  // artwork doubles it.
+  const preferences = usePreferences();
+  const rowH = rowHeightForArtworkMode(
+    Math.round(ROW_H * browseScale(preferences.view.browseLineSpace)),
+    artworkMode,
+  );
+  const columns = useMemo(
+    () => columnsForArtworkMode(layoutColumns, artworkMode, rowH),
+    [layoutColumns, artworkMode, rowH],
+  );
+  const band = previewBand(rowH);
   const extraColumns = useMemo(() => EXTRA_COLUMNS.filter((key) => columns.some((column) => column.key === key)), [columns]);
   const view = useTrackView(spec, libraryGeneration, pendingEdits, seed, extraColumns);
-  const preferences = usePreferences();
+  const played = usePlayedTracks();
   const { keyDisplay, previewCueMarkers, tooltips } = preferences.view;
   // The keys the Keyboard pane's preset and the person's own changes give.
   const keyOverrides = keyMap(preferences.keyboard);
@@ -1038,9 +1178,6 @@ export const TrackTable = memo(function TrackTable({
     };
   }, [trafficMenu]);
   const clickToEdit = !preferences.advanced.doubleClickToEdit;
-  // Browse › FontSize and Line Space scale the measured tokens; the
-  // virtualizer has to be told the same height the CSS draws.
-  const rowH = Math.round(ROW_H * browseScale(preferences.view.browseLineSpace));
 
   // Hand the top of the view up once it is real, for the next start's opening
   // screen. Only the first page, and only when it is filled.
@@ -1314,6 +1451,30 @@ export const TrackTable = memo(function TrackTable({
     },
     [view, virtualizer, rowH],
   );
+  // A new artwork mode, then rekordbox's `movePositionToSelectedRow`: with a
+  // selection, the first selected row goes to the top of the list and the
+  // list back to its left edge, once the rows are their new height.
+  const topSelectedAfterResize = useRef<{ ids: ReadonlySet<string>; view: typeof view } | null>(null);
+  const chooseArtworkMode = useCallback(
+    (mode: ArtworkMode) => {
+      if (mode === artworkMode || !onArtworkMode) return;
+      topSelectedAfterResize.current = selection.ids.size > 0 ? { ids: selection.ids, view } : null;
+      onArtworkMode(mode);
+    },
+    [artworkMode, onArtworkMode, selection.ids, view],
+  );
+  useEffect(() => {
+    const pending = topSelectedAfterResize.current;
+    topSelectedAfterResize.current = null;
+    if (!pending || pending.view.count === 0) return;
+    void pending.view.idsInRange(0, pending.view.count).then((all) => {
+      const first = all.findIndex((id) => pending.ids.has(id));
+      const el = scrollRef.current;
+      if (first < 0 || !el) return;
+      el.scrollTop = first * rowH;
+      el.scrollLeft = 0;
+    });
+  }, [rowH]);
   const showsCollection = spec.source.kind === "collection";
   const locateLoaded = useCallback(() => {
     const step = locateStep(locateCursor.current, deckTrackIds);
@@ -1457,12 +1618,12 @@ export const TrackTable = memo(function TrackTable({
   }, [platform, keyOverrides, answersLocate, listScope]);
 
   const startDragOut = useCallback(
-    (row: RowDto) => {
+    (row: RowDto, index: number) => {
       // Whatever is selected, plus the row grabbed if it was not part of it —
       // dragging an unselected row should move that row, not the selection
       // somewhere else on screen.
       if (!selection.ids.has(row.id)) {
-        onDragTracks?.({ ids: [row.id], row });
+        onDragTracks?.({ ids: [row.id], row, sourceKind: spec.source.kind, position: { spec, index } });
         return;
       }
       // A playlist takes all of them; a deck takes the first in list order,
@@ -1471,16 +1632,18 @@ export const TrackTable = memo(function TrackTable({
       // selection was made from are in the cache, and the walk ends at the
       // first hit. Once per drag, not per frame.
       let first = row;
+      let firstIndex = index;
       for (let i = 0; i < view.count; i += 1) {
         const at = view.rowAt(i);
         if (at && selection.ids.has(at.id)) {
           first = at;
+          firstIndex = i;
           break;
         }
       }
-      onDragTracks?.({ ids: [...selection.ids], row: first });
+      onDragTracks?.({ ids: [...selection.ids], row: first, sourceKind: spec.source.kind, position: { spec, index: firstIndex } });
     },
-    [selection.ids, onDragTracks, view],
+    [selection.ids, onDragTracks, spec, view],
   );
 
   // The ids travelling with the hand, and where they would land. Held here
@@ -1590,7 +1753,7 @@ export const TrackTable = memo(function TrackTable({
         item.index < index && item.index < view.count && view.rowAt(item.index)?.id === row.id);
       setDragSourceKey(copyAbove ? `${row.id}#${String(slot)}` : row.id);
       carrying.current = selection.ids.has(row.id) ? [...selection.ids] : [row.id];
-      startDragOut(row);
+      startDragOut(row, index);
       if (!nativeTrackDragging()) return false;
       nativeDrag.current = true;
       void dragTracksToDesktop(carrying.current)
@@ -1688,6 +1851,18 @@ export const TrackTable = memo(function TrackTable({
   }, [view.totals, onTotalsChange]);
   // A list that is no longer shown has nothing to tally.
   useEffect(() => () => onTotalsChange?.(undefined), [onTotalsChange]);
+
+  // rekordbox looks at the file of the one row selected again and redraws
+  // its [!] (`BrowseBasicView::changedSelectedRows` @0x100321688 calls
+  // `updateMissingStatus` only when one row is selected), so a file that
+  // went missing after the list was read shows once its row is picked
+  // (#682). A stick's rows are not collection tracks.
+  const onlySelected = selection.ids.size === 1 ? [...selection.ids][0] : undefined;
+  const { recheckMissing } = view;
+  useEffect(() => {
+    if (onlySelected === undefined || spec.source.kind === "device") return;
+    recheckMissing(onlySelected);
+  }, [onlySelected, recheckMissing, spec.source.kind]);
 
   const reportedRow = useRef<string | null>(null);
   useEffect(() => {
@@ -2037,7 +2212,12 @@ export const TrackTable = memo(function TrackTable({
             The resize grip. Its own mousedown stops the header's click, so
             dragging an edge never also re-sorts the table.
           */}
-          <span
+          {/*
+            rekordbox adds neither Artwork column as resizable: the upper
+            part's is 80 wide at most and at least, and the whole artwork's
+            follows the row height.
+          */}
+          {FIXED_WIDTH.includes(col.key) ? null : <span
             className={styles.grip}
             onMouseDown={(e) => {
               e.stopPropagation();
@@ -2048,7 +2228,7 @@ export const TrackTable = memo(function TrackTable({
             role="separator"
             aria-orientation="vertical"
             aria-label={`Resize ${col.label}`}
-          />
+          />}
         </div>
       )),
     [columns, spec.sort, onSortChange, sortIndicator, dragKey],
@@ -2058,6 +2238,7 @@ export const TrackTable = memo(function TrackTable({
     <div
       ref={rootRef}
       data-browser-pane="list"
+      data-artwork={artworkMode === "full" && fullArtworkWidth(rowH) === rowH ? "full" : undefined}
       data-browser-side={listScope}
       className={styles.browser}
       style={{
@@ -2067,6 +2248,8 @@ export const TrackTable = memo(function TrackTable({
         // tokens are the measured sizes, and these are the slider's multiples
         // of them.
         ...browseListVars(preferences.view, ROW_H),
+        ["--s-row-height" as string]: `${rowH}px`,
+        ["--s-preview-band-top" as string]: `${band.top}px`,
       }}
       data-file-over={fileOver || undefined}
       // Below the last row takes a reorder on entering too, as a row does
@@ -2184,6 +2367,25 @@ export const TrackTable = memo(function TrackTable({
             ) : null}
           </div>
         ) : null}
+        {onArtworkMode ? (
+          <div className={styles.artworkModes}>
+            {ARTWORK_MODES.map(({ mode, label, Icon }) => (
+              <button
+                key={mode}
+                type="button"
+                className={styles.filterToggle}
+                data-on={artworkMode === mode || undefined}
+                aria-pressed={artworkMode === mode}
+                aria-label={label}
+                title={tip(label)}
+                data-testid={`artwork-mode-${mode}`}
+                onClick={() => chooseArtworkMode(mode)}
+              >
+                <Icon className={styles.filterGlyph} />
+              </button>
+            ))}
+          </div>
+        ) : null}
         {onToggleFilter ? (
           <button
             type="button"
@@ -2255,6 +2457,7 @@ export const TrackTable = memo(function TrackTable({
                 onRate={onRate}
                 onComment={onComment}
                 onEditField={onEditField}
+                onEditColor={spec.source.kind === "collection" || spec.source.kind === "playlist" ? onEditColor : undefined}
                 onEditBlocked={onEditBlocked}
                 keyDisplay={keyDisplay}
                 keyChoices={keyChoices}
@@ -2266,6 +2469,7 @@ export const TrackTable = memo(function TrackTable({
                 trafficReach={preferences.view.trafficLight}
                 top={item.start - COL_HEADER_H}
                 selected={row ? selection.ids.has(row.id) : false}
+                played={row ? played.has(row.id) : false}
                 onSelect={handleSelect}
                 onOpen={handleOpen}
                 onMenu={openTrackMenu}
@@ -2277,6 +2481,7 @@ export const TrackTable = memo(function TrackTable({
                 onReorderOver={reorderOver}
                 onReorderDrop={reorderDrop}
                 startupCache={seed !== undefined}
+                previewHeight={band.height}
               />
             );
           })}
@@ -2397,6 +2602,7 @@ export const TrackTable = memo(function TrackTable({
           onAutoSize={onColumnAutoSize}
           onAutoSizeAll={onColumnAutoSizeAll}
           renumber={onRenumber && spec.sort !== "trackNo" ? { disabled: query !== "", onRenumber: renumber } : undefined}
+          artworkMode={artworkMode}
           onClose={() => setMenu(null)}
         />
       ) : null}

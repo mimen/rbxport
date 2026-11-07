@@ -29,14 +29,14 @@ const box = async (locator: Locator): Promise<Box> =>
 const bottom = (b: Box) => b.y + b.height;
 const right = (b: Box) => b.x + b.width;
 
-/** Both decks loaded: the first row on A, the second on B by the track menu. */
-async function twoPlayer(page: Page, query = "") {
+/** Both decks loaded: the selected rows on A and B via the track menu. */
+async function twoPlayer(page: Page, query = "", rows: readonly [number, number] = [0, 1]) {
   await page.goto(`/${query}`);
   await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
   await page.getByRole("button", { name: "Layout" }).click();
   await page.getByRole("menuitemradio", { name: "2 PLAYER" }).click();
-  await page.locator('[role="gridcell"][data-col="title"]').first().dblclick();
-  const cell = page.locator('[role="gridcell"][data-col="title"]').nth(1);
+  await page.locator('[role="gridcell"][data-col="title"]').nth(rows[0]).dblclick();
+  const cell = page.locator('[role="gridcell"][data-col="title"]').nth(rows[1]);
   await cell.click({ button: "right" });
   const menu = page.getByRole("menu", { name: "Track" });
   await menu.getByRole("menuitem", { name: "Load", exact: true }).hover();
@@ -46,6 +46,60 @@ async function twoPlayer(page: Page, query = "") {
   await expect(b.getByTestId("player-title")).not.toHaveText("");
   return { a, b };
 }
+
+/** Painted PWV7 rows in canvas coordinates, before any CSS deck flip. */
+async function paintedRows(canvas: Locator): Promise<{ first: number; last: number; height: number; cssHeight: number }> {
+  return canvas.evaluate((element: HTMLCanvasElement) => {
+    const context = element.getContext("2d");
+    const { width, height } = element;
+    if (!context || !width || !height) return { first: -1, last: -1, height, cssHeight: element.getBoundingClientRect().height };
+    const pixels = context.getImageData(0, 0, width, height).data;
+    let first = -1;
+    let last = -1;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if ((pixels[(y * width + x) * 4 + 3] ?? 0) === 0) continue;
+        if (first === -1) first = y;
+        last = y;
+        break;
+      }
+    }
+    return { first, last, height, cssHeight: element.getBoundingClientRect().height };
+  });
+}
+
+test("both loaded PWV7 waveforms keep painted bounds after deck B flips", async ({ page }) => {
+  const { a, b } = await twoPlayer(page, "", [3, 4]);
+  const top = await token(page, "--s-wave-inset-top");
+  const bottom = await token(page, "--s-wave-inset-bottom");
+  expect(top).toBe(20);
+  expect(bottom).toBe(16);
+
+  for (const [deck, flipped] of [[a, false], [b, true]] as const) {
+    const detail = deck.getByTestId("player-detail");
+    await expect(detail).not.toHaveAttribute("data-pcm", /.+/);
+    const canvas = detail.locator("canvas").first();
+    await expect.poll(async () => (await paintedRows(canvas)).first).toBeGreaterThanOrEqual(0);
+    const rows = await paintedRows(canvas);
+    const scale = rows.height / rows.cssHeight;
+    const rawTop = rows.first / scale;
+    const rawBottom = (rows.height - 1 - rows.last) / scale;
+    // Pixel rounding and the fixture's sub-full-scale peaks leave a few px
+    // beyond the requested top edge. The baseline reaches the bottom edge.
+    expect(rawTop).toBeGreaterThanOrEqual(top - 1);
+    expect(rawTop).toBeLessThan(33);
+    expect(rawBottom).toBeGreaterThanOrEqual(bottom - 1);
+    expect(rawBottom).toBeLessThanOrEqual(bottom + 1);
+    const transform = await canvas.evaluate((el) => getComputedStyle(el).transform);
+    expect(transform).toBe(flipped ? "matrix(1, 0, 0, -1, 0, 0)" : "none");
+    // CSS flips the bitmap, so deck B's visible top is the raw bottom and
+    // its visible bottom is the raw top.
+    const visibleTop = flipped ? rawBottom : rawTop;
+    const visibleBottom = flipped ? rawTop : rawBottom;
+    expect(visibleTop).toBeGreaterThanOrEqual((flipped ? bottom : top) - 1);
+    expect(visibleBottom).toBeGreaterThanOrEqual((flipped ? top : bottom) - 1);
+  }
+});
 
 test("deck A is laid out the way the capture measures it", async ({ page }) => {
   const { a } = await twoPlayer(page);
@@ -175,7 +229,8 @@ test("the control row loops the chosen number of beats, and the steps resize it"
 
   // AU: IN starts a two-beat loop from the head; the field and both ends light.
   await row.getByRole("button", { name: "Loop in" }).click();
-  const exit = row.getByRole("button", { name: "Exit loop" });
+  // The length field, by its place: lit it is "Exit loop", unlit "4 beat loop".
+  const exit = row.getByRole("group", { name: "Beat loop length" }).getByRole("button").nth(1);
   await expect(exit).toHaveAttribute("aria-pressed", "true");
   await expect(row.getByRole("button", { name: "Loop out" })).toBeEnabled();
 
@@ -221,7 +276,8 @@ test("a manual loop on the same beats as the last auto beat loop leaves the fiel
 
   // AU: four beats from the head, then OUT exits it.
   await row.getByRole("button", { name: "Loop in" }).click();
-  const exit = row.getByRole("button", { name: "Exit loop" });
+  // The length field, by its place: lit it is "Exit loop", unlit "4 beat loop".
+  const exit = row.getByRole("group", { name: "Beat loop length" }).getByRole("button").nth(1);
   await expect(exit).toHaveAttribute("aria-pressed", "true");
   await row.getByRole("button", { name: "Loop out" }).click();
   await expect(row.getByRole("button", { name: "4 beat loop" })).toHaveAttribute("aria-pressed", "false");
@@ -234,6 +290,59 @@ test("a manual loop on the same beats as the last auto beat loop leaves the fiel
   await row.getByRole("button", { name: "Loop out" }).click();
   await expect(a.getByTestId("player-overview").locator('[class*="loopBand"][data-active]')).toHaveCount(1);
   await expect(exit).toHaveAttribute("aria-pressed", "false");
+});
+
+test("beat jump moves an active loop and keeps the head within it", async ({ page }) => {
+  const { a } = await twoPlayer(page, "?writable=1");
+  const read = () => page.evaluate(() => (window as unknown as {
+    __deckSeconds: () => { a: number; aLoopIn: number; aLoopOut: number; loopingA: boolean };
+  }).__deckSeconds());
+  // Put the loop away from the track boundary, then start it while playing.
+  await page.getByRole("button", { name: "Beat jump forward" }).first().click();
+  await page.getByRole("button", { name: "Play", exact: true }).first().click();
+  await a.getByTestId("player-controls").getByRole("button", { name: "4 beat loop" }).click();
+  await expect.poll(async () => (await read()).loopingA).toBe(true);
+  const loopField = a.getByTestId("player-controls")
+    .getByRole("group", { name: "Beat loop length" }).getByRole("button").nth(1);
+  await expect(loopField).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("group", { name: "Deck A transport" })
+    .getByRole("button", { name: "Pause", exact: true }).click();
+  const before = await read();
+  await page.getByRole("button", { name: "Beat jump forward" }).first().click();
+  await expect.poll(async () => (await read()).aLoopIn).toBeGreaterThan(before.aLoopIn + 1);
+  const after = await read();
+  expect(after.loopingA).toBe(true);
+  await expect(loopField).toHaveAttribute("aria-pressed", "true");
+  expect(after.aLoopOut - after.aLoopIn).toBeCloseTo(before.aLoopOut - before.aLoopIn, 1);
+  expect(after.a).toBeGreaterThanOrEqual(after.aLoopIn);
+  expect(after.a).toBeLessThan(after.aLoopOut);
+  expect(after.a - after.aLoopIn).toBeCloseTo(before.a - before.aLoopIn, 1);
+  await page.getByRole("button", { name: "Beat jump forward" }).first().click();
+  await expect.poll(async () => (await read()).aLoopIn).toBeGreaterThan(after.aLoopIn + 1);
+  const twice = await read();
+  expect(twice.a - twice.aLoopIn).toBeCloseTo(before.a - before.aLoopIn, 1);
+  await page.getByRole("button", { name: "Beat jump back" }).first().click();
+  await expect.poll(async () => (await read()).aLoopIn).toBeLessThan(twice.aLoopIn - 1);
+  const back = await read();
+  expect(back.a - back.aLoopIn).toBeCloseTo(before.a - before.aLoopIn, 1);
+  await page.getByRole("button", { name: "Beat jump size" }).first().click();
+  await page.getByRole("menu", { name: "Beat jump size" })
+    .getByRole("menuitemradio", { name: "8Beats" }).click();
+  await page.getByRole("button", { name: "Beat jump forward" }).first().click();
+  await expect.poll(async () => (await read()).aLoopIn).toBeGreaterThan(back.aLoopIn + 3);
+  expect((await read()).loopingA).toBe(true);
+  await expect(loopField).toHaveAttribute("aria-pressed", "true");
+});
+
+test("beat jump without a loop moves the head and does not start a loop", async ({ page }) => {
+  await twoPlayer(page, "?writable=1");
+  const read = () => page.evaluate(() => (window as unknown as {
+    __deckSeconds: () => { a: number; loopingA: boolean };
+  }).__deckSeconds());
+  const before = await read();
+  await page.getByRole("button", { name: "Beat jump forward" }).first().click();
+  await expect.poll(async () => (await read()).a).toBeGreaterThan(before.a + 1);
+  expect((await read()).loopingA).toBe(false);
 });
 
 // rekordbox 7.2.11's AutoBeatLoopController labels, which ‹ and › step
@@ -319,6 +428,18 @@ test("deck B reads the other way up, and its detail meets deck A's at the centre
   expect(beatBoxA.y - detailA.y).toBeCloseTo(lineTop, 0);
   expect(bottom(detail) - bottom(beatBox)).toBeCloseTo(lineTop, 0);
   expect(beatBox.y - detail.y).toBeLessThan(beatBoxA.y - detailA.y);
+  // Both mirrored details use the restored waveform height. The head crosses
+  // its edge by two CSS pixels instead of forcing a 15px clear strip.
+  const waveTop = await token(page, "--s-wave-inset-top");
+  const beatTop = await token(page, "--s-beat-marker-top");
+  const headH = await token(page, "--s-beat-head-h");
+  expect(waveTop).toBe(20);
+  expect(beatTop).toBeLessThan(waveTop);
+  expect(beatTop + headH).toBeGreaterThan(waveTop);
+  const headA = await box(a.getByTestId("player-detail-head"));
+  const headB = await box(b.getByTestId("player-detail-head"));
+  expect(headA.height).toBeCloseTo(detailA.height, 0);
+  expect(headB.height).toBeCloseTo(detail.height, 0);
 });
 
 test("the shared column, strip and zoom are placed where the capture puts them", async ({ page }) => {
@@ -668,7 +789,9 @@ test("PLAY on a BPM SYNC deck with Q off starts on the master's beat", async ({ 
 });
 
 test("a new track on the master deck hands MASTER to the other deck", async ({ page }) => {
-  const { a, b, titles, bpms, first, toB } = await syncedPair(page);
+  const { a, b, titles, bpms, first, toB, play } = await syncedPair(page);
+  // A plays first, so A is the master [rekordbox 7.2.18 manual p.121].
+  await play.first().click();
   const bpmA = a.getByTestId("player-bpm");
   const bpmB = b.getByTestId("player-bpm");
   const master = Number(bpms[first]);
@@ -687,4 +810,81 @@ test("a new track on the master deck hands MASTER to the other deck", async ({ p
   await expect(a.getByRole("button", { name: "Sync master" })).toHaveAttribute("aria-pressed", "false");
   await expect.poll(async () => Number(await bpmA.innerText())).toBeCloseTo(Number(bpms[other]), 1);
   expect(Number(await bpmB.innerText())).toBeCloseTo(master, 1);
+});
+
+/** The zoom each deck was last given, in bars, as the session stores it. */
+const zoomOf = (page: Page) => page.evaluate(() => {
+  const raw = localStorage.getItem("rbl.session") ?? "{}";
+  return (JSON.parse(raw) as { waveformZoom?: { a?: number; b?: number } }).waveformZoom ?? {};
+});
+
+test("the wheel over either deck zooms both, and RST puts both back (#602)", async ({ page }) => {
+  // rekordbox 7.2.19: `PlayerWaveView::mouseWheelMove` @0x100c93584 hands a
+  // wheel step to `WaveViewArea::triggerZoomInOut` @0x100c936e0, which steps
+  // deck A and deck B, as + and − do; RST calls `PlayerWaveView::zoomReset`
+  // on both (`WaveViewArea::buttonClicked` @0x100c95708).
+  const { a, b } = await twoPlayer(page);
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 12, b: 12 });
+
+  await b.getByTestId("player-detail").hover();
+  await page.mouse.wheel(0, -120);
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 8, b: 8 });
+  // Out over deck A: however far the gesture goes, the two move together.
+  await a.getByTestId("player-detail").hover();
+  await page.mouse.wheel(0, 120);
+  await page.mouse.wheel(0, 120);
+  await expect.poll(async () => (await zoomOf(page)).a ?? 0).toBeGreaterThan(8);
+  const out = await zoomOf(page);
+  expect(out.b).toBe(out.a);
+  await page.getByRole("button", { name: "Reset zoom" }).click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 12, b: 12 });
+
+  // 1 PLAYER zooms deck A alone; back in 2 PLAYER the pair steps from where
+  // each deck is, and RST brings both to the default.
+  await page.getByRole("button", { name: "Layout" }).click();
+  await page.getByRole("menuitemradio", { name: "1 PLAYER" }).click();
+  await page.getByRole("button", { name: "Zoom in", exact: true }).click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 8, b: 12 });
+  await page.getByRole("button", { name: "Layout" }).click();
+  await page.getByRole("menuitemradio", { name: "2 PLAYER" }).click();
+  await page.getByRole("button", { name: "Zoom in", exact: true }).click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 4, b: 8 });
+  await page.getByRole("button", { name: "Reset zoom" }).click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 12, b: 12 });
+});
+
+test("an empty HOT CUE row beside either deck sets that hot cue (#602)", async ({ page }) => {
+  // The 2 PLAYER deck has no pads; the HOT CUE panel of the sub-information
+  // panel beside it is where rekordbox sets one with the mouse ("If it is
+  // empty, click it to save the Hot Cue point", rekordbox 7.2.18 manual p.73).
+  const { b } = await twoPlayer(page, "?writable=1");
+  const list = b.getByRole("complementary", { name: "Cue list" });
+  await list.getByRole("tab", { name: "HOT CUE" }).click();
+  const row = list.getByRole("button", { name: "Hot cue H", exact: true });
+  await expect(row).toHaveAttribute("data-empty", "");
+  await row.click();
+  await expect(row).not.toHaveAttribute("data-empty");
+  await expect(row).toContainText(/\d\d:\d\d/);
+});
+
+test("two-deck RST resets both zooms and never plays or pauses (#832)", async ({ page }) => {
+  const { a } = await twoPlayer(page);
+  const playing = () => page.getByRole("button", { name: "Pause", exact: true }).count();
+  const zoomIn = page.getByRole("button", { name: "Zoom in", exact: true });
+  const reset = page.getByRole("button", { name: "Reset zoom" });
+  const before = await playing();
+
+  await zoomIn.click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 8, b: 8 });
+  await reset.click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 12, b: 12 });
+  expect(await playing()).toBe(before);
+
+  await zoomIn.click();
+  await reset.focus();
+  await page.keyboard.press("Space");
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 12, b: 12 });
+  await page.keyboard.press("Enter");
+  expect(await playing()).toBe(before);
+  await expect(a.getByTestId("player-detail")).toBeVisible();
 });

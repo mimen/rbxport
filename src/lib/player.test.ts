@@ -19,6 +19,8 @@ import {
   JUMP_SIZE_ID,
   jumpSizeById,
   jumpStepSeconds,
+  movedLoopByBeats,
+  shiftByGridBeats,
   FINE_JUMP_SECONDS,
   jumpSeconds,
   nextJumpSize,
@@ -51,6 +53,9 @@ import {
   NO_BEATS,
   scrollOffset,
   snapOffset,
+  OVERVIEW_HEAD_DEVICE_PX,
+  overviewHeadWidth,
+  playheadWidth,
   pressCue,
   releaseCue,
   parseBeatGrid,
@@ -321,6 +326,16 @@ describe("parseBeatGrid", () => {
     expect(Array.from(grid.tempos)).toEqual([13_800, 13_800, 16_000]);
   });
 
+  it("uses already corrected DAT times from the backend without shifting them again", () => {
+    const correctedTimes: [number, number, number][] = [[250, 750, 1150], [375, 875, 1275], [150, 650, 1050]];
+    for (const times of correctedTimes) {
+      const grid = parseBeatGrid(encode([[times[0], 1, 12_000], [times[1], 2, 12_000], [times[2], 3, 15_000]]));
+      expect(Array.from(grid.times)).toEqual(times);
+      expect(Array.from(grid.numbers)).toEqual([1, 2, 3]);
+      expect(Array.from(grid.tempos)).toEqual([12_000, 12_000, 15_000]);
+    }
+  });
+
   it("holds a whole track without turning it into objects", () => {
     // A three-hour mix is about 23,000 beats — a list of objects here is what
     // the windowed fetch existed to avoid.
@@ -503,6 +518,21 @@ describe("scrollOffset", () => {
   });
 });
 
+describe("overviewHeadWidth", () => {
+  it("is two device pixels, as rekordbox draws the overview head (#570)", () => {
+    expect(OVERVIEW_HEAD_DEVICE_PX).toBe(2);
+    expect(overviewHeadWidth(1)).toBe(2);
+    expect(overviewHeadWidth(2)).toBe(1);
+    expect(overviewHeadWidth(1.5) * 1.5).toBeCloseTo(2, 9);
+  });
+
+  it("treats a missing or nonsense ratio as 1x", () => {
+    expect(overviewHeadWidth(Number.NaN)).toBe(2);
+    expect(overviewHeadWidth(0)).toBe(2);
+    expect(overviewHeadWidth(-2)).toBe(2);
+  });
+});
+
 describe("snapOffset", () => {
   it("puts the slide on whole device pixels (#346)", () => {
     // Measured during playback: -164.155, -164.929 ... CSS px at 2x.
@@ -527,6 +557,28 @@ describe("snapOffset", () => {
     expect(snapOffset(Number.NaN, 2)).toBe(0);
     expect(Object.is(snapOffset(-0.1, 2), 0)).toBe(true);
     expect(snapOffset(10.4, Number.NaN)).toBe(10);
+  });
+});
+
+describe("playheadWidth", () => {
+  it("is two whole device pixels at 150%, as rekordbox draws it (#393)", () => {
+    // rekordbox 7.2.14 at 150%: the detail playhead is two full device columns.
+    expect(playheadWidth(1.5) * 1.5).toBeCloseTo(2, 9);
+  });
+
+  it("keeps one CSS pixel at 1x and 2x, and is always whole device pixels", () => {
+    expect(playheadWidth(1)).toBe(1);
+    expect(playheadWidth(2)).toBe(1);
+    for (const ratio of [1, 1.25, 1.5, 1.75, 2, 2.5, 3]) {
+      const device = playheadWidth(ratio) * ratio;
+      expect(Math.abs(device - Math.round(device))).toBeLessThan(1e-9);
+      expect(device).toBeGreaterThanOrEqual(ratio - 1e-9);
+    }
+  });
+
+  it("falls back to one CSS pixel for a ratio the browser did not report", () => {
+    expect(playheadWidth(Number.NaN)).toBe(1);
+    expect(playheadWidth(0)).toBe(1);
   });
 });
 
@@ -591,6 +643,41 @@ describe("jumpStepSeconds", () => {
 
   it("cannot move a beat length with no tempo behind it", () => {
     expect(jumpStepSeconds(jumpSizeById("8beats"), 0)).toBe(0);
+  });
+});
+
+describe("moving a playing loop by grid beats", () => {
+  const constant: BeatGrid = {
+    times: Uint32Array.from({ length: 45 }, (_, i) => i * 500),
+    numbers: Uint8Array.from({ length: 45 }, (_, i) => i % 4 + 1),
+    tempos: Uint16Array.from({ length: 45 }, () => 12_000),
+  };
+
+  it.each([
+    [4, 12_000, 14_000, 12_750],
+    [-4, 8_000, 10_000, 8_750],
+    [8, 14_000, 16_000, 14_750],
+    [-8, 6_000, 8_000, 6_750],
+  ])("moves %i beats with the head's fractional beat intact", (beats, from, to, head) => {
+    expect(movedLoopByBeats(constant, 10_000, 12_000, 10_750, beats, 22_000))
+      .toEqual({ fromMs: from, toMs: to, headMs: head });
+  });
+
+  it("counts across a tempo change and repeated moves without time drift", () => {
+    const variable: BeatGrid = {
+      ...constant,
+      times: Uint32Array.from({ length: 45 }, (_, i) => i <= 24 ? i * 500 : 12_000 + (i - 24) * 400),
+    };
+    const first = movedLoopByBeats(variable, 10_000, 12_000, 10_750, 4, 20_000);
+    expect(first).toEqual({ fromMs: 12_000, toMs: 13_600, headMs: 12_600 });
+    const second = movedLoopByBeats(variable, first!.fromMs, first!.toMs, first!.headMs, -4, 20_000);
+    expect(second).toEqual({ fromMs: 10_000, toMs: 12_000, headMs: 10_750 });
+    expect(shiftByGridBeats(variable, 10_750, 8)).toBe(14_200);
+  });
+
+  it("keeps the old loop when the requested range would leave the track", () => {
+    expect(movedLoopByBeats(constant, 10_000, 12_000, 10_750, -24, 22_000)).toBeNull();
+    expect(movedLoopByBeats(constant, 10_000, 12_000, 10_750, 24, 22_000)).toBeNull();
   });
 });
 

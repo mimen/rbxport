@@ -513,6 +513,116 @@ test("Color sorts in rekordbox's palette order, not by name", async ({ page }) =
   expect((ballBox?.x ?? 0) - (cellBox?.x ?? 0)).toBe(5);
 });
 
+test("Color can be edited from a selected collection row and cancelled", async ({ page }) => {
+  await page.goto("/?writable");
+  await page.getByRole("treeitem", { name: /All Tracks/ }).click();
+  await expect(page.getByTestId("browser-title")).toContainText("All Tracks");
+  await expect(page.locator('[role="gridcell"][data-col="title"]').first()).toBeVisible();
+  await page.getByRole("columnheader", { name: "Track Title" }).click({ button: "right" });
+  const colorOption = page.getByRole("menu", { name: "Columns" })
+    .getByRole("menuitemcheckbox", { name: "Color", exact: true });
+  await expect(colorOption).toHaveAttribute("aria-checked", "false");
+  await colorOption.click();
+  await expect(colorOption).toHaveAttribute("aria-checked", "true");
+  await expect(page.getByRole("columnheader", { name: /^Color/ })).toBeVisible();
+
+  const cell = page.locator('[role="gridcell"][data-col="color"]').first();
+  const before = await cell.innerText();
+  await cell.click(); // select the track
+  await cell.click(); // open the list's Color modifier
+  const editor = cell.getByRole("combobox", { name: "Color" });
+  await expect(editor).toBeVisible();
+  await editor.press("Escape");
+  await expect(cell).toHaveText(before);
+
+  await cell.click();
+  await cell.getByRole("combobox", { name: "Color" }).selectOption("2");
+  await expect(page.getByRole("contentinfo")).toContainText("Color saved");
+  await expect(cell).toHaveText("Red");
+
+  await page.waitForFunction(() => "__menu" in window);
+  await page.evaluate(() => (window as unknown as { __menu: (id: string) => void }).__menu("info"));
+  const panel = page.getByRole("complementary", { name: "Information" });
+  await panel.getByRole("tab", { name: "Info" }).click();
+  await expect(panel.getByRole("combobox", { name: "Color" })).toHaveValue("2");
+
+  await page.getByRole("treeitem").filter({ hasText: "Melodic Vox" }).first().click();
+  await expect(page.getByTestId("browser-title")).toContainText("Melodic Vox");
+  await expect(page.locator('[role="gridcell"][data-col="title"]').first()).toBeVisible();
+  await page.getByRole("columnheader", { name: "Track Title" }).click({ button: "right" });
+  await expect(colorOption).toHaveAttribute("aria-checked", "false");
+  await colorOption.click();
+  await expect(colorOption).toHaveAttribute("aria-checked", "true");
+  await expect(page.getByRole("columnheader", { name: /^Color/ })).toBeVisible();
+  const playlistCell = page.locator('[role="gridcell"][data-col="color"]').first();
+  await expect(playlistCell).toBeVisible();
+  await playlistCell.click();
+  await playlistCell.click();
+  await playlistCell.getByRole("combobox", { name: "Color" }).selectOption("5");
+  await expect(playlistCell).toHaveText("Green");
+});
+
+test("Color follows the double-click editing preference", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("rbl.preferences", JSON.stringify({ advanced: { doubleClickToEdit: true, protectLibrary: false } })));
+  await page.goto("/?writable");
+  await page.getByRole("columnheader", { name: "Track Title" }).click({ button: "right" });
+  await page.getByRole("menu", { name: "Columns" })
+    .getByRole("menuitemcheckbox", { name: "Color", exact: true }).click();
+
+  const cell = page.locator('[role="gridcell"][data-col="color"]').first();
+  await cell.click(); // select
+  await cell.click(); // preference must prevent single-click editing
+  await expect(cell.getByRole("combobox", { name: "Color" })).toHaveCount(0);
+  await cell.dblclick();
+  await expect(cell.getByRole("combobox", { name: "Color" })).toBeVisible();
+  await expect(cell.getByRole("option", { name: "No Color" })).toHaveCount(1);
+});
+
+test("a refused Color write leaves the table and Information panel unchanged", async ({ page }) => {
+  await page.goto("/?writable&refuseColorWrite");
+  await page.getByRole("columnheader", { name: "Track Title" }).click({ button: "right" });
+  await page.getByRole("menu", { name: "Columns" })
+    .getByRole("menuitemcheckbox", { name: "Color", exact: true }).click();
+
+  const cell = page.locator('[role="gridcell"][data-col="color"]').first();
+  const before = await cell.innerText();
+  await cell.click();
+  await page.waitForFunction(() => "__menu" in window);
+  await page.evaluate(() => (window as unknown as { __menu: (id: string) => void }).__menu("info"));
+  const panel = page.getByRole("complementary", { name: "Information" });
+  await panel.getByRole("tab", { name: "Info" }).click();
+  const detail = panel.getByRole("combobox", { name: "Color" });
+  const detailBefore = await detail.inputValue();
+
+  await cell.click();
+  await cell.getByRole("combobox", { name: "Color" }).selectOption(detailBefore === "2" ? "3" : "2");
+  await expect(page.getByRole("contentinfo")).toContainText("That could not be saved.");
+  await expect(cell).toHaveText(before);
+  await expect(detail).toHaveValue(detailBefore);
+});
+
+test("editing a Color cell changes only that track after a multi-selection", async ({ page }) => {
+  await page.goto("/?writable");
+  await page.getByRole("columnheader", { name: "Track Title" }).click({ button: "right" });
+  await page.getByRole("menu", { name: "Columns" })
+    .getByRole("menuitemcheckbox", { name: "Color", exact: true }).click();
+
+  const rows = page.getByRole("row").filter({ has: page.getByRole("gridcell") });
+  const first = rows.first();
+  const second = rows.nth(1);
+  const firstColor = first.locator('[role="gridcell"][data-col="color"]');
+  const secondColor = second.locator('[role="gridcell"][data-col="color"]');
+  const secondBefore = await secondColor.innerText();
+  await firstColor.click();
+  await second.click({ modifiers: ["ControlOrMeta"] });
+  await expect(first).toHaveAttribute("aria-selected", "true");
+  await expect(second).toHaveAttribute("aria-selected", "true");
+  await firstColor.click();
+  await firstColor.getByRole("combobox", { name: "Color" }).selectOption("2");
+  await expect(firstColor).toHaveText("Red");
+  await expect(secondColor).toHaveText(secondBefore);
+});
+
 test("Track number sorts by the tag's number, apart from the # column", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("columnheader", { name: "Track Title" }).click({ button: "right" });
@@ -1532,6 +1642,12 @@ test("each kind of table remembers its own columns", async ({ page }) => {
   // Back to a playlist and the change is still there.
   await page.getByRole("treeitem").filter({ hasText: "Melodic Vox" }).first().click();
   await expect(page.getByRole("columnheader", { name: /^Genre/ })).toBeVisible();
+
+  // A playlist folder is a playlist-type list too and shares the same layout
+  // (TableHeader-PlaylistTracks), not the collection's (#596).
+  await page.getByRole("treeitem").filter({ hasText: "CURRENT" }).first().click();
+  await expect(page.getByTestId("browser-title")).toContainText("CURRENT (");
+  await expect(page.getByRole("columnheader", { name: /^Genre/ })).toBeVisible();
 });
 
 test("analysing a selection reports progress and can be stopped", async ({ page }) => {
@@ -1692,15 +1808,18 @@ test("the detail waveform draws a beat grid with heavier downbeats", async ({ pa
   expect(marks).toContain("rgb(255, 255, 255)|rgb(234, 51, 35)");
   expect(marks).toContain("rgb(76, 76, 76)|rgb(124, 124, 124)");
 
-  // And they do not span the band: a marker starts 15px above the waveform,
-  // head included, so its line starts the head's height and a point lower.
+  // The beat head starts below the cue badge and overlaps the waveform top;
+  // the former 15px extension rule would unnecessarily shrink the waveform.
   const band = await detail.boundingBox();
   const marker = await detail.locator("span").first().boundingBox();
   const token = (name: string) =>
     page.evaluate((n) => Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue(n)), name);
   expect((marker?.y ?? 0) - (band?.y ?? 0)).toBeCloseTo(
-    (await token("--s-wave-inset-top")) - 15 + (await token("--s-beat-head-h")) + 1, 0,
+    (await token("--s-beat-marker-top")) + (await token("--s-beat-head-h")) + 1, 0,
   );
+  expect(await token("--s-beat-marker-top")).toBeLessThan(await token("--s-wave-inset-top"));
+  expect((await token("--s-beat-marker-top")) + (await token("--s-beat-head-h")))
+    .toBeGreaterThan(await token("--s-wave-inset-top"));
   expect((band?.y ?? 0) + (band?.height ?? 0) - ((marker?.y ?? 0) + (marker?.height ?? 0)))
     .toBeGreaterThan(4);
 });
@@ -1953,6 +2072,50 @@ test("the playhead is moved by a transform, not by laying the strip out again", 
   await expect(fill).toHaveCSS("transform", "matrix(0, 0, 0, 1, 0, 0)");
 });
 
+test("the overview playhead runs the whole band two device pixels wide, as rekordbox's does (#570)", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  await page.locator('[role="gridcell"][data-col="title"]').nth(3).dblclick();
+
+  // Not just the waveform: from the band's top, through the position bar,
+  // to its bottom. rekordbox 7.2.14 draws it that way, and over an RGB
+  // waveform's red bars the part outside the music is what stays visible.
+  const head = page.getByTestId("player-head");
+  const ovw = await page.getByTestId("player-overview").boundingBox();
+  const band = await head.evaluate((el) => {
+    const r = el.parentElement!.getBoundingClientRect();
+    return { y: r.y, height: r.height };
+  });
+  const box = await head.boundingBox();
+  expect(box?.y).toBeCloseTo(band.y, 0);
+  expect(box?.height).toBeCloseTo(band.height, 0);
+  expect(box?.height ?? 0).toBeGreaterThan(ovw?.height ?? 0);
+  const scrub = await page.locator('[class*="scrubFill"]').boundingBox();
+  expect((box?.y ?? 0) + (box?.height ?? 0)).toBeGreaterThan((scrub?.y ?? 0) + (scrub?.height ?? 0));
+
+  // Two device pixels: rekordbox 7.2.19 draws two one-pixel lines side by side.
+  const ratio = await page.evaluate(() => globalThis.devicePixelRatio);
+  expect((box?.width ?? 0) * ratio).toBeCloseTo(2, 1);
+});
+
+test("the simple player's head keeps its own 1pt line, not the deck overview's two device pixels (#570)", async ({ page }) => {
+  // The simple player shares the deck's head ref, but its head is the 1pt
+  // line measured off the SIMPLE PLAYER capture; #570 only widens the deck's.
+  await page.goto("/");
+  await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  await page.locator('[role="gridcell"][data-col="title"]').nth(3).dblclick();
+  await expect(page.getByTestId("player-head")).toBeAttached();
+
+  await page.getByRole("button", { name: "Layout" }).click();
+  await page.getByRole("menuitemradio", { name: "SIMPLE PLAYER" }).click();
+  const head = page.getByTestId("simple-player-head");
+  await expect(head).toBeAttached();
+  // One CSS pixel at any ratio (Chromium runs at 1x, where the deck's head
+  // would be two), and no inline width written over the stylesheet's.
+  await expect(head).toHaveCSS("width", "1px");
+  expect(await head.evaluate((el) => el.style.width)).toBe("");
+});
+
 test("the detail playhead is pinned to the middle, whatever the track does", async ({ page }) => {
   // The window moves under the head rather than the head across the window,
   // which is what a CDJ shows and what makes the head mean "here".
@@ -1962,7 +2125,11 @@ test("the detail playhead is pinned to the middle, whatever the track does", asy
 
   const detail = await page.getByTestId("player-detail").boundingBox();
   const head = await page.getByTestId("player-detail-head").boundingBox();
-  expect((head?.x ?? 0) - (detail?.x ?? 0)).toBeCloseTo((detail?.width ?? 0) / 2, 0);
+  // Within half a device pixel of the middle: the head is put on whole device
+  // pixels so it draws solid rather than blended across two (#393).
+  const ratio = await page.evaluate(() => globalThis.devicePixelRatio);
+  expect(Math.abs((head?.x ?? 0) - (detail?.x ?? 0) - (detail?.width ?? 0) / 2)).toBeLessThanOrEqual(0.5 / ratio + 1e-6);
+  expect(((head?.x ?? 0) - (detail?.x ?? 0)) * ratio % 1).toBeCloseTo(0, 6);
 });
 
 test("dragging the detail waveform scrubs, and dragging the overview seeks", async ({ page }) => {
@@ -2425,12 +2592,13 @@ test("beat sync belongs to two decks, and pulls the follower to the master", asy
   const a = page.getByRole("region", { name: "Preview player" }).first();
   const b = page.getByRole("region", { name: "Preview player B" });
 
-  // Deck A is master to begin with, so its own BEAT SYNC has nothing to do.
-  await expect(a.getByRole("button", { name: "Sync master" })).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
-  await expect(a.getByRole("button", { name: "Beat sync" })).toBeDisabled();
+  // No deck is the master until one plays, as in rekordbox's EXPORT mode;
+  // then the first to play takes it. BEAT SYNC is enabled on both decks.
+  await expect(a.getByRole("button", { name: "Sync master" })).toHaveAttribute("aria-pressed", "false");
+  await expect(b.getByRole("button", { name: "Sync master" })).toHaveAttribute("aria-pressed", "false");
+  await page.getByRole("button", { name: "Play", exact: true }).first().click();
+  await expect(a.getByRole("button", { name: "Sync master" })).toHaveAttribute("aria-pressed", "true");
+  await expect(a.getByRole("button", { name: "Beat sync" })).toBeEnabled();
   await expect(b.getByRole("button", { name: "Beat sync" })).toBeEnabled();
 
   // Syncing B pulls it to A's tempo: 127 against its own 129.
@@ -2441,10 +2609,42 @@ test("beat sync belongs to two decks, and pulls the follower to the master", asy
   const leader = Number(await a.getByTestId("player-bpm").innerText());
   expect(Number(await bpmB.innerText())).toBeCloseTo(leader, 0);
 
-  // And master moves: whichever deck holds it, the other is the one that syncs.
+  // And master moves: B leads with its BEAT SYNC still lit, and A can sync to it.
   await b.getByRole("button", { name: "Sync master" }).click();
-  await expect(b.getByRole("button", { name: "Beat sync" })).toBeDisabled();
+  await expect(b.getByRole("button", { name: "Beat sync" })).toBeEnabled();
+  await expect(b.getByRole("button", { name: "Beat sync" })).toHaveAttribute("aria-pressed", "true");
   await expect(a.getByRole("button", { name: "Beat sync" })).toBeEnabled();
+});
+
+test("deck A's BEAT SYNC follows deck B when B played first (#615)", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  await page.getByRole("button", { name: "Layout" }).click();
+  await page.getByRole("menuitemradio", { name: "2 PLAYER" }).click();
+  await page.locator('[role="gridcell"][data-col="title"]').first().dblclick();
+  const cell = page.locator('[role="gridcell"][data-col="title"]').nth(1);
+  await cell.click({ button: "right" });
+  const menu = page.getByRole("menu", { name: "Track" });
+  await menu.getByRole("menuitem", { name: "Load", exact: true }).hover();
+  await menu.getByRole("menuitem", { name: "Load track to player 2" }).click();
+
+  const a = page.getByRole("region", { name: "Preview player" }).first();
+  const b = page.getByRole("region", { name: "Preview player B" });
+  await expect(b.getByTestId("player-title")).not.toHaveText("");
+
+  // B plays first, so B is the master and A is the one that syncs.
+  await page.getByRole("button", { name: "Play", exact: true }).nth(1).click();
+  await expect(b.getByRole("button", { name: "Sync master" })).toHaveAttribute("aria-pressed", "true");
+  await expect(a.getByRole("button", { name: "Sync master" })).toHaveAttribute("aria-pressed", "false");
+
+  const syncA = a.getByRole("button", { name: "Beat sync" });
+  await expect(syncA).toBeEnabled();
+  const bpmA = a.getByTestId("player-bpm");
+  const before = Number(await bpmA.innerText());
+  await syncA.click();
+  await expect(syncA).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(async () => Number(await bpmA.innerText())).not.toBe(before);
+  expect(Number(await bpmA.innerText())).toBeCloseTo(Number(await b.getByTestId("player-bpm").innerText()), 0);
 });
 
 test("BEAT SYNC stays lit and follows the master's tempo until RST or MASTER ends it", async ({
@@ -2479,6 +2679,9 @@ test("BEAT SYNC stays lit and follows the master's tempo until RST or MASTER end
   const resetA = a.getByRole("button", { name: "Reset tempo" });
   const resetB = b.getByRole("button", { name: "Reset tempo" });
   await resetA.click();
+  // A plays first, so A is the master.
+  await page.getByRole("button", { name: "Play", exact: true }).first().click();
+  await expect(a.getByRole("button", { name: "Sync master" })).toHaveAttribute("aria-pressed", "true");
 
   // Lit once pressed, and the follower's own tempo steps are not its to take.
   await sync.click();
@@ -2507,12 +2710,12 @@ test("BEAT SYNC stays lit and follows the master's tempo until RST or MASTER end
   await expect(bpmB).toHaveText(bpmBAtRest);
   await expect(sliderB).toHaveAttribute("aria-disabled", "true");
 
-  // Synced again, then made master: a master follows nobody, so its light goes out.
+  // Synced again, then made master: the light stays, as rekordbox draws it.
   await sync.click();
   await expect(sync).toHaveAttribute("aria-pressed", "true");
   await b.getByRole("button", { name: "Sync master" }).click();
-  await expect(sync).toBeDisabled();
-  await expect(sync).toHaveAttribute("aria-pressed", "false");
+  await expect(sync).toBeEnabled();
+  await expect(sync).toHaveAttribute("aria-pressed", "true");
 
   // MT is the engine's key lock, held per deck.
   const mt = a.getByRole("button", { name: "Master tempo" });
@@ -3021,4 +3224,37 @@ test("errors go to the status bar in red, not over the deck", async ({ page }) =
     return resolved;
   }, red);
   expect(colour).toBe(expected);
+});
+
+test("single-deck RST resets the zoom and never plays or pauses (#832)", async ({ page }) => {
+  // rekordbox 7.2.18 manual p.75: RST is "Reset the zoom ratio".
+  await page.locator('[role="gridcell"][data-col="title"]').nth(3).dblclick();
+  const detail = page.getByTestId("player-detail");
+  const beats = () => detail.locator("span").count();
+  await expect.poll(beats).toBeGreaterThan(10);
+  const normal = await beats();
+
+  const reset = page.getByRole("button", { name: "Reset zoom" });
+  await page.getByRole("button", { name: "Zoom in", exact: true }).click();
+  await expect.poll(beats).not.toBe(normal);
+
+  // Stopped: RST resets and the deck stays stopped.
+  await reset.click();
+  await expect.poll(beats).toBe(normal);
+  await expect(page.getByRole("button", { name: "Play", exact: true })).toBeVisible();
+
+  // Playing: a click and Space/Enter on the focused RST leave it playing.
+  await page.getByRole("button", { name: "Play", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Zoom in", exact: true }).click();
+  await reset.click();
+  await expect.poll(beats).toBe(normal);
+  await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Zoom in", exact: true }).click();
+  await reset.focus();
+  await page.keyboard.press("Space");
+  await expect.poll(beats).toBe(normal);
+  await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
 });

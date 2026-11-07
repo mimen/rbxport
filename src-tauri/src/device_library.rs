@@ -6,6 +6,8 @@
 //! [`rbl_export::device_library`], which changes one of the stick's two
 //! libraries at a time and publishes the file through the export journal.
 
+use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,9 +17,14 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::commands::{blocking, MAX_ROWS};
-use crate::dto::{RowDto, ViewHandleDto, ViewSpecDto};
+use crate::dto::{cue_colour_css, RowCueDto, RowDto, ViewHandleDto, ViewSpecDto};
 use crate::error::{AppError, AppResult, ErrorKind};
 use crate::state::{sort_from_wire, AppState};
+
+// The USB browser is opened on a blocking thread. Keep companion reads bounded
+// even when a stick has corrupt file lengths or a very large playlist.
+const MAX_BROWSER_EXT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_BROWSER_EXT_VIEW_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One library on a stick, for the tree.
 #[derive(Debug, Clone, Serialize)]
@@ -218,15 +225,34 @@ fn id_from(text: &str) -> AppResult<u32> {
 pub async fn device_libraries(path: String) -> AppResult<Vec<DeviceLibraryDto>> {
     blocking("device_libraries", move || {
         let mount = connected(&path)?;
-        device::formats(&mount)
-            .into_iter()
-            .map(|format| {
-                let library = device::read(&mount, format).map_err(|e| device_error(&e))?;
-                Ok(library_dto(&library))
-            })
-            .collect()
+        Ok(readable_libraries(&mount))
     })
     .await
+}
+
+/// Each library on the stick that can be read, Device Library first.
+///
+/// The two are separate databases and rekordbox lists each under the stick
+/// on its own, so one that cannot be read (a damaged or half-written
+/// `exportLibrary.db`, say) leaves the other in the tree rather than taking
+/// the whole stick's tree with it (#631). Why it could not be read goes to
+/// the log: the interface shows the stick with nothing under it, as it
+/// shows a folder it may not open, and says nothing more.
+fn readable_libraries(mount: &Path) -> Vec<DeviceLibraryDto> {
+    if let Err(error) = rbl_export::export_root_name(mount) {
+        tracing::warn!(device = %mount.display(), %error, "the device's libraries cannot be listed");
+        return Vec::new();
+    }
+    device::formats(mount)
+        .into_iter()
+        .filter_map(|format| match device::read(mount, format) {
+            Ok(library) => Some(library_dto(&library)),
+            Err(error) => {
+                tracing::warn!(device = %mount.display(), library = format_name(format), %error, "a library on the device cannot be read; it is left out of the tree");
+                None
+            }
+        })
+        .collect()
 }
 
 fn library_dto(library: &device::Library) -> DeviceLibraryDto {
@@ -258,6 +284,110 @@ pub async fn device_playlist_edit(path: String, format: String, edit: DeviceEdit
     blocking("device_playlist_edit", move || apply_edit(&path, &format, edit, rbl_db::is_rekordbox_app_running())).await
 }
 
+/// Analyse loose audio already on this stick and add it to its playlist.
+/// The exporter publishes the track, analysis and membership together.
+#[tauri::command]
+pub async fn device_playlist_add_files(
+    path: String,
+    format: String,
+    playlist: String,
+    tracks: Vec<String>,
+) -> AppResult<DeviceEditResultDto> {
+    blocking("device_playlist_add_files", move || {
+        if let Some(refused) = edit_refusal(rbl_db::is_rekordbox_app_running()) {
+            return Err(refused);
+        }
+        let mount = connected(&path)?;
+        let volume = rbl_core::durable::VolumeIdentity::capture(&mount)
+            .map_err(|error| AppError::new(ErrorKind::NotFound, error.to_string()))?;
+        let format = format_from(&format)?;
+        let playlist_id = id_from(&playlist)?;
+        let before = device::read(&mount, format).map_err(|error| device_error(&error))?;
+        let before_count = before
+            .node(playlist_id)
+            .filter(|node| !node.folder)
+            .ok_or_else(|| {
+                AppError::new(
+                    ErrorKind::NotFound,
+                    "That playlist is no longer on the device.",
+                )
+            })?
+            .tracks
+            .len();
+        let mut sources = Vec::with_capacity(tracks.len());
+        for row in &tracks {
+            let source = rbl_index::folder::loose_path(row)
+                .filter(|source| plainly_under(&mount, source))
+                .ok_or_else(|| {
+                    AppError::new(
+                        ErrorKind::Malformed,
+                        "Only audio files on this device can go into its playlist.",
+                    )
+                })?;
+            if !source.is_file() {
+                return Err(AppError::new(
+                    ErrorKind::NotFound,
+                    "A file on this device is no longer there.",
+                ));
+            }
+            let indexed = before
+                .tracks
+                .iter()
+                .any(|track| audio_path(&mount, &track.path) == source);
+            sources.push(if indexed {
+                rbl_export::SourceTrack {
+                    source_path: source.to_path_buf(),
+                    ..rbl_export::SourceTrack::default()
+                }
+            } else {
+                crate::analysis::usb_source(source)?
+            });
+        }
+        volume.check(&mount).map_err(|error| AppError::new(ErrorKind::NotFound, error.to_string()))?;
+        rbl_export::add_in_place_to_playlist(&mount, format, playlist_id, &sources)
+            .map_err(|error| device_error(&error))?;
+        let after = device::read(&mount, format).map_err(|error| device_error(&error))?;
+        let after_count = after.node(playlist_id).map_or(0, |node| node.tracks.len());
+        Ok(DeviceEditResultDto {
+            id: playlist,
+            changed: u32::try_from(after_count.saturating_sub(before_count)).unwrap_or(u32::MAX),
+        })
+    })
+    .await
+}
+
+/// Maps collection ids to their rows in one device library. Missing rows are
+/// `None`; callers can export those tracks before asking for the mapping again.
+#[tauri::command]
+pub async fn device_playlist_collection_tracks(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    format: String,
+    tracks: Vec<String>,
+) -> AppResult<Vec<Option<String>>> {
+    let state = Arc::clone(&state);
+    blocking("device_playlist_collection_tracks", move || {
+        let mount = connected(&path)?;
+        let format = format_from(&format)?;
+        let library = device::read(&mount, format).map_err(|e| device_error(&e))?;
+        let db_id = state
+            .read_db(|db| rbl_db::export_info::db_id(db.connection()))
+            .map_err(crate::commands::write_error)?;
+        Ok(collection_track_rows(&mount, &library, db_id, &tracks))
+    })
+    .await
+}
+
+fn collection_track_rows(mount: &Path, library: &device::Library, db_id: u64, tracks: &[String]) -> Vec<Option<String>> {
+    let mut rows = std::collections::HashMap::new();
+    for track in &library.tracks {
+        if track.master_db_id == db_id && track.master_content_id != 0 {
+            rows.entry(track.master_content_id).or_insert_with(|| rbl_index::folder::loose_id(&audio_path(mount, &track.path)));
+        }
+    }
+    tracks.iter().map(|id| id.parse::<u64>().ok().and_then(|id| rows.get(&id).cloned())).collect()
+}
+
 /// The rows of `tracks` whose track `playlist` already holds, each once, so
 /// the interface can ask rekordbox's Add or Skip question before adding.
 /// Only reads the stick.
@@ -270,8 +400,12 @@ fn duplicates_of(path: &str, format: &str, playlist: &str, rows: &[String]) -> A
     let mount = connected(path)?;
     let format = format_from(format)?;
     let library = device::read(&mount, format).map_err(|e| device_error(&e))?;
+    let playlist_id = id_from(playlist)?;
+    if library.node(playlist_id).is_none_or(|node| node.folder) {
+        return Err(AppError::new(ErrorKind::NotFound, "That playlist is no longer on the device."));
+    }
     let ids = track_ids_in(&library, &mount, rows)?;
-    let held: std::collections::BTreeSet<u32> = library.held(id_from(playlist)?, &ids).into_iter().collect();
+    let held: std::collections::BTreeSet<u32> = library.held(playlist_id, &ids).into_iter().collect();
     let mut named = std::collections::BTreeSet::new();
     Ok(rows.iter().zip(&ids).filter(|(_, id)| held.contains(id) && named.insert(**id)).map(|(row, _)| row.clone()).collect())
 }
@@ -341,6 +475,10 @@ pub struct DeviceImportResultDto {
     pub missing: u32,
     /// Files copied to the computer and added to the collection.
     pub copied: u32,
+    /// Of those, the tracks given the device's analysis (BPM, key, the
+    /// analysis files and cues) and the ones it could not be given to.
+    pub analysed: u32,
+    pub analysis_failed: u32,
     /// Nothing was imported because a track was missing and the choice was
     /// to cancel.
     pub cancelled: bool,
@@ -376,11 +514,12 @@ pub async fn device_playlist_import_plan(
     path: String,
     format: String,
     id: String,
+    destination: Option<String>,
 ) -> AppResult<DeviceImportPlanDto> {
     let reading = Arc::clone(&state);
     blocking("device_playlist_import_plan", move || {
         let plan = read_plan(&reading, &path, &format, &id)?;
-        let destination = music_destination()?;
+        let destination = copy_destination(destination.as_deref())?;
         let copies = plan.copies();
         Ok(DeviceImportPlanDto {
             name: plan.name.clone(),
@@ -406,6 +545,16 @@ pub async fn device_playlist_import_plan(
 /// [static, rekordbox 7.2.19: `importFromDeviceManager::start` @0x1001dc470,
 /// `import_from_d_ask_file_copy` @0x1001dc94c, `importFromDeviceThread::
 /// import_from_d_file_copy` @0x1001daa68]; on Cancel it imports nothing.
+/// Its Change… picks another folder for the copies
+/// (`importFromDeviceCopySettingWindow::buttonClicked` @0x1001d802c,
+/// `FileChooser::browseForDirectory`): `destination`, when given.
+///
+/// Each track copied is given what the stick knows of it: its BPM and key,
+/// the stick's analysis files (waveforms, beat grid, cues) and its cues,
+/// as rekordbox's import thread does for each track it copies [static,
+/// rekordbox 7.2.19 `importFromDeviceThread::run` @0x1001d9618] (see
+/// [`carry_stick_analysis`]). Tracks the collection already had are left
+/// as they are, as rekordbox leaves them.
 ///
 /// The stick is only read. The copies are made first, each checked against
 /// the stick's file and never over an existing file (see
@@ -420,6 +569,7 @@ pub async fn device_playlist_import<R: tauri::Runtime>(
     format: String,
     id: String,
     missing: MissingTracks,
+    destination: Option<String>,
 ) -> AppResult<DeviceImportResultDto> {
     let reading = Arc::clone(&state);
     let plan = blocking("device_playlist_import", move || read_plan(&reading, &path, &format, &id)).await?;
@@ -430,30 +580,32 @@ pub async fn device_playlist_import<R: tauri::Runtime>(
         tracks: 0,
         missing: count(plan.missing()),
         copied: 0,
+        analysed: 0,
+        analysis_failed: 0,
         cancelled,
     };
     let to_copy = plan.copies();
-    let (entries, copies) = match missing {
-        _ if to_copy.is_empty() => (plan.matched_entries(), None),
+    let (entries, copies, carried) = match missing {
+        _ if to_copy.is_empty() => (plan.matched_entries(), None, Vec::new()),
         MissingTracks::Cancel => return Ok(none(true)),
         MissingTracks::Matched => {
             let entries = plan.matched_entries();
             if entries.is_empty() {
                 return Ok(none(false));
             }
-            (entries, None)
+            (entries, None, Vec::new())
         }
         MissingTracks::Copy => {
             let location = state.location()?;
             if location.is_real_install && rbl_db::is_rekordbox_running() {
                 return Err(AppError::new(ErrorKind::ReadOnly, "rekordbox is running. Quit it before making changes."));
             }
-            let (entries, copies) = blocking("device_playlist_import_copy", {
+            let (entries, copies, carried) = blocking("device_playlist_import_copy", {
                 let plan = plan.clone();
-                move || copy_missing(&plan, &to_copy, &music_destination()?)
+                move || copy_missing(&plan, &to_copy, &copy_destination(destination.as_deref())?)
             })
             .await?;
-            (entries, Some(copies))
+            (entries, Some(copies), carried)
         }
     };
 
@@ -483,11 +635,19 @@ pub async fn device_playlist_import<R: tauri::Runtime>(
             return Err(error);
         }
     };
+    let (mut analysed, mut analysis_failed) = (0_usize, 0_usize);
     if !made.added.is_empty() {
+        let added = made.added.clone();
+        let mount = plan.mount.clone();
+        let writing = Arc::clone(&state);
+        (analysed, analysis_failed) = blocking("device_playlist_import_analysis", move || {
+            Ok(carry_all(&writing, &mount, &added, &carried))
+        })
+        .await?;
         // New tracks: the collection changed as well as the tree.
         crate::commands::reload(app, Arc::clone(&state)).await?;
     }
-    tracing::info!(tracks = made.tracks, missing = plan.missing(), copied = made.added.len(), "imported a device playlist");
+    tracing::info!(tracks = made.tracks, missing = plan.missing(), copied = made.added.len(), analysed, analysis_failed, "imported a device playlist");
     Ok(DeviceImportResultDto {
         id: Some(made.id),
         renamed: made.name != plan.name,
@@ -495,6 +655,8 @@ pub async fn device_playlist_import<R: tauri::Runtime>(
         tracks: count(made.tracks),
         missing: count(plan.missing()),
         copied: count(made.added.len()),
+        analysed: count(analysed),
+        analysis_failed: count(analysis_failed),
         cancelled: false,
     })
 }
@@ -510,6 +672,24 @@ fn music_destination() -> AppResult<PathBuf> {
         .ok_or_else(|| AppError::new(ErrorKind::NotFound, "Your Music folder could not be found."))
 }
 
+/// Where the copies go: the folder picked with Change…, or
+/// `<Music>/PioneerDJ/Imported from Device`. rekordbox only takes a folder
+/// that exists (`buttonClicked` @0x1001d8194 checks `File::exists` on the
+/// chooser's result), so a picked folder must be a folder already there.
+fn copy_destination(chosen: Option<&str>) -> AppResult<PathBuf> {
+    match chosen.map(str::trim).filter(|c| !c.is_empty()) {
+        None => music_destination(),
+        Some(chosen) => {
+            let path = PathBuf::from(chosen);
+            if path.is_absolute() && path.is_dir() {
+                Ok(path)
+            } else {
+                Err(AppError::new(ErrorKind::NotFound, "That folder could not be found.").with_detail(chosen.to_owned()))
+            }
+        }
+    }
+}
+
 /// Reads the stick and plans the import against the collection.
 fn read_plan(state: &AppState, path: &str, format: &str, id: &str) -> AppResult<ImportPlan> {
     let mount = connected(path)?;
@@ -523,12 +703,13 @@ fn read_plan(state: &AppState, path: &str, format: &str, id: &str) -> AppResult<
 
 /// Copies every file in `to_copy` under `destination` (`<Music>/PioneerDJ/
 /// Imported from Device`), and gives the plan's entries with each missing track replaced by
-/// its copy. On any failure the copies made so far are removed.
+/// its copy, and each copy with the stick file it came from. On any failure
+/// the copies made so far are removed.
 fn copy_missing(
     plan: &ImportPlan,
     to_copy: &[MissingFile],
     destination: &Path,
-) -> AppResult<(Vec<rbl_db::write::DeviceEntry>, rbl_export::device_import::Copies)> {
+) -> AppResult<CopiedEntries> {
     let bytes: u64 = to_copy.iter().map(|c| c.bytes).sum();
     if rbl_export::device_import::free_space(destination).is_ok_and(|free| free < bytes) {
         return Err(AppError::new(ErrorKind::ReadOnly, "There is not enough free space to copy the music files."));
@@ -576,8 +757,110 @@ fn copy_missing(
             PlanEntry::Missing(file) => copy_of.get(&file.source).cloned().map(rbl_db::write::DeviceEntry::File),
         })
         .collect();
-    Ok((entries, copies))
+    let carried = to_copy.iter().filter_map(|file| copy_of.get(&file.source).map(|copy| (copy.clone(), file.clone()))).collect();
+    Ok((entries, copies, carried))
 }
+
+/// [`carry_stick_analysis`] for every track an import added from a copy,
+/// `added` as the writer gives it and `carried` as [`copy_missing`] does.
+/// Says how many were given the stick's analysis and how many could not be;
+/// one that fails is left as the bare file the import added.
+fn carry_all(state: &AppState, mount: &Path, added: &[(String, PathBuf)], carried: &[(PathBuf, MissingFile)]) -> (usize, usize) {
+    let mut counts = (0, 0);
+    for (content, file) in added {
+        let Some((_, stick)) = carried.iter().find(|(copy, _)| copy == file) else { continue };
+        match carry_stick_analysis(state, mount, content, file, stick) {
+            Ok(()) => counts.0 += 1,
+            Err(error) => {
+                counts.1 += 1;
+                tracing::warn!(track = %content, error = %error, "could not give an imported device track its analysis");
+            }
+        }
+    }
+    counts
+}
+
+/// Gives `content`, a track Import Playlist just added from `copy` (a copy
+/// of `stick`'s file), what the stick knows of it, as rekordbox does for
+/// each track it copies [static, rekordbox 7.2.19 macOS arm64,
+/// `importFromDeviceThread::run` @0x1001d9618]: `addTrackFromDevice` adds
+/// the track from the device's row (its BPM and key), and
+/// `import_device_analysis` @0x1001db460 copies the stick's `.DAT`, `.EXT`
+/// and `.2EX` into the share tree and gives them the new file's path
+/// (`CAnalyzerIF::initPathAndDeviceCue`), with the device's cues
+/// (`getDeviceContentCueInfo`).
+///
+/// The files go where rekordbox keeps a track's analysis (the UUID-derived
+/// path, see [`rbl_db::write::analysis_data_path`]), each `PPTH` the share
+/// tree's `?/<file name>` ([`rbl_anlz::share_tree_ppth`]), every other
+/// section byte for byte as on the stick. They and the row are one
+/// journalled edit ([`crate::file_journal`]), so a failure or a crash
+/// leaves neither. The cues use the `.EXT`'s extended list when present,
+/// retaining colours and comments. DAT-only exports use the legacy list
+/// [ASSUME: the stick's analysis cues are the ones its database lists; an
+/// export writes both from the same cues].
+/// The stick is only read, and only below its mount point.
+fn carry_stick_analysis(state: &AppState, mount: &Path, content: &str, copy: &Path, stick: &MissingFile) -> AppResult<()> {
+    let ppth = rbl_anlz::share_tree_ppth(&copy.to_string_lossy());
+    let read = |relative: &Path| -> AppResult<Option<rbl_anlz::Anlz>> {
+        let at = audio_path(mount, &relative.to_string_lossy());
+        let at = if at.exists() { at } else { device::StickFiles::new(mount).locate(&relative.to_string_lossy()) };
+        if !at.is_file() || !plainly_under(mount, &at) {
+            return Ok(None);
+        }
+        rbl_anlz::Anlz::read(&at)
+            .map(Some)
+            .map_err(|e| AppError::new(ErrorKind::Malformed, "The device's analysis could not be read.").with_detail(format!("{}: {e}", at.display())))
+    };
+    let dat_relative = Path::new(&stick.analysis);
+    let dat = if stick.analysis.trim().is_empty() { None } else { read(dat_relative)? };
+
+    let _gate = state.edit_gate.lock();
+    let _files = state.analysis_write.lock();
+    let location = state.location()?;
+    crate::file_journal::recover(state.backup_dir(), &location)?;
+    let key = Some(stick.key.as_str()).filter(|k| !k.is_empty());
+    let Some(dat) = dat else {
+        // Nothing analysed on the stick: the row's BPM and key only.
+        let analysis = rbl_db::write::DeviceAnalysis { bpm_x100: stick.bpm_x100, key, analysis_data_path: None, cues: &[] };
+        state.write(|w| w.import_device_analysis(content, &analysis)).map_err(crate::commands::write_error)?;
+        return Ok(());
+    };
+    let ext = read(&dat_relative.with_extension("EXT"))?;
+    let two_ex = read(&dat_relative.with_extension("2EX"))?;
+    let cues = ext.as_ref().map_or_else(|| dat.legacy_cue_entries(), rbl_anlz::Anlz::cue_entries);
+
+    let relative = state.write(|w| w.analysis_data_path_for(content)).map_err(crate::commands::write_error)?;
+    let target = rbl_anlz::resolve(&location.share_root, &relative);
+    let mut files = vec![(target.clone(), dat.with_path(&ppth))];
+    for (extension, anlz) in [("EXT", &ext), ("2EX", &two_ex)] {
+        if let Some(anlz) = anlz {
+            files.push((rbl_anlz::sibling(&target, extension), anlz.with_path(&ppth)));
+        }
+    }
+    let bpm_after = if stick.bpm_x100 > 0 {
+        stick.bpm_x100
+    } else {
+        state
+            .read_db(|db| Ok(db.connection().query_row("SELECT COALESCE(BPM,0) FROM djmdContent WHERE ID=?1", [content], |r| r.get::<_, u32>(0))?))
+            .map_err(crate::commands::write_error)?
+    };
+    let journal = crate::file_journal::FileJournal::prepare(state.backup_dir(), &location, content, bpm_after, Some(relative.clone()), true, &files)?;
+    if let Err(e) = journal.publish() {
+        journal.rollback()?;
+        return Err(e);
+    }
+    let analysis = rbl_db::write::DeviceAnalysis { bpm_x100: stick.bpm_x100, key, analysis_data_path: Some(&relative), cues: &cues };
+    if let Err(e) = state.write(|w| w.import_device_analysis(content, &analysis)) {
+        journal.reconcile(&location)?;
+        return Err(crate::commands::write_error(e));
+    }
+    journal.commit()
+}
+
+/// What [`copy_missing`] gives: the entries to write, the copies it made,
+/// and each copy with the stick file it came from.
+type CopiedEntries = (Vec<rbl_db::write::DeviceEntry>, rbl_export::device_import::Copies, Vec<(PathBuf, MissingFile)>);
 
 /// One library of a stick, with what tells its tracks apart from the
 /// collection's.
@@ -595,8 +878,12 @@ impl StickTracks {
         let library = device::read(mount, format).map_err(|e| device_error(&e))?;
         let mut masters_by_path = std::collections::HashMap::new();
         if format == Format::DeviceLibrary && device::formats(mount).contains(&Format::OneLibrary) {
-            let one = device::read(mount, Format::OneLibrary).map_err(|e| device_error(&e))?;
-            masters_by_path = one.tracks.iter().map(|t| (t.path.clone(), (t.master_db_id, t.master_content_id))).collect();
+            // Only a help for older rows: a OneLibrary that cannot be read
+            // leaves the Device Library's own rows to say what they can (#631).
+            match device::read(mount, Format::OneLibrary) {
+                Ok(one) => masters_by_path = one.tracks.iter().map(|t| (t.path.clone(), (t.master_db_id, t.master_content_id))).collect(),
+                Err(error) => tracing::warn!(device = %mount.display(), %error, "the device's OneLibrary cannot be read; Device Library tracks are matched by their own rows"),
+            }
         }
         Ok(Self { mount: mount.to_path_buf(), library, masters_by_path })
     }
@@ -612,6 +899,12 @@ struct MissingFile {
     artist: String,
     album: String,
     bytes: u64,
+    /// What the stick knows of the track, for the collection track the copy
+    /// becomes: its BPM x100, its key by name, and its analysis `.DAT`,
+    /// volume-relative (empty for none).
+    bpm_x100: u32,
+    key: String,
+    analysis: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -725,7 +1018,16 @@ fn plan_import(db: &rbl_db::Library, stick: &StickTracks, node: &device::Node) -
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        entries.push(PlanEntry::Missing(MissingFile { source, name, artist: track.artist.clone(), album: track.album.clone(), bytes }));
+        entries.push(PlanEntry::Missing(MissingFile {
+            source,
+            name,
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            bytes,
+            bpm_x100: track.bpm_x100,
+            key: track.key.clone(),
+            analysis: track.analysis_path.clone(),
+        }));
     }
     Ok(ImportPlan { mount: stick.mount.clone(), name: node.name.clone(), entries })
 }
@@ -781,13 +1083,20 @@ pub async fn open_view(state: &State<'_, Arc<AppState>>, path: String, format: S
         } else {
             library.node(playlist).map(|n| n.tracks.clone()).unwrap_or_default()
         };
+        let one_cues = if format == Format::OneLibrary { one_library_cues(&mount) } else { HashMap::new() };
         let rows: Vec<DeviceRow> = ids
             .iter()
             .enumerate()
             .filter_map(|(at, id)| library.track(*id).map(|t| device_row(&mount, t, at)))
             .collect();
         handle.remember_device_assets(&mount, library.tracks.iter().map(|t| assets_of(&mount, t)));
-        let view = DeviceView::open(rows, &parsed, field);
+        let mut view = DeviceView::open(rows, &parsed, field);
+        let mut remaining = MAX_BROWSER_EXT_VIEW_BYTES;
+        for row in &mut view.rows {
+            if let Some(track) = library.track(row.id) {
+                row.cues = device_cues(&mount, track, format, &one_cues, &mut remaining);
+            }
+        }
         let (view_id, len, generation) = handle.open_device_view(view);
         Ok(ViewHandleDto { view_id, len, gen: generation, totals: None })
     })
@@ -813,6 +1122,166 @@ fn device_row(mount: &Path, track: &device::Track, at: usize) -> DeviceRow {
         color: track.color,
         analysed: !track.analysis_path.is_empty(),
         has_artwork: !track.artwork_path.is_empty(),
+        cues: Vec::new(),
+    }
+}
+
+/// Read the format's cue source while the view is opened on a blocking thread.
+/// A damaged analysis companion cannot make its track disappear from the browser.
+fn device_cues(
+    mount: &Path,
+    track: &device::Track,
+    format: Format,
+    one_cues: &HashMap<u32, Vec<rbl_index::Cue>>,
+    remaining: &mut u64,
+) -> Vec<rbl_index::Cue> {
+    let mut cues = if format == Format::OneLibrary {
+        one_cues.get(&track.id).cloned().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // OneLibrary's table owns cue timing and identity. EXT is only needed to
+    // supplement memory-cue colors, so most rows need no companion read.
+    if *remaining == 0 || (format == Format::OneLibrary && !cues.iter().any(rbl_index::Cue::is_memory)) {
+        cues.sort_by_key(|cue| (cue.position_ms, cue.kind));
+        return cues;
+    }
+    let analysis = assets_of(mount, track)
+        .1
+        .analysis_dat()
+        .and_then(|dat| {
+            let ext = dat.with_extension("EXT");
+            let relative = ext.strip_prefix(mount).ok()?.to_str()?;
+            let ext = DeviceAssets::on_stick(mount, relative)?;
+            read_browser_ext(&ext, remaining).map(|file| file.cue_entries())
+        })
+        .unwrap_or_default();
+    cues = match format {
+        Format::DeviceLibrary => analysis.iter().filter_map(cue_from_analysis).collect(),
+        Format::OneLibrary => {
+            for cue in &mut cues {
+                if cue.is_memory() {
+                    cue.memory_colour = analysis
+                        .iter()
+                        .find(|entry| {
+                            entry.hot_cue == 0
+                                && entry.time_ms == cue.position_ms
+                                && (entry.kind != 2 || entry.loop_time_ms == cue.out_ms)
+                        })
+                        .and_then(|entry| {
+                            u8::try_from(entry.library_color())
+                                .ok()
+                                .filter(|color| *color < 8)
+                        });
+                }
+            }
+            cues
+        }
+    };
+    cues.sort_by_key(|cue| (cue.position_ms, cue.kind));
+    cues
+}
+
+fn read_browser_ext(path: &Path, remaining: &mut u64) -> Option<rbl_anlz::Anlz> {
+    let limit = MAX_BROWSER_EXT_BYTES.min(*remaining);
+    if limit == 0 {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > limit {
+        return None;
+    }
+    // The metadata check avoids ordinary oversized reads; take also caps a
+    // companion that grows between the check and the read.
+    let mut bytes = Vec::new();
+    let read = file.take(limit + 1).read_to_end(&mut bytes);
+    *remaining = remaining.saturating_sub(bytes.len() as u64);
+    read.ok()?;
+    if bytes.len() as u64 > limit {
+        return None;
+    }
+    rbl_anlz::parse(&bytes).ok()
+}
+
+fn cue_from_analysis(entry: &rbl_anlz::CueEntry) -> Option<rbl_index::Cue> {
+    let kind = u8::try_from(entry.library_kind()).ok()?;
+    if !matches!(kind, 0..=3 | 5..=17) || !matches!(entry.kind, 1 | 2) {
+        return None;
+    }
+    Some(rbl_index::Cue {
+        kind,
+        position_ms: entry.time_ms,
+        out_ms: if entry.kind == 2 {
+            entry.loop_time_ms
+        } else {
+            0
+        },
+        colour: entry.library_color_table_index(),
+        memory_colour: u8::try_from(entry.library_color())
+            .ok()
+            .filter(|color| *color < 8),
+        ..Default::default()
+    })
+}
+
+/// `OneLibrary`'s cue table supplies its own cue identity and timing. The
+/// connection is explicitly read-only; malformed individual rows are ignored.
+fn one_library_cues(mount: &Path) -> HashMap<u32, Vec<rbl_index::Cue>> {
+    let read = || -> rbl_onelibrary::Result<HashMap<u32, Vec<rbl_index::Cue>>> {
+        let root = rbl_export::export_root_name(mount)
+            .map_err(|error| rbl_onelibrary::Error::Io(std::io::Error::other(error)))?;
+        let db = rbl_onelibrary::ExportLibrary::open_read_only(
+            &mount.join(root).join("rekordbox/exportLibrary.db"),
+        )?;
+        let mut stmt = db.connection().prepare(
+            "SELECT content_id, kind, colorTableIndex, inUsec, outUsec FROM cue ORDER BY cue_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ))
+        })?;
+        let mut cues: HashMap<u32, Vec<rbl_index::Cue>> = HashMap::new();
+        for row in rows {
+            let Ok((track, kind, colour, start, end)) = row else {
+                continue;
+            };
+            let (Ok(track), Ok(kind), Ok(position_ms)) = (
+                u32::try_from(track),
+                u8::try_from(kind),
+                u32::try_from(start / 1000),
+            ) else {
+                continue;
+            };
+            if start < 0 || !matches!(kind, 0..=17) {
+                continue;
+            }
+            let out_ms = end
+                .filter(|end| *end >= 0)
+                .and_then(|end| u32::try_from(end / 1000).ok())
+                .unwrap_or(0);
+            cues.entry(track).or_default().push(rbl_index::Cue {
+                kind,
+                position_ms,
+                out_ms,
+                colour: colour
+                    .and_then(|value| u8::try_from(value).ok())
+                    .unwrap_or(0),
+                ..Default::default()
+            });
+        }
+        Ok(cues)
+    };
+    match read() {
+        Ok(cues) => cues,
+        Err(error) => {
+            tracing::warn!(device = %mount.display(), %error, "OneLibrary cues could not be read");
+            HashMap::new()
+        }
     }
 }
 
@@ -847,6 +1316,10 @@ pub fn ids_in_range(view: &DeviceView, from: u32, to: u32) -> Vec<String> {
 }
 
 fn row_dto(row: &DeviceRow) -> RowDto {
+    let mut hot: Vec<_> = row.cues.iter().filter_map(|cue| cue.hot_letter().map(|letter| (cue.kind, RowCueDto(letter, cue.position_ms, cue_colour_css(cue.colour), cue.out_ms > cue.position_ms)))).collect();
+    hot.sort_by_key(|(kind, _)| *kind);
+    let memory: Vec<_> = row.cues.iter().filter(|cue| cue.is_memory()).collect();
+    let memory_cue_colours = if memory.iter().all(|cue| cue.memory_colour.is_none()) { Vec::new() } else { memory.iter().map(|cue| cue.memory_colour.unwrap_or(u8::MAX)).collect() };
     RowDto {
         id: rbl_index::folder::loose_id(&row.path),
         track_no: row.position,
@@ -863,8 +1336,9 @@ fn row_dto(row: &DeviceRow) -> RowDto {
         analysed: u8::from(row.analysed),
         date_added: row.date_added.clone(),
         release_date: String::new(),
-        hot_cues: Vec::new(),
-        memory_cues: Vec::new(),
+        hot_cues: hot.into_iter().map(|(_, cue)| cue).collect(),
+        memory_cues: memory.iter().map(|cue| cue.position_ms).collect(),
+        memory_cue_colours,
         artwork_hue: 0,
         has_artwork: row.has_artwork,
         file_name: row.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -879,6 +1353,85 @@ fn row_dto(row: &DeviceRow) -> RowDto {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Runs the public command against a disposable stick and decoded audio,
+    /// through analysis and both device database writers.
+    #[test]
+    fn loose_wav_is_analysed_and_added_without_a_collection_entry_or_audio_copy() {
+        let (_src, dest) = stick();
+        let local = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(local.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let collection_count = || {
+            let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+            db.connection().query_row("SELECT COUNT(*) FROM djmdContent", [], |row| row.get::<_, i64>(0)).unwrap()
+        };
+        let before_collection = collection_count();
+        let root = dest.path();
+        let original = device::read(root, Format::DeviceLibrary).unwrap();
+        let playlist = original.nodes.iter().find(|node| node.name == "Friday").unwrap();
+        let existing_ids = playlist.tracks.clone();
+        let music = root.join("Music");
+        std::fs::create_dir_all(&music).unwrap();
+        let wav = music.join("click.wav");
+        write_test_wav(&wav);
+        let audio = std::fs::read(&wav).unwrap();
+        let path = root.to_str().unwrap().to_owned();
+        let id = playlist.id.to_string();
+        let row = rbl_index::folder::loose_id(&wav);
+        let add = || tauri::async_runtime::block_on(device_playlist_add_files(path.clone(), "deviceLibrary".into(), id.clone(), vec![row.clone()]));
+        assert_eq!(add().unwrap().changed, 1);
+        let legacy = device::read(root, Format::DeviceLibrary).unwrap();
+        let one = device::read(root, Format::OneLibrary).unwrap();
+        assert_eq!(legacy.nodes, one.nodes);
+        assert_eq!(legacy.tracks, one.tracks);
+        let entries = &legacy.node(playlist.id).unwrap().tracks;
+        assert_eq!(&entries[..existing_ids.len()], existing_ids);
+        assert_eq!(entries.len(), existing_ids.len() + 1);
+        let added = legacy.track(*entries.last().unwrap()).unwrap();
+        assert_eq!(added.path, "/Music/click.wav");
+        assert_ne!(added.analysis_path, "");
+        let dat = root.join(added.analysis_path.trim_start_matches('/'));
+        for file in [&dat, &rbl_anlz::sibling(&dat, "EXT"), &rbl_anlz::sibling(&dat, "2EX")] {
+            let parsed = rbl_anlz::Anlz::read(file).unwrap();
+            assert_eq!(parsed.path().as_deref(), Some("/Music/click.wav"));
+        }
+        assert!(rbl_export::verify(root).unwrap().is_ok());
+        assert_eq!(std::fs::read(&wav).unwrap(), audio);
+        assert!(!root.join("Contents").join("click.wav").exists());
+        assert_eq!(collection_count(), before_collection, "the local collection remains unchanged");
+        assert_eq!(add().unwrap().changed, 0);
+        assert_eq!(device::read(root, Format::DeviceLibrary).unwrap(), legacy);
+        assert_eq!(device::read(root, Format::OneLibrary).unwrap(), one);
+        assert_eq!(std::fs::read(&wav).unwrap(), audio);
+        assert_eq!(collection_count(), before_collection);
+    }
+
+    fn write_test_wav(path: &Path) {
+        let rate = 22_050_u32;
+        let frames = rate * 4;
+        let mut data = Vec::with_capacity(usize::try_from(frames * 2).unwrap());
+        for i in 0..frames {
+            let since = i % (rate / 2);
+            let sample: i16 = if since < 400 { i16::try_from(20_000 * (400 - since) / 400).unwrap() } else { 0 };
+            data.extend_from_slice(&sample.to_le_bytes());
+        }
+        let len = u32::try_from(data.len()).unwrap();
+        let mut wav = Vec::with_capacity(44 + data.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&len.to_le_bytes());
+        wav.extend_from_slice(&data);
+        std::fs::write(path, wav).unwrap();
+    }
 
     /// A stick written by the export pipeline: a folder with a list, and a
     /// list at the top level.
@@ -914,6 +1467,54 @@ mod tests {
         assert_eq!(found[0].tracks, 3);
     }
 
+    /// Overwrites one of the stick's databases with bytes neither reader
+    /// takes, as a damaged or half-written file would be.
+    fn damage(mount: &Path, format: Format) {
+        std::fs::write(mount.join("PIONEER/rekordbox").join(format.file_name()), b"not a database").unwrap();
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_read_leaves_the_other_in_the_tree() {
+        // #631: one unreadable library emptied the whole stick in the tree.
+        let (_src, dest) = stick();
+        damage(dest.path(), Format::OneLibrary);
+        let found = readable_libraries(dest.path());
+        assert_eq!(found.iter().map(|l| l.format).collect::<Vec<_>>(), ["deviceLibrary"]);
+        let tree: Vec<&str> = found[0].nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(tree, ["Sets", "Friday", "Warm Up"]);
+
+        let (_src, dest) = stick();
+        damage(dest.path(), Format::DeviceLibrary);
+        let found = readable_libraries(dest.path());
+        assert_eq!(found.iter().map(|l| l.format).collect::<Vec<_>>(), ["oneLibrary"]);
+        assert_eq!(found[0].tracks, 3);
+    }
+
+    #[test]
+    fn a_stick_whose_libraries_cannot_be_read_lists_none() {
+        let (_src, dest) = stick();
+        damage(dest.path(), Format::DeviceLibrary);
+        damage(dest.path(), Format::OneLibrary);
+        assert!(readable_libraries(dest.path()).is_empty());
+        let blank = tempfile::tempdir().unwrap();
+        assert!(readable_libraries(blank.path()).is_empty());
+        // Libraries under both PIONEER and .PIONEER: which is the stick's is
+        // not this tree's to guess, so neither is listed (and the log says why).
+        let (_src, dest) = stick();
+        std::fs::create_dir_all(dest.path().join(".PIONEER/rekordbox")).unwrap();
+        std::fs::copy(dest.path().join("PIONEER/rekordbox/export.pdb"), dest.path().join(".PIONEER/rekordbox/export.pdb")).unwrap();
+        assert!(readable_libraries(dest.path()).is_empty());
+    }
+
+    #[test]
+    fn a_device_library_playlist_is_read_for_import_when_the_onelibrary_cannot_be() {
+        let (_src, dest) = stick();
+        damage(dest.path(), Format::OneLibrary);
+        let stick = StickTracks::read(dest.path(), Format::DeviceLibrary).unwrap();
+        assert_eq!(stick.library.tracks.len(), 3);
+        assert!(stick.masters_by_path.is_empty());
+    }
+
     #[test]
     fn rows_name_tracks_by_their_file_and_edits_find_them_again() {
         let (_src, dest) = stick();
@@ -925,6 +1526,20 @@ mod tests {
         assert_eq!(ids, vec![library.tracks[2].id, library.tracks[0].id]);
         assert!(track_ids(mount, Format::OneLibrary, &["file:/elsewhere/x.mp3".into()]).is_err());
         assert!(track_ids(mount, Format::OneLibrary, &["7".into()]).is_err(), "a library track id is not a device track");
+    }
+
+    #[test]
+    fn collection_track_ids_map_only_to_rows_owned_by_this_library() {
+        let (_src, dest) = stick();
+        let mut library = device::read(dest.path(), Format::OneLibrary).unwrap();
+        library.tracks[0].master_db_id = 77;
+        library.tracks[0].master_content_id = 101;
+        library.tracks[1].master_db_id = 77;
+        library.tracks[1].master_content_id = 102;
+
+        assert_eq!(collection_track_rows(dest.path(), &library, 77, &["102".into(), "999".into(), "not-an-id".into()]),
+            [Some(rbl_index::folder::loose_id(&audio_path(dest.path(), &library.tracks[1].path))), None, None]);
+        assert_eq!(collection_track_rows(dest.path(), &library, 78, &["101".into()]), [None]);
     }
 
     #[test]
@@ -978,6 +1593,7 @@ mod tests {
         let edit: DeviceEditDto = serde_json::from_str(r#"{"kind":"add","playlist":"1","tracks":[],"duplicates":true}"#).unwrap();
         assert!(matches!(edit, DeviceEditDto::Add { duplicates: true, .. }));
         assert!(duplicates_of(path, "deviceLibrary", "1", &["file:/elsewhere/x.mp3".into()]).is_err());
+        assert!(duplicates_of(path, "deviceLibrary", "999", &[]).is_err(), "a missing target is refused before an export starts");
     }
 
     #[test]
@@ -1037,6 +1653,11 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_with(|_, _| {})
+    }
+
+    /// [`rig`] with each stick track as `edit` leaves it before the export.
+    fn rig_with(edit: impl Fn(usize, &mut rbl_export::SourceTrack)) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
         let (src, stick) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -1044,13 +1665,15 @@ mod tests {
             .map(|i| {
                 let path = src.path().join(format!("t{i}.wav"));
                 std::fs::write(&path, wav(4410 * (u32::try_from(i).unwrap() + 1))).unwrap();
-                rbl_export::SourceTrack {
+                let mut track = rbl_export::SourceTrack {
                     id: rbl_db::fixture::track_id(i).parse().unwrap(),
                     source_path: path,
                     title: format!("Track {i}"),
                     artist: "TRIODE".into(),
                     ..Default::default()
-                }
+                };
+                edit(i, &mut track);
+                track
             })
             .collect();
         let playlists = vec![rbl_export::SourcePlaylist { id: 11, name: "Friday".into(), track_indices: vec![0, 1], ..Default::default() }];
@@ -1198,7 +1821,7 @@ mod tests {
         let destination = rbl_export::device_import::destination(music.path());
         let stick_file = rig.sticks_file(3);
         let stick_bytes = std::fs::read(&stick_file).unwrap();
-        let (entries, copies) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
+        let (entries, copies, _) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
         let copy = destination.join("Contents/TRIODE/UnknownAlbum").join(stick_file.file_name().unwrap());
         assert_eq!(copies.files(), std::slice::from_ref(&copy), "the track listed twice is copied once");
         assert_eq!(std::fs::read(&copy).unwrap(), stick_bytes);
@@ -1220,10 +1843,10 @@ mod tests {
         let music = tempfile::tempdir().unwrap();
         let destination = rbl_export::device_import::destination(music.path());
         let plan = rig.plan(Format::OneLibrary, "TAG LIST");
-        let (entries, _) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
+        let (entries, _, _) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
         let first = rig.writer().import_device_playlist_entries(&plan.name, &entries).unwrap();
         let plan = rig.plan(Format::OneLibrary, "TAG LIST");
-        let (entries, copies) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
+        let (entries, copies, _) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
         assert_eq!(copies.files(), Vec::<PathBuf>::new(), "no second copy");
         let second = rig.writer().import_device_playlist_entries(&plan.name, &entries).unwrap();
         assert_eq!(second.name, "TAG LIST (1)");
@@ -1243,11 +1866,226 @@ mod tests {
         let theirs = destination.join("Contents/TRIODE/UnknownAlbum").join(&name);
         std::fs::create_dir_all(theirs.parent().unwrap()).unwrap();
         std::fs::write(&theirs, b"the user's own file").unwrap();
-        let (_, copies) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
+        let (_, copies, _) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
         assert_eq!(std::fs::read(&theirs).unwrap(), b"the user's own file");
         let made = copies.files()[0].clone();
         assert_ne!(made, theirs);
         assert!(made.file_name().unwrap().to_string_lossy().contains("-1."), "{made:?}");
+    }
+
+    /// An app state over `rig`'s collection, for the steps that write
+    /// through it.
+    fn state_over(rig: &Rig) -> AppState {
+        let db = rbl_db::Library::open(rig.location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (library, _) = rbl_index::load(&db).unwrap();
+        let state = AppState::with_backups(rig.dir.path().join("backups"));
+        state.set_library(library, false, db.schema().db_version, 0, rig.location.clone());
+        state
+    }
+
+    /// Every file under `dir` with its bytes.
+    fn contents_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        files_under(dir).into_iter().map(|f| { let bytes = std::fs::read(dir.join(&f)).unwrap(); (f, bytes) }).collect()
+    }
+
+    /// A stick track 0 that rekordbox analysed: 128 BPM in F minor, a grid,
+    /// waveforms, a hot cue A and a memory loop.
+    fn analysed_on_the_stick(i: usize, track: &mut rbl_export::SourceTrack) {
+        if i != 0 {
+            return;
+        }
+        track.bpm_x100 = 12_800;
+        track.key = "Fm".into();
+        let beats = [rbl_anlz::Beat { beat_number: 1, tempo_x100: 12_800, time_ms: 25 }, rbl_anlz::Beat { beat_number: 2, tempo_x100: 12_800, time_ms: 494 }];
+        let mut dat = rbl_anlz::write::AnlzBuilder::new();
+        dat.path("/Contents/TRIODE/UnknownAlbum/t0.wav").beat_grid(&beats).waveform_preview(b"PWAV", &[7; 400]).cue_lists(false);
+        let mut ext = rbl_anlz::write::AnlzBuilder::new();
+        ext.path("/Contents/TRIODE/UnknownAlbum/t0.wav").waveform_preview(b"PWV3", &[9; 30]).cue_lists(true);
+        track.analysis = vec![("DAT".into(), dat.finish()), ("EXT".into(), ext.finish())];
+        let cue = |kind: u8, time_ms: u32, loop_time_ms: Option<u32>| rbl_anlz::cues::ExportCue {
+            kind,
+            time_ms,
+            loop_time_ms,
+            color_id: 0,
+            color_code: u8::from(kind != 0),
+            comment: String::new(),
+            active_loop: false,
+            loop_numerator: 0,
+            loop_denominator: 0,
+        };
+        track.cues = Some(vec![cue(1, 25, None), cue(0, 494, Some(2369))]);
+    }
+
+    #[test]
+    fn a_copied_track_brings_the_sticks_bpm_key_waveform_grid_and_cues() {
+        // #568: the copy came in as a bare file, its BPM, waveform, cues and
+        // key lost. rekordbox gives each track it copies the device's row,
+        // analysis files and cues [static, rekordbox 7.2.19
+        // importFromDeviceThread::run @0x1001d9618].
+        for format in [Format::OneLibrary, Format::DeviceLibrary] {
+            copied_track_brings_the_sticks_analysis(format);
+        }
+    }
+
+    #[test]
+    fn matched_collection_cues_are_unchanged_by_playlist_import() {
+        for format in [Format::OneLibrary, Format::DeviceLibrary] {
+            let rig = rig_with(analysed_on_the_stick);
+            let content = rbl_db::fixture::track_id(0);
+            rig.writer().add_cue(&content, 1, 1000).unwrap();
+            rig.writer().add_cue(&content, 0, 2000).unwrap();
+            let cues = || {
+                let db = rbl_db::Library::open(rig.location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+                let mut stmt = db.connection().prepare("SELECT InMsec, Kind FROM djmdCue WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY InMsec").unwrap();
+                stmt.query_map([&content], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap().map(Result::unwrap).collect::<Vec<_>>()
+            };
+            let before = cues();
+            assert_eq!(before, vec![(1000, 1), (2000, 0)]);
+            let stick_before = contents_under(rig.stick.path());
+            let plan = rig.plan(format, "Friday");
+            assert_eq!(plan.missing(), 0, "{format:?}");
+            let made = rig.writer().import_device_playlist_entries(&plan.name, &plan.matched_entries()).unwrap();
+            assert!(made.added.is_empty(), "{format:?}");
+            assert_eq!(rig.entries(&made.id), ids(&[0, 1]));
+            assert_eq!(cues(), before, "{format:?}: matched collection cues remain untouched");
+            assert_eq!(contents_under(rig.stick.path()), stick_before, "USB fixture is read only");
+        }
+    }
+
+    #[test]
+    fn dat_only_stick_analysis_imports_cues_for_copied_tracks() {
+        for format in [Format::OneLibrary, Format::DeviceLibrary] {
+            for active_loop in [false, true] {
+                let rig = rig_with(|i, track| {
+                    analysed_on_the_stick(i, track);
+                    if i == 0 {
+                        track.analysis.retain(|(extension, _)| extension == "DAT");
+                        if active_loop {
+                            let loop_cue = &mut track.cues.as_mut().unwrap()[1];
+                            loop_cue.kind = 4;
+                            loop_cue.active_loop = true;
+                        }
+                    }
+                });
+                rig.came_from_elsewhere(0);
+                let library = device::read(rig.stick.path(), format).unwrap();
+                let track = library.tracks.iter().find(|t| t.title == "Track 0").unwrap();
+                let dat = rbl_anlz::Anlz::read(&audio_path(rig.stick.path(), &track.analysis_path)).unwrap();
+                assert!(dat.section(b"PCOB").is_some_and(|s| s.payload.starts_with(b"PCPT")), "DAT contains a hot cue entry");
+                assert!(!audio_path(rig.stick.path(), &track.analysis_path).with_extension("EXT").exists());
+                let stick_before = contents_under(rig.stick.path());
+                let state = state_over(&rig);
+                let plan = rig.plan(format, "Friday");
+                let music = tempfile::tempdir().unwrap();
+                let destination = rbl_export::device_import::destination(music.path());
+                let (entries, _, carried) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
+                let made = state.write(|w| w.import_device_playlist_entries(&plan.name, &entries)).unwrap();
+                assert_eq!(carry_all(&state, rig.stick.path(), &made.added, &carried), (1, 0));
+                let db = rbl_db::Library::open(rig.location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+                let mut stmt = db.connection().prepare("SELECT InMsec, OutMsec, Kind FROM djmdCue WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY InMsec").unwrap();
+                let cues: Vec<(i64, Option<i64>, i64)> = stmt.query_map([&made.added[0].0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+                assert_eq!(cues, vec![(25, None, 1), (494, Some(2369), if active_loop { 4 } else { 0 })], "{format:?}: DAT-only hot cue and memory loop, active={active_loop}");
+                assert_eq!(contents_under(rig.stick.path()), stick_before, "USB fixture is read only");
+                assert!(files_under(&rig.dir.path().join("backups/analysis-journal")).is_empty(), "journal is closed");
+            }
+        }
+    }
+
+    fn copied_track_brings_the_sticks_analysis(format: Format) {
+        let rig = rig_with(analysed_on_the_stick);
+        rig.came_from_elsewhere(0);
+        let library = device::read(rig.stick.path(), format).unwrap();
+        let track = library.tracks.iter().find(|t| t.title == "Track 0").unwrap();
+        let stick_dat_path = audio_path(rig.stick.path(), &track.analysis_path);
+        let mut divergent_dat = rbl_anlz::Anlz::read(&stick_dat_path).unwrap();
+        let hot_list = divergent_dat.sections.iter_mut().find(|s| &s.tag.0 == b"PCOB" && s.header.get(..4) == Some(&[0, 0, 0, 1])).unwrap();
+        hot_list.payload[32..36].copy_from_slice(&125_u32.to_be_bytes());
+        std::fs::write(&stick_dat_path, divergent_dat.to_bytes()).unwrap();
+        assert_eq!(divergent_dat.legacy_cue_entries()[0].time_ms, 125, "DAT fixture differs from EXT");
+        let stick_ext = rbl_anlz::Anlz::read(&stick_dat_path.with_extension("EXT")).unwrap();
+        assert_eq!(stick_ext.cue_entries()[0].time_ms, 25, "EXT retains its own cue");
+        rbl_db::Library::open(rig.location.clone(), rbl_db::OpenMode::ReadWrite)
+            .unwrap()
+            .connection()
+            .execute("INSERT INTO djmdKey (ID, ScaleName, Seq, created_at, updated_at) VALUES ('12', 'Fm', 7, '2026-01-01', '2026-01-01')", [])
+            .unwrap();
+        let state = state_over(&rig);
+        let stick_before = contents_under(rig.stick.path());
+        let stick_dat = {
+            let library = device::read(rig.stick.path(), format).unwrap();
+            let track = library.tracks.iter().find(|t| t.title == "Track 0").unwrap();
+            rbl_anlz::Anlz::read(&audio_path(rig.stick.path(), &track.analysis_path)).unwrap()
+        };
+        let plan = rig.plan(format, "Friday");
+        assert_eq!(plan.missing(), 1, "{format:?}");
+        let music = tempfile::tempdir().unwrap();
+        let destination = rbl_export::device_import::destination(music.path());
+        let (entries, _, carried) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
+        let made = state.write(|w| w.import_device_playlist_entries(&plan.name, &entries)).unwrap();
+        assert_eq!(carry_all(&state, rig.stick.path(), &made.added, &carried), (1, 0));
+
+        let (content, copy) = made.added[0].clone();
+        let db = rbl_db::Library::open(rig.location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (bpm, key, path, analysed): (i64, String, String, i64) = db
+            .connection()
+            .query_row("SELECT BPM, KeyID, AnalysisDataPath, Analysed FROM djmdContent WHERE ID = ?1", [&content], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!((bpm, key.as_str(), analysed), (12_800, "12", rbl_db::write::ANALYSED_FULL), "{format:?}");
+        let dat_path = rbl_anlz::resolve(&rig.location.share_root, &path);
+        let dat = rbl_anlz::Anlz::read(&dat_path).unwrap();
+        let ext = rbl_anlz::Anlz::read(&rbl_anlz::sibling(&dat_path, "EXT")).unwrap();
+        let named = rbl_anlz::share_tree_ppth(&copy.to_string_lossy());
+        assert_eq!((dat.path(), ext.path()), (Some(named.clone()), Some(named)), "the share tree's ?/<file name>");
+        assert_eq!(dat.beat_grid(), stick_dat.beat_grid());
+        assert_eq!(dat.section(b"PWAV"), stick_dat.section(b"PWAV"), "the waveform as the stick has it");
+        assert_eq!(ext.section(b"PWV3").map(|s| s.payload.len()), Some(30));
+        let mut stmt = db
+            .connection()
+            .prepare("SELECT InMsec, OutMsec, Kind FROM djmdCue WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY InMsec")
+            .unwrap();
+        let cues: Vec<(i64, Option<i64>, i64)> = stmt.query_map([&content], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+        assert_eq!(cues, vec![(25, None, 1), (494, Some(2369), 0)]);
+        assert_eq!(contents_under(rig.stick.path()), stick_before, "the stick is only read");
+        assert!(files_under(&rig.dir.path().join("backups/analysis-journal")).is_empty(), "the journal is closed");
+    }
+
+    #[test]
+    fn a_copied_track_the_stick_never_analysed_still_takes_its_bpm() {
+        let rig = rig_with(|i, track| if i == 1 { track.bpm_x100 = 9_950 });
+        rig.came_from_elsewhere(1);
+        let state = state_over(&rig);
+        let plan = rig.plan(Format::OneLibrary, "Friday");
+        let music = tempfile::tempdir().unwrap();
+        let destination = rbl_export::device_import::destination(music.path());
+        let (entries, _, carried) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
+        let made = state.write(|w| w.import_device_playlist_entries(&plan.name, &entries)).unwrap();
+        assert_eq!(carry_all(&state, rig.stick.path(), &made.added, &carried), (1, 0));
+        let db = rbl_db::Library::open(rig.location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (bpm, path): (i64, Option<String>) = db
+            .connection()
+            .query_row("SELECT BPM, AnalysisDataPath FROM djmdContent WHERE ID = ?1", [&made.added[0].0], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(bpm, 9_950);
+        assert!(path.unwrap_or_default().is_empty(), "no analysis files, no path");
+    }
+
+    #[test]
+    fn a_picked_folder_takes_the_copies_and_one_that_is_not_there_is_refused() {
+        // rekordbox's Change… takes a folder that exists
+        // (importFromDeviceCopySettingWindow::buttonClicked @0x1001d802c).
+        let picked = tempfile::tempdir().unwrap();
+        let at = copy_destination(Some(&picked.path().to_string_lossy())).unwrap();
+        assert_eq!(at, picked.path());
+        assert!(copy_destination(Some(&picked.path().join("not there").to_string_lossy())).is_err());
+        assert!(copy_destination(Some("relative/folder")).is_err());
+        let rig = rig();
+        rig.came_from_elsewhere(3);
+        let plan = rig.plan(Format::OneLibrary, "TAG LIST");
+        let (_, copies, _) = copy_missing(&plan, &plan.copies(), &at).unwrap();
+        let name = rig.sticks_file(3).file_name().unwrap().to_owned();
+        assert_eq!(copies.files(), [picked.path().join("Contents/TRIODE/UnknownAlbum").join(name)]);
     }
 
     #[test]
@@ -1259,7 +2097,7 @@ mod tests {
         let plan = rig.plan(Format::OneLibrary, "TAG LIST");
         let music = tempfile::tempdir().unwrap();
         let destination = rbl_export::device_import::destination(music.path());
-        let (entries, copies) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
+        let (entries, copies, _) = copy_missing(&plan, &plan.copies(), &destination).unwrap();
         let mut writer = rig.writer();
         writer.delete_track(&rbl_db::fixture::track_id(1)).unwrap();
         let count = |w: &rbl_db::write::Writer, sql: &str| -> i64 { w.library().connection().query_row(sql, [], |r| r.get(0)).unwrap() };
@@ -1645,5 +2483,239 @@ mod tests {
         assert_eq!(page.iter().map(|r| (r.title.as_str(), r.track_no)).collect::<Vec<_>>(), [("Track 2", 2), ("Track 1", 1)]);
         assert_eq!(ids_in_range(&view, 1, 0), vec![page[0].id.clone(), page[1].id.clone()]);
         assert!(fetch_rows(&view, 0, MAX_ROWS + 1).is_err());
+    }
+    #[test]
+    fn browsing_both_device_formats_reads_cues_without_changing_a_clean_stick() {
+        let rig = rig_with(|index, track| {
+            analysed_on_the_stick(index, track);
+            if index == 0 {
+                track.cues = Some(vec![
+                    rbl_anlz::cues::ExportCue {
+                        kind: 1,
+                        time_ms: 1_000,
+                        color_code: 46,
+                        ..Default::default()
+                    },
+                    rbl_anlz::cues::ExportCue {
+                        kind: 5,
+                        time_ms: 2_000,
+                        ..Default::default()
+                    },
+                    rbl_anlz::cues::ExportCue {
+                        time_ms: 3_000,
+                        loop_time_ms: Some(5_000),
+                        color_id: 3,
+                        ..Default::default()
+                    },
+                ]);
+            }
+        });
+        let mount = rig.stick.path();
+        let before = contents_under(mount);
+        let probe = device::read(mount, Format::DeviceLibrary).unwrap();
+        let probe_track = probe.tracks.iter().find(|track| track.title == "Track 0").unwrap();
+        let probe_ext = assets_of(mount, probe_track).1.analysis_dat().unwrap().with_extension("EXT");
+        assert!(probe_ext.is_file(), "{}", probe_ext.display());
+        assert_ne!(rbl_anlz::Anlz::read(&probe_ext).unwrap().cue_entries().len(), 0);
+        #[cfg(unix)]
+        let original_ext = std::fs::read(&probe_ext).unwrap();
+        for format in [Format::DeviceLibrary, Format::OneLibrary] {
+            let library = device::read(mount, format).unwrap();
+            let one_cues = if format == Format::OneLibrary {
+                one_library_cues(mount)
+            } else {
+                HashMap::new()
+            };
+            let mut remaining = MAX_BROWSER_EXT_VIEW_BYTES;
+            let rows: Vec<_> = library
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(at, track)| {
+                    let mut row = device_row(mount, track, at);
+                    row.cues = device_cues(mount, track, format, &one_cues, &mut remaining);
+                    row
+                })
+                .collect();
+            let cued_row = rows.iter().find(|row| row.title == "Track 0").unwrap();
+            assert!(cued_row.cues.iter().any(|cue| cue.is_memory() && cue.position_ms == 3_000 && cue.out_ms == 5_000), "{format:?}");
+            let view = DeviceView::open(
+                rows,
+                &rbl_index::ViewSpec {
+                    source: rbl_index::TrackSource::Collection,
+                    sort: rbl_index::SortColumn::TrackNo,
+                    descending: false,
+                    query: String::new(),
+                    filter: rbl_index::TrackFilter::default(),
+                },
+                rbl_index::SearchField::All,
+            );
+            let found = fetch_rows(&view, 0, 10).unwrap();
+            let cued = found.iter().find(|row| row.title == "Track 0").unwrap();
+            assert_eq!(
+                cued.hot_cues
+                    .iter()
+                    .map(|cue| (cue.0, cue.1, cue.3))
+                    .collect::<Vec<_>>(),
+                [('A', 1_000, false), ('D', 2_000, false)],
+                "{format:?}"
+            );
+            assert_eq!(cued.hot_cues[0].2, cue_colour_css(46), "{format:?}");
+            assert_eq!(cued.memory_cues, [3_000], "{format:?}");
+            assert_eq!(cued.memory_cue_colours, [2], "{format:?}");
+            assert!(
+                found
+                    .iter()
+                    .filter(|row| row.title != "Track 0")
+                    .all(|row| row.hot_cues.is_empty() && row.memory_cues.is_empty()),
+                "{format:?}"
+            );
+        }
+        assert_eq!(
+            contents_under(mount),
+            before,
+            "browsing a clean stick must not write to it"
+        );
+
+        let library = device::read(mount, Format::DeviceLibrary).unwrap();
+        let track = library
+            .tracks
+            .iter()
+            .find(|track| track.title == "Track 0")
+            .unwrap();
+        let ext = assets_of(mount, track)
+            .1
+            .analysis_dat()
+            .unwrap()
+            .with_extension("EXT");
+        std::fs::write(&ext, b"malformed analysis").unwrap();
+        let mut remaining = MAX_BROWSER_EXT_VIEW_BYTES;
+        let mut damaged = device_row(mount, track, 0);
+        damaged.cues = device_cues(mount, track, Format::DeviceLibrary, &HashMap::new(), &mut remaining);
+        assert!(row_dto(&damaged).hot_cues.is_empty());
+        let one_cues = one_library_cues(mount);
+        let mut still_in_database = device_row(mount, track, 0);
+        still_in_database.cues = device_cues(mount, track, Format::OneLibrary, &one_cues, &mut remaining);
+        assert_eq!(row_dto(&still_in_database).memory_cues, [3_000]);
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("ANLZ0000.EXT");
+            std::fs::write(&target, original_ext).unwrap();
+            std::fs::remove_file(&ext).unwrap();
+            std::os::unix::fs::symlink(&target, &ext).unwrap();
+            let mut linked = device_row(mount, track, 0);
+            linked.cues = device_cues(mount, track, Format::DeviceLibrary, &HashMap::new(), &mut remaining);
+            assert!(row_dto(&linked).hot_cues.is_empty(), "analysis symlinks outside the stick are not followed");
+        }
+    }
+
+    #[test]
+    fn oversized_browser_ext_is_nonfatal_and_bounded() {
+        let rig = rig_with(|index, track| {
+            analysed_on_the_stick(index, track);
+            if index == 0 {
+                track.cues = Some(vec![rbl_anlz::cues::ExportCue {
+                    kind: 1,
+                    time_ms: 1_000,
+                    ..Default::default()
+                }, rbl_anlz::cues::ExportCue {
+                    time_ms: 3_000,
+                    loop_time_ms: Some(5_000),
+                    ..Default::default()
+                }]);
+            }
+        });
+        let mount = rig.stick.path();
+        let library = device::read(mount, Format::DeviceLibrary).unwrap();
+        let track = library.tracks.iter().find(|track| track.title == "Track 0").unwrap();
+        let ext = assets_of(mount, track).1.analysis_dat().unwrap().with_extension("EXT");
+        let mut analysis = rbl_anlz::Anlz::read(&ext).unwrap();
+        analysis.sections.push(rbl_anlz::Section::new(b"JUNK", Vec::new(), vec![0; usize::try_from(MAX_BROWSER_EXT_BYTES).unwrap()]));
+        std::fs::write(&ext, analysis.to_bytes()).unwrap();
+        assert_ne!(rbl_anlz::Anlz::read(&ext).unwrap().cue_entries(), [] as [rbl_anlz::CueEntry; 0]);
+        let before = contents_under(mount);
+        for format in [Format::DeviceLibrary, Format::OneLibrary] {
+            let one_cues = if format == Format::OneLibrary { one_library_cues(mount) } else { HashMap::new() };
+            let mut remaining = MAX_BROWSER_EXT_VIEW_BYTES;
+            let cues = device_cues(mount, track, format, &one_cues, &mut remaining);
+            assert_eq!(remaining, MAX_BROWSER_EXT_VIEW_BYTES, "oversized file should not be read");
+            let mut row = device_row(mount, track, 0);
+            row.cues = cues;
+            let dto = row_dto(&row);
+            if format == Format::DeviceLibrary {
+                assert!(dto.hot_cues.is_empty());
+            } else {
+                assert_eq!(dto.hot_cues[0].0, 'A');
+                assert_eq!(dto.memory_cues, [3_000]);
+            }
+        }
+        assert_eq!(contents_under(mount), before, "browsing must not write to the stick");
+        std::fs::remove_file(&ext).unwrap();
+        let mut remaining = MAX_BROWSER_EXT_VIEW_BYTES;
+        assert_eq!(device_cues(mount, track, Format::DeviceLibrary, &HashMap::new(), &mut remaining), [] as [rbl_index::Cue; 0]);
+        assert_ne!(device_cues(mount, track, Format::OneLibrary, &one_library_cues(mount), &mut remaining), [] as [rbl_index::Cue; 0]);
+    }
+
+    #[test]
+    fn browser_ext_reads_share_a_view_budget() {
+        let rig = rig_with(|index, track| {
+            analysed_on_the_stick(index, track);
+        });
+        let mount = rig.stick.path();
+        let library = device::read(mount, Format::DeviceLibrary).unwrap();
+        let track = library.tracks.iter().find(|track| track.title == "Track 0").unwrap();
+        let ext = assets_of(mount, track).1.analysis_dat().unwrap().with_extension("EXT");
+        let size = std::fs::metadata(ext).unwrap().len();
+        let mut remaining = size * 2;
+        for _ in 0..2 {
+            assert_ne!(device_cues(mount, track, Format::DeviceLibrary, &HashMap::new(), &mut remaining), [] as [rbl_index::Cue; 0]);
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(device_cues(mount, track, Format::DeviceLibrary, &HashMap::new(), &mut remaining), [] as [rbl_index::Cue; 0]);
+    }
+
+    #[test]
+    fn browser_open_many_tracks_records_fixture_latency() {
+        let (src, stick) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut seed = rbl_export::SourceTrack::default();
+        analysed_on_the_stick(0, &mut seed);
+        let tracks: Vec<_> = (0..600_u64)
+            .map(|id| {
+                let path = src.path().join(format!("t{id}.mp3"));
+                std::fs::write(&path, [0_u8; 512]).unwrap();
+                rbl_export::SourceTrack {
+                    id: id + 1,
+                    source_path: path,
+                    title: format!("Track {id}"),
+                    analysis: seed.analysis.clone(),
+                    cues: seed.cues.clone(),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        rbl_export::export(stick.path(), &tracks, &[]).unwrap();
+        for format in [Format::DeviceLibrary, Format::OneLibrary] {
+            let started = std::time::Instant::now();
+            let library = device::read(stick.path(), format).unwrap();
+            let one_cues = if format == Format::OneLibrary { one_library_cues(stick.path()) } else { HashMap::new() };
+            let rows = library.tracks.iter().enumerate().map(|(at, track)| device_row(stick.path(), track, at)).collect();
+            let mut view = DeviceView::open(rows, &rbl_index::ViewSpec {
+                source: rbl_index::TrackSource::Collection,
+                sort: rbl_index::SortColumn::Title,
+                descending: false,
+                query: String::new(),
+                filter: rbl_index::TrackFilter::default(),
+            }, rbl_index::SearchField::All);
+            let mut remaining = MAX_BROWSER_EXT_VIEW_BYTES;
+            for row in &mut view.rows {
+                let track = library.track(row.id).unwrap();
+                row.cues = device_cues(stick.path(), track, format, &one_cues, &mut remaining);
+            }
+            assert_eq!(view.len(), 600);
+            assert!(view.rows.iter().all(|row| !row.cues.is_empty()));
+            let elapsed = started.elapsed();
+            assert!(elapsed < std::time::Duration::from_secs(10), "{format:?}: 600-track browser fixture took {elapsed:?}");
+        }
     }
 }

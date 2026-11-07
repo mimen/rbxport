@@ -4,13 +4,13 @@
  *
  * Database holds the library's own facts and rekordbox's Database management
  * (the one place rekordbox chooses which library it works on). Browse holds
- * Library Protection and Edit Library. Others holds BEAT/BPM SYNC, the
- * quantize beat value and play history.
+ * My Tag, Library Protection, Edit Library and the Playback time setting.
+ * Others holds BEAT/BPM SYNC, the quantize beat value and play history.
  *
  * Not here: Auto Relocate Search Folders and Duplicates (hidden; Auto
  * Relocate searches the stored folders, Music, Movies and Desktop by
  * default), iTunes and rekordbox xml (neither is read), Auto Export and
- * Database management's Move Database (neither is built), My Tag, colour names, display
+ * Database management's Move Database (neither is built), colour names, display
  * speed, the long-press menu and the Tag List (none exist here), the
  * export name (link export is not built), hot cue GATE, loop export,
  * Recordings, and every streaming service.
@@ -20,10 +20,11 @@ import { useEffect, useRef, useState } from "react";
 import { getBackend } from "@/ipc/client";
 import type { DatabaseDrive, LibrarySummary } from "@/ipc/types";
 import { useTranslation } from "@/i18n";
-import { QUANTIZE_BEATS } from "@/lib/preferences";
+import { errorMessage } from "@/lib/errorMessage";
+import { PLAYBACK_TIME, QUANTIZE_BEATS } from "@/lib/preferences";
 import { usePreferencesContext } from "@/store/usePreferences";
 import styles from "./Preferences.module.css";
-import { Button, Note, Radios, Section, Select, Sub, Toggle } from "./controls";
+import { Button, Note, Radios, Section, Select, Separator, Slider, Sub, Toggle } from "./controls";
 
 export type AdvancedTab = "database" | "browse" | "others";
 
@@ -42,6 +43,8 @@ export function AdvancedPane({ tab, summary }: {
   const advanced = preferences.advanced;
   const set = (patch: Partial<typeof advanced>) => update("advanced", patch);
   const [checkingBackup, setCheckingBackup] = useState(false);
+  const [writingMyTags, setWritingMyTags] = useState(false);
+  const [myTagFailure, setMyTagFailure] = useState<string | null>(null);
   const [unlockWarning, setUnlockWarning] = useState(false);
   const warningDialog = useRef<HTMLElement>(null);
 
@@ -68,9 +71,45 @@ export function AdvancedPane({ tab, summary }: {
     }
   };
 
+  /**
+   * rekordbox's `DetailMyTag::buttonClicked` (7.2.x arm64, static, #605):
+   * "This operation can take few minutes." with OK and Cancel; Cancel
+   * leaves the switch as it was, OK writes the tags into every tagged
+   * track's comment, or takes them off, under "Please wait for a while".
+   * rekordbox stores the setting before it writes; here it is stored once
+   * the write succeeds, since a protected library refuses it.
+   */
+  const setMyTagComments = async (on: boolean) => {
+    const backend = await getBackend();
+    const sure = await backend.confirm(t("This operation can take few minutes."), { yes: t("OK"), no: t("Cancel") });
+    if (!sure) return;
+    setWritingMyTags(true);
+    setMyTagFailure(null);
+    try {
+      await backend.edits.writeMyTagComments(on);
+      set({ myTagComments: on });
+    } catch (error) {
+      setMyTagFailure(errorMessage(error));
+    } finally {
+      setWritingMyTags(false);
+    }
+  };
+
   if (tab === "browse") {
     return (
       <>
+        {/* First on rekordbox's Browse tab (`setPageName`: My Tag, Color,
+            ..., Library Protection, Edit Library, Playback time). */}
+        <Section title="My Tag">
+          <Toggle
+            label={'Add "My Tag" to the "Comments"'}
+            checked={advanced.myTagComments}
+            disabled={writingMyTags}
+            onChange={(on) => { void setMyTagComments(on); }}
+          />
+          {writingMyTags ? <Note>{t("Please wait for a while")}</Note> : null}
+          {myTagFailure ? <Note failed>{myTagFailure}</Note> : null}
+        </Section>
         <Section title="Library Protection">
           <Toggle
             label="Protect library edit."
@@ -86,6 +125,21 @@ export function AdvancedPane({ tab, summary }: {
             onChange={(doubleClickToEdit) => set({ doubleClickToEdit })}
           />
         </Section>
+        {/* rekordbox 7.2.19's DetailPlaybackTime: a 1–60 slider with the
+            value in seconds beside it, under these two lines. PERFORMANCE
+            mode there; here, the deck's plays (#540). */}
+        <Section title="Playback time setting">
+          <Note>{t("The length of time before a track is added to Histories")}</Note>
+          <Note>{t("(Length of time before played tracks are displayed in color)")}</Note>
+          <Slider
+            label="Playback time setting"
+            value={advanced.playbackTime}
+            range={{ min: PLAYBACK_TIME.min, max: PLAYBACK_TIME.max, step: 1 }}
+            ends={[String(PLAYBACK_TIME.min), String(PLAYBACK_TIME.max)]}
+            onChange={(playbackTime) => set({ playbackTime })}
+          />
+          <Sub>{`${advanced.playbackTime} ${t("seconds")}`}</Sub>
+        </Section>
         <Section title="Playlists">
           <Sub>When a track is already in the playlist</Sub>
           <Select
@@ -98,19 +152,28 @@ export function AdvancedPane({ tab, summary }: {
             ]}
             onChange={(duplicateTracks) => set({ duplicateTracks })}
           />
+          <Separator />
           <Sub>{t("When importing a playlist from a device")}</Sub>
-          <Note>{t("Tracks the collection does not have are copied to PioneerDJ/Imported from Device in your Music folder. Files already there are never replaced.")}</Note>
           <Select
             label={t("When importing a playlist from a device")}
             value={advanced.deviceImportMissing}
             choices={[
               { value: "copy", label: t("Copy missing tracks") },
+              { value: "matched", label: t("Don't copy") },
               { value: "ask", label: t("Ask each import") },
-              { value: "matched", label: t("Import only already-matched tracks") },
               { value: "cancel", label: t("Cancel when any track is missing") },
             ]}
             onChange={(deviceImportMissing) => set({ deviceImportMissing })}
           />
+          {advanced.deviceImportMissing === "copy" ?
+            <Note>{t("Tracks the collection does not have are copied to PioneerDJ/Imported from Device in your Music folder. Files already there are never replaced.")}</Note> : null}
+          {advanced.deviceImportMissing === "matched" ?
+            <Note>{t("Only tracks already in your collection are imported. Unmatched tracks are left out; if none match, no playlist is created.")}</Note> : null}
+          {advanced.deviceImportMissing === "ask" ?
+            <Note>{t("When tracks are missing, choose whether to copy them and where to save them. Cancel stops the import.")}</Note> : null}
+          {advanced.deviceImportMissing === "cancel" ?
+            <Note>{t("If any track is missing from your collection, the playlist is not imported.")}</Note> : null}
+          <Separator />
           <Sub>{t("When a dropped folder has the same name as a list")}</Sub>
           <Select
             label={t("When a dropped folder has the same name as a list")}

@@ -13,6 +13,14 @@ import {
 } from "./preferences";
 
 describe("sanitisePreferences", () => {
+  it("keeps the chosen output device and treats anything else as the system default (#799)", () => {
+    expect(DEFAULT_PREFERENCES.audio.outputDevice).toBeNull();
+    expect(sanitisePreferences({ audio: {} }).audio.outputDevice).toBeNull();
+    expect(sanitisePreferences({ audio: { outputDevice: "alsa:hw:M4" } }).audio.outputDevice).toBe("alsa:hw:M4");
+    for (const bad of ["", 3, {}, false, undefined]) {
+      expect(sanitisePreferences({ audio: { outputDevice: bad } }).audio.outputDevice).toBeNull();
+    }
+  });
   it("enables rating imports for older settings and remembers explicit off choices", () => {
     expect(DEFAULT_PREFERENCES.usbExport).toMatchObject({ importButtonRatings: true });
     expect(sanitisePreferences({ usbExport: {} }).usbExport).toMatchObject({ importButtonRatings: true });
@@ -71,6 +79,19 @@ describe("sanitisePreferences", () => {
     expect(DEFAULT_PREFERENCES.analysis.writeKeyTag).toBe(false);
     expect(sanitisePreferences({ analysis: { writeKeyTag: "yes" } }).analysis.writeKeyTag).toBe(false);
     expect(sanitisePreferences({ analysis: { writeKeyTag: true } }).analysis.writeKeyTag).toBe(true);
+  });
+
+  it("leaves Add My Tag to the Comments off until it is switched on", () => {
+    // rekordbox's `writeMytag` defaults to off (#605).
+    expect(DEFAULT_PREFERENCES.advanced.myTagComments).toBe(false);
+    expect(sanitisePreferences({ advanced: { myTagComments: "yes" } }).advanced.myTagComments).toBe(false);
+    expect(sanitisePreferences({ advanced: { myTagComments: true } }).advanced.myTagComments).toBe(true);
+  });
+
+  it("analyses the key unless Analyze key is switched off", () => {
+    expect(DEFAULT_PREFERENCES.analysis.detectKey).toBe(true);
+    expect(sanitisePreferences({ analysis: { detectKey: "no" } }).analysis.detectKey).toBe(true);
+    expect(sanitisePreferences({ analysis: { detectKey: false } }).analysis.detectKey).toBe(false);
   });
 
   it("offers rekordbox's ten BPM ranges with 70-180 the default", () => {
@@ -195,6 +216,8 @@ describe("formatKey", () => {
     expect(formatKey("Ebm", "classic")).toBe("Ebm");
     expect(formatKey("Ebm", "alphanumeric")).toBe("2A");
     expect(formatKey("C", "alphanumeric")).toBe("8B");
+    expect(formatKey("12A", "classic")).toBe("Dbm");
+    expect(formatKey("12A", "alphanumeric")).toBe("12A");
     // A key the wheel does not know is shown as it is, not hidden.
     expect(formatKey("Unknown", "alphanumeric")).toBe("Unknown");
     expect(formatKey("", "alphanumeric")).toBe("");
@@ -255,4 +278,17 @@ describe("browseListVars", () => {
     expect(vars["--s-row-height"]).toBe("25px");
     expect(vars["--browse-weight"]).toBe(400);
   });
+});
+
+// Issue 540: rekordbox 7.2.19 keeps the Playback time setting in 1–60
+// seconds, 60 by default, and reads anything else as the default
+// (`SettingIF::getCurrentPlayedTime` @0x1015d43f8).
+it("keeps the Playback time setting in rekordbox's 1 to 60 seconds, 60 by default", () => {
+  expect(DEFAULT_PREFERENCES.advanced.playbackTime).toBe(60);
+  expect(sanitisePreferences({}).advanced.playbackTime).toBe(60);
+  expect(sanitisePreferences({ advanced: { playbackTime: 1 } }).advanced.playbackTime).toBe(1);
+  expect(sanitisePreferences({ advanced: { playbackTime: 30 } }).advanced.playbackTime).toBe(30);
+  for (const stored of [0, 61, 12.5, "30", null]) {
+    expect(sanitisePreferences({ advanced: { playbackTime: stored } }).advanced.playbackTime).toBe(60);
+  }
 });

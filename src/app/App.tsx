@@ -3,6 +3,7 @@ import type { DuplicateAnswer } from "@/components/DuplicateTracksDialog";
 import type { FolderClashAnswer } from "@/lib/folderDrop";
 import { JobQueue, slices, type JobView } from "@/lib/jobQueue";
 import { importInSlices, removeInSlices } from "@/lib/bulkJobs";
+import { INITIAL_SYNC, deckStartedPlaying, isFollowing, pressMaster, toggleBeatSync, type SyncState } from "@/lib/syncMaster";
 import { skippedTail } from "@/lib/importSkips";
 import { useBackupProgress } from "@/store/useBackupProgress";
 import { useExportProgress } from "@/store/useExportProgress";
@@ -27,6 +28,7 @@ import { droppedFilePaths, getBackend, subscribeNativeFileDrops } from "@/ipc/cl
 import type {
   Backend, DeckId, DeckTick, Device, ImportReport, LibraryProblem, LibrarySummary, RowDto, SortColumn, TrackField, TreeNode, ViewSpec,
 } from "@/ipc/types";
+import { TREE_ROOT } from "@/ipc/types";
 import { TrackTable, type TrackDrag } from "@/views/browser/TrackTable";
 import { clearWaveformPreviewCache } from "@/views/browser/WaveformPreview";
 import { TreeView } from "@/views/tree/TreeView";
@@ -45,6 +47,7 @@ import { transposeKey } from "@/lib/camelot";
 import { stepMasterGain, toggleMute } from "@/lib/volume";
 import { clampWidth, TREE_BOUNDS } from "@/lib/splitter";
 import { exportSummary } from "@/lib/exportSummary";
+import { prepareDevicePlaylistDrop } from "@/lib/devicePlaylistDrop";
 import { deviceId, devicePath, renamedDevice } from "@/lib/devices";
 import { DEVICE_ASKS, deviceNodeId, deviceParentFor, devicePlaylistsOf, isDeviceLibraryKind, parseDeviceNodeId } from "@/lib/deviceLibrary";
 import { useDeviceLibraries } from "@/store/useDeviceLibraries";
@@ -53,9 +56,11 @@ import { nextSort, specForNode, type SortState } from "@/lib/viewSpec";
 import {
   DEFAULT_SUB_TREE_WIDTH, DEFAULT_SUB_WIDTH, loadSession, saveSession, SEEDED_NODES, SEEDED_ROWS,
   type TrafficLightSource,
+  type ArtworkMode,
 } from "@/lib/session";
 import { startWindowDrag, toggleWindowMaximise } from "@/lib/windowDrag";
 import { AppCost } from "@/views/topbar/AppCost";
+import { useAudioOutput } from "@/store/useAudioOutput";
 import { useLimiter } from "@/store/useLimiter";
 import { onPreviewError, stopPreview } from "@/store/usePreview";
 import { useUpdater } from "@/store/useUpdater";
@@ -65,11 +70,12 @@ import { asLayout, deckCount, isFullDeck, type PlayerLayout } from "@/lib/layout
 import { FIELD_LABEL } from "@/views/info/fieldLabel";
 import { SubBrowser } from "@/views/subbrowser/SubBrowser";
 import { RightRail } from "@/views/browser/RightRail";
-import { useColumns, type ColumnContext } from "@/store/useColumns";
+import { MyTagPanel } from "@/views/browser/MyTagPanel";
+import { columnContextFor, useColumns, type ColumnContext } from "@/store/useColumns";
 import { useExplorer } from "@/store/useExplorer";
-import { importLoose, isLooseId } from "@/lib/explorer";
+import { hasLooseId, importLoose, isLooseId } from "@/lib/explorer";
 import { childrenOf, containerOf, parentFor, withSources } from "@/lib/tree";
-import { JUMP_SIZE_ID } from "@/lib/player";
+import { DETAIL_BARS } from "@/lib/player";
 import type { Deck as SyncDeck } from "@/lib/sync";
 import { LayoutDualIcon } from "@/components/icons";
 import { Player } from "@/views/player/Player";
@@ -87,7 +93,7 @@ import type { LibraryQuestion } from "@/views/library/NewLibraryDialog";
 import type { QueueItem } from "@/lib/queue";
 import { TrackFilter } from "@/views/browser/TrackFilter";
 import { EMPTY_FILTER, toSpecFilter, type FilterState } from "@/lib/trackFilter";
-import type { AnalysisResult, DeviceImportMissing, DevicePlaylistEdit, DevicePlaylistImportPlan, FilterValues, LinkPeerSeen, LinkStatus, ListTotals, RelocateSearch, SmartRule, TrackLookups, UnanalysedTracks } from "@/ipc/types";
+import type { AnalysisResult, DeviceFormat, DeviceImportMissing, DevicePlaylistEdit, DevicePlaylistImportPlan, FilterValues, LinkPeerSeen, LinkStatus, ListTotals, RelocateSearch, SmartRule, TrackLookups, UnanalysedTracks } from "@/ipc/types";
 import { statusBarListText } from "@/lib/format";
 import { autoRelocated, missingAmong, relocateSteps, relocateTracks } from "@/lib/relocate";
 import { useTooltip } from "@/store/usePreferences";
@@ -96,7 +102,7 @@ import { nativeMenuLabels } from "@/lib/nativeMenu";
 
 /** The commands the shell itself registers, and so the keys it runs. */
 const SHELL_COMMANDS: ReadonlySet<Action> = new Set<Action>([
-  "volumeUp", "volumeDown", "mute", "focusSearch", "clearSearch", "analyseSelection",
+  "volumeUp", "volumeDown", "mute", "focusSearch", "clearSearch", "analyseSelection", "sortItems",
 ]);
 
 /**
@@ -203,6 +209,9 @@ function AppBody() {
   // Closed by default, which is what browseSetting.xml records for the user's
   // own rekordbox (`ListInfo open="0"`).
   const [infoOpen, setInfoOpen] = useState(restored.infoOpen);
+  // The My Tag window takes the information window's place: opening one
+  // closes the other, as rekordbox's icon column does [OBS 7.2.14, #539].
+  const [myTagOpen, setMyTagOpen] = useState(restored.myTagOpen);
   // Closed unless it was open at exit; browseSetting.xml records
   // `SubBrowse open="0"` for a first run.
   const [subOpen, setSubOpen] = useState(restored.subOpen);
@@ -280,27 +289,27 @@ function AppBody() {
    * value to both, so a wheel over one waveform moves the other with it.
    */
   /**
-   * Which deck the other syncs to.
+   * Which deck the other syncs to, and each deck's BEAT SYNC.
    *
-   * Deck A to begin with, because that is the one a single-player layout has
-   * and the one a first track lands on. Only ever one, which is what MASTER
-   * means.
+   * No deck is the master until one plays; the first to play takes it, as
+   * rekordbox's EXPORT mode does. BEAT SYNC is each deck's own toggle, the
+   * master's included; a lit deck follows only while the other deck is the
+   * master. See `@/lib/syncMaster` for the evidence.
    */
-  const [syncMaster, setSyncMasterState] = useState<DeckId>("a");
-  /**
-   * BEAT SYNC held on, per deck. A deck follows the master's tempo for as
-   * long as its button is lit; the master itself never follows, so making a
-   * deck the master puts its own light out.
-   */
-  const [synced, setSynced] = useState<Record<DeckId, boolean>>({ a: false, b: false });
-  const setSyncMaster = useCallback((deck: DeckId) => {
-    setSyncMasterState(deck);
-    setSynced((s) => (s[deck] ? { ...s, [deck]: false } : s));
-  }, []);
+  const [sync, setSync] = useState<SyncState>(INITIAL_SYNC);
+  const syncMaster = sync.master;
+  const setSyncMaster = useCallback((deck: DeckId) => setSync((s) => pressMaster(s, deck)), []);
   const toggleSync = useMemo(
     () => ({
-      a: () => setSynced((s) => ({ ...s, a: !s.a })),
-      b: () => setSynced((s) => ({ ...s, b: !s.b })),
+      a: () => setSync((s) => toggleBeatSync(s, "a")),
+      b: () => setSync((s) => toggleBeatSync(s, "b")),
+    }),
+    [],
+  );
+  const startedPlaying = useMemo(
+    () => ({
+      a: () => setSync((s) => deckStartedPlaying(s, "a")),
+      b: () => setSync((s) => deckStartedPlaying(s, "b")),
     }),
     [],
   );
@@ -316,7 +325,7 @@ function AppBody() {
     }),
     [],
   );
-  const leaderBpmX100 = playingBpm[syncMaster];
+  const leaderBpmX100 = syncMaster === null ? null : playingBpm[syncMaster];
   /** Each deck's key shift in semitones, so the Traffic Light reads the key the deck sounds in. */
   const [keyShift, setKeyShift] = useState<Record<DeckId, number>>({ a: 0, b: 0 });
   const reportKeyShift = useMemo(
@@ -376,8 +385,10 @@ function AppBody() {
   /**
    * The zoom cluster the two-deck layout shares, registered the same way:
    * one + RST − over the line where the two details meet, and a press
-   * zooms both decks. DUAL CONTROL off, each deck still keeps its own zoom
-   * for the wheel; the cluster is simply pressed on both.
+   * zooms both decks. The wheel over either detail is the same press, as
+   * rekordbox's is (#602). DUAL CONTROL off, each deck still holds its own
+   * zoom, and a step moves each from where it is; RST brings both back to
+   * the default.
    */
   const zoomA = useRef<(by: number) => void>(() => {});
   const zoomB = useRef<(by: number) => void>(() => {});
@@ -410,13 +421,21 @@ function AppBody() {
     setDualBars(bars);
     setWaveformZoom({ a: bars, b: bars });
   }, []);
-  const [dualJump, setDualJump] = useState(JUMP_SIZE_ID);
-  const linked = dual
-    ? {
-        jumpSize: dualJump,
-        onJumpSize: setDualJump,
-      }
-    : {};
+  // RST: both decks back to the default zoom, linked or not (#602).
+  const resetZoom = useCallback(() => setLinkedZoom(DETAIL_BARS), [setLinkedZoom]);
+  // Remembered across runs the same way: each deck's beat-jump size. Linked,
+  // both decks read deck A's and a pick is written to both, so what is shown
+  // is always what is stored and comes back the same after a restart.
+  const [jumpSize, setJumpSize] = useState(restored.jumpSize);
+  const setJumpA = useCallback((id: string) => {
+    setJumpSize((size) => size.a === id ? size : { ...size, a: id });
+  }, []);
+  const setJumpB = useCallback((id: string) => {
+    setJumpSize((size) => size.b === id ? size : { ...size, b: id });
+  }, []);
+  const setLinkedJump = useCallback((id: string) => {
+    setJumpSize({ a: id, b: id });
+  }, []);
   const [query, setQuery] = useState("");
   const [searchField, setSearchField] = useState<TrackSearchField>("all");
   // The tree's width, dragged by the splitter. Held here because the grid that
@@ -428,15 +447,29 @@ function AppBody() {
   const clock = useClock();
   // The table's layout follows the kind of thing being browsed, as
   // browseSetting.xml does, rather than each individual playlist.
-  const columnContext: ColumnContext =
-    selectedNode?.kind === "playlist" || selectedNode?.kind === "smartPlaylist" || selectedNode?.kind === "devicePlaylist"
-      ? "playlist"
-      : selectedNode?.kind === "history"
-        ? "history"
-        : selectedNode?.kind === "directory" || selectedNode?.kind === "explorer"
-          ? "folder"
-          : "collection";
-  const cols = useColumns(columnContext);
+  const columnContext: ColumnContext = columnContextFor(selectedNode?.kind);
+  /**
+   * The artwork display pattern, the two buttons beside MASTER. The main
+   * browser and the sub-browser each have their own pair and their own mode
+   * (rekordbox's `ListViewer` holds an `ArtworkStatus` each), and both keep
+   * the last one chosen under one name, `ArtworkStatus-TrackList`, which both
+   * start from [OBS static, rekordbox 7.2.19: `SubTrackListHeader` makes both
+   * buttons and its `getHeaderType` is 0, the main list's].
+   */
+  const [artworkMode, chooseArtworkMode] = useState<ArtworkMode>(restored.artworkMode);
+  const [subArtworkMode, chooseSubArtworkMode] = useState<ArtworkMode>(restored.artworkMode);
+  const [savedArtworkMode, setSavedArtworkMode] = useState<ArtworkMode>(restored.artworkMode);
+  const setArtworkMode = useCallback((mode: ArtworkMode) => {
+    chooseArtworkMode(mode);
+    setSavedArtworkMode(mode);
+  }, []);
+  const setSubArtworkMode = useCallback((mode: ArtworkMode) => {
+    chooseSubArtworkMode(mode);
+    setSavedArtworkMode(mode);
+  }, []);
+  // Each mode has its own columns, as rekordbox keeps a `-FullArtwork`
+  // layout beside each table's.
+  const cols = useColumns(columnContext, artworkMode);
   // The Preferences window, and the pane it opens on: the missing-file
   // manager lives under Advanced, so the File menu opens it there. In the
   // shell it is a window of its own; in a browser, which has no windows to
@@ -552,7 +585,7 @@ function AppBody() {
    */
   const [trafficLight, setTrafficLight] = useState<TrafficLightSource>(restored.trafficLight);
   const activeTrafficLight = trafficLight === "b" && deckCount(layout) < 2 ? "a" : trafficLight;
-  const trafficDeck: DeckId = deckCount(layout) < 2 ? "a" : activeTrafficLight === "master" ? syncMaster : activeTrafficLight;
+  const trafficDeck: DeckId = deckCount(layout) < 2 ? "a" : activeTrafficLight === "master" ? (syncMaster ?? "a") : activeTrafficLight;
   /*
    * A new track on the master deck, or none, hands MASTER to the other deck
    * when that one holds a track, as rekordbox does: the deck that was
@@ -569,10 +602,10 @@ function AppBody() {
   useEffect(() => {
     const held = masterHeld.current;
     masterHeld.current = { deck: syncMaster, track: masterTrackId };
-    if (held.deck !== syncMaster || held.track === null || held.track === masterTrackId) return;
+    if (syncMaster === null || held.deck !== syncMaster || held.track === null || held.track === masterTrackId) return;
     if (!twoDecks || otherTrackId === null) return;
-    setSyncMasterState(syncMaster === "a" ? "b" : "a");
-  }, [syncMaster, masterTrackId, otherTrackId, twoDecks]);
+    setSyncMaster(syncMaster === "a" ? "b" : "a");
+  }, [syncMaster, masterTrackId, otherTrackId, twoDecks, setSyncMaster]);
   const trafficTrack = trafficDeck === "b" ? playerTrackB : playerTrack;
   const trafficKey = trafficTrack ? transposeKey(trafficTrack.key, keyShift[trafficDeck]) : null;
   const master = useMasterControls();
@@ -584,6 +617,7 @@ function AppBody() {
   // device is opened with, and the metronome's click. On start and on every
   // change, from this window or the Preferences window's storage event.
   const audioPrefs = prefs.preferences.audio;
+  useAudioOutput(audioPrefs.outputDevice);
   useEffect(() => {
     void (async () => {
       const backend = await getBackend();
@@ -1043,6 +1077,14 @@ function AppBody() {
   );
   const commentTrack = useCallback((id: string, comment: string) => commentTracks([id], comment), [commentTracks]);
 
+  const editTrackColor = useCallback((id: string, color: string) => {
+    if (refuseLoose(id)) return;
+    // Let the library-changed event update the table and Info panel only after
+    // the write succeeds. A refused write must leave the previous color visible.
+    void runEdit(t(color === "0" ? "Color cleared." : "Color saved."), (b) =>
+      b.edits.setTrackColor([id], color));
+  }, [refuseLoose, runEdit, t]);
+
   const editTrackField = useCallback(
     (id: string, field: TrackField, value: string) => {
       if (refuseLoose(id)) return;
@@ -1115,28 +1157,28 @@ function AppBody() {
             report(`Nothing added to ${name}${tail}.`);
             return;
           }
-          // Tracks the playlist already holds and keeps once, so the note
-          // counts only the ones that were added.
-          const held = allowDuplicates ? 0 : (await backend.edits.playlistDuplicates(playlistId, trackIds)).length;
           update({ total: trackIds.length, pendingRows: trackIds.length });
           let added = 0;
+          let processed = 0;
+          // Every slice of this add is one step of Edit › Undo (#499).
+          const transaction = crypto.randomUUID();
           try {
             for (const slice of slices(trackIds, ADD_SLICE)) {
               if (signal.aborted) break;
-              await backend.edits.addTracksToPlaylist(playlistId, slice, allowDuplicates);
-              added += slice.length;
-              update({ done: added, pendingRows: trackIds.length - added });
+              const result = await backend.edits.addTracksToPlaylist(playlistId, slice, allowDuplicates, transaction);
+              added += result.added;
+              processed += slice.length;
+              update({ done: processed, pendingRows: trackIds.length - processed });
             }
           } finally {
-            if (added > 0) setTree(withSources(await backend.playlistTree()));
+            if (processed > 0) setTree(withSources(await backend.playlistTree()));
           }
           const noun = (n: number) => `${n} track${n === 1 ? "" : "s"}`;
-          const count = added - held;
-          report(added < trackIds.length
+          report(processed < trackIds.length
             ? `Stopped: added ${added} of ${noun(trackIds.length)} to ${name}${tail}.`
-            : count <= 0
+            : added <= 0
               ? `Already in ${name}${tail}.`
-              : `Added ${noun(count)} to ${name}${tail}.`);
+              : `Added ${noun(added)} to ${name}${tail}.`);
         },
       });
     },
@@ -1232,11 +1274,16 @@ function AppBody() {
           update({ label: t("Adding {count} to {name}", { count: total, name }) });
           const allowDuplicates = signal.aborted ? false : await resolveDuplicates(playlistId, toAdd, name);
           let added = 0;
+          let processed = 0;
+          // Every slice of this add is one step of Edit › Undo (#499); the
+          // import before it is not in the history.
+          const transaction = crypto.randomUUID();
           for (const slice of slices(toAdd, ADD_SLICE)) {
             if (signal.aborted || allowDuplicates === null) break;
-            await backend.edits.addTracksToPlaylist(playlistId, slice, allowDuplicates);
-            added += slice.length;
-            update({ done: total + added, pendingRows: toAdd.length - added });
+            const result = await backend.edits.addTracksToPlaylist(playlistId, slice, allowDuplicates, transaction);
+            added += result.added;
+            processed += slice.length;
+            update({ done: total + processed, pendingRows: toAdd.length - processed });
           }
           setTree(await backend.playlistTree());
           if (analysisPrefs.auto && fresh.length > 0) analysis.add(fresh);
@@ -1244,7 +1291,9 @@ function AppBody() {
           const left = skippedTail(skipped);
           report(signal.aborted
             ? `Stopped: ${noun(added)} added to ${name}${left}${already}.`
-            : `Added ${noun(added)} to ${name}${left}${already}.`);
+            : added === 0 && toAdd.length > 0
+              ? `Already in ${name}${left}${already}.`
+              : `Added ${noun(added)} to ${name}${left}${already}.`);
         },
       });
     },
@@ -1252,38 +1301,75 @@ function AppBody() {
       advancedPrefs.folderDropClash, askFolderClash],
   );
 
+  const importDroppedPathsToCollection = useCallback((paths: string[]) => {
+    if (readOnly) {
+      refuse(refusal(advancedPrefs.protectLibrary));
+      return;
+    }
+    jobs.add({
+      label: t("Adding track data to the Collection"),
+      run: async ({ signal, update }) => {
+        const backend = await getBackend();
+        const files = await backend.listImportFiles(paths);
+        if (signal.aborted) return;
+        if (files.length === 0) {
+          refuse(t("No tracks found to import."));
+          return;
+        }
+        update({ total: files.length });
+        let landed = 0;
+        let imported;
+        try {
+          imported = await importInSlices(files, (slice) => backend.importPathsSlice(slice), signal, (reached, sofar) => {
+            landed = sofar.imported;
+            update({ done: reached });
+          });
+        } finally {
+          if (landed > 0) await backend.reloadLibrary();
+        }
+        if (analysisPrefs.auto && imported.tracks.length > 0) analysis.add(imported.tracks);
+        const already = imported.existing > 0 ? `; ${imported.existing} already in the library` : "";
+        report(`Imported ${imported.imported} of ${files.length} files${skippedTail(imported.skipped)}${already}.`);
+      },
+    });
+  }, [readOnly, advancedPrefs.protectLibrary, refuse, jobs, t, analysisPrefs.auto, analysis, report]);
+
+  const importDroppedPaths = useCallback((target: string, paths: string[]) => {
+    if (target === "all") importDroppedPathsToCollection(paths);
+    else importDroppedPathsTo(target, paths);
+  }, [importDroppedPathsToCollection, importDroppedPathsTo]);
+
   const importDroppedFilesTo = useCallback(
-    (playlistId: string, files: File[]) => {
+    (target: string, files: File[]) => {
       // Resolve immediately: macOS's drag pasteboard belongs to the current
       // OS drag, not to the File object retained by this callback.
       void droppedFilePaths(files)
-        .then((paths) => importDroppedPathsTo(playlistId, paths))
+        .then((paths) => importDroppedPaths(target, paths))
         .catch((e: unknown) => refuse(e instanceof Error ? e.message : "Those files could not be imported."));
     },
-    [importDroppedPathsTo, refuse],
+    [importDroppedPaths, refuse],
   );
 
   useEffect(() => subscribeNativeFileDrops((drop) => {
     const target = document.elementFromPoint(drop.x, drop.y);
     const row = target?.closest<HTMLElement>("[data-file-drop-playlist]");
-    const playlistId = row?.dataset.fileDropPlaylist
+    const dropTarget = row?.dataset.fileDropPlaylist
       ?? (target?.closest('[data-testid="track-scroll"]') && selectedNode?.kind === "playlist"
         ? selectedNode.id
+        : target?.closest('[data-testid="track-scroll"]') && selectedNode?.kind === "allTracks"
+          ? "all"
         : undefined);
-    if (playlistId) importDroppedPathsTo(playlistId, drop.paths);
-    else refuse("Drop files or folders onto a playlist to import them.");
-  }), [selectedNode, importDroppedPathsTo, refuse]);
+    if (dropTarget) importDroppedPaths(dropTarget, drop.paths);
+    else refuse(t("Drop files or folders onto All Tracks or a playlist to import them."));
+  }), [selectedNode, importDroppedPaths, refuse, t]);
 
   /**
-   * The same drop, for files dropped straight into the open playlist's own
-   * list rather than onto its row in the tree — the tree row is easy to miss
-   * with a full list open, and an empty playlist has no rows to aim at.
-   * `undefined` outside a real playlist so the list gives no false promise
-   * of a drop it would not act on.
+   * Files dropped into the open All Tracks or playlist list follow the same
+   * route as their tree rows. Empty lists accept files; other sources do not.
    */
   const importDroppedFilesIntoOpen = useMemo(
     () =>
-      readOnly || selectedNode?.kind !== "playlist"
+      readOnly || (selectedNode?.kind !== "playlist" && selectedNode?.kind !== "allTracks")
         ? undefined
         : (files: File[]) => importDroppedFilesTo(selectedNode.id, files),
     [readOnly, selectedNode, importDroppedFilesTo],
@@ -1297,10 +1383,30 @@ function AppBody() {
    * is there, else shows `kPlayerOperateErrorLoadMissingFile`, "Load error.
    * The file could not be found.", @0x101abb0f4 and returns].
    */
-  const loadOnto = useEventCallback((set: (row: RowDto | null) => void, row: RowDto | null) => {
-    if (row?.missing === true) {
+  const loadRequest = useRef({ a: 0, b: 0 });
+  const loadOnto = useEventCallback(async (deck: DeckId, set: (row: RowDto | null) => void, row: RowDto | null): Promise<boolean> => {
+    const request = ++loadRequest.current[deck];
+    if (row && /^\d+$/.test(row.id)) {
+      // A fetched collection row is only a snapshot. Its audio drive may have
+      // disconnected or returned at the same path since the row was fetched.
+      try {
+        const backend = await getBackend();
+        const missing = await backend.trackMissing(row.id);
+        if (request !== loadRequest.current[deck]) return false;
+        if (missing === true || (missing === null && row.missing === true)) {
+          refuse(t("Load error. The file could not be found."));
+          return false;
+        }
+      } catch (error) {
+        if (request === loadRequest.current[deck]) {
+          refuse(error instanceof Error ? error.message : t("Load error. The file could not be found."));
+        }
+        return false;
+      }
+    } else if (row?.missing === true) {
+      // Loose/device rows are not addressed by trackMissing.
       refuse(t("Load error. The file could not be found."));
-      return;
+      return false;
     }
     // What this session has written to the row since the list read it, an
     // analysis among it: the library is re-read only once a run is over.
@@ -1317,11 +1423,25 @@ function AppBody() {
     if (current && !(current.analysed > 0) && !readOnly && /^\d+$/.test(current.id)) {
       analysis.draw({ id: current.id, title: current.title });
     }
+    return true;
   });
   const deckLoaders = useMemo(() => ({
-    a: (row: RowDto | null) => loadOnto(setPlayerTrack, row),
-    b: (row: RowDto | null) => loadOnto(setPlayerTrackB, row),
+    a: (row: RowDto | null) => { void loadOnto("a", setPlayerTrack, row); },
+    b: (row: RowDto | null) => { void loadOnto("b", setPlayerTrackB, row); },
   }), [loadOnto]);
+  /**
+   * Where deck 1's track was opened from. Whether that list goes on into its
+   * next row is asked when the track ends, as rekordbox does, since it turns
+   * on the layout shown then: see `src/lib/continuousPlay.ts`. A load from
+   * anywhere else leaves a stale entry behind, which the track id no longer
+   * matches.
+   */
+  const continuation = useRef<{ position: ListPosition; trackId: string } | null>(null);
+  const openInDeckA = useCallback(async (row: RowDto | null, from?: ListPosition) => {
+    if (!await loadOnto("a", setPlayerTrack, row)) return false;
+    continuation.current = row && from ? { position: from, trackId: row.id } : null;
+    return true;
+  }, [loadOnto]);
   // The tracks an analysis is drawing for a deck, so the deck shows the
   // waveform before the analysis is over.
   const drawingIds = useMemo(
@@ -1337,15 +1457,15 @@ function AppBody() {
    * frame the app draws.
    */
   const loadDroppedInto = useMemo(() => {
-    const into = (put: (row: RowDto) => void) => () => {
-      const row = draggedTracks?.row;
+    const into = (put: (row: RowDto, position: ListPosition) => void) => () => {
+      const dragged = draggedTracks;
       setDraggedTracks(null);
       // Nothing is written: which track a deck is holding is not part of the
       // library, so this is the one drop that cannot be refused.
-      if (row) put(row);
+      if (dragged) put(dragged.row, dragged.position);
     };
-    return { a: into(deckLoaders.a), b: into(deckLoaders.b) };
-  }, [draggedTracks, deckLoaders]);
+    return { a: into((row, position) => { void openInDeckA(row, position); }), b: into((row) => deckLoaders.b(row)) };
+  }, [draggedTracks, deckLoaders, openInDeckA]);
 
   // Dropping a track onto a CDJ row in the LINK strip tells that player to
   // load it from us over Pro DJ Link.
@@ -1381,21 +1501,6 @@ function AppBody() {
   }, [selectedRow, deckLoaders]);
 
   /**
-   * Where deck 1's track was opened from. Whether that list goes on into its
-   * next row is asked when the track ends, as rekordbox does, since it turns
-   * on the layout shown then: see `src/lib/continuousPlay.ts`. A load from
-   * anywhere else leaves a stale entry behind, which the track id no longer
-   * matches.
-   */
-  const continuation = useRef<{ position: ListPosition; trackId: string } | null>(null);
-  const openInDeckA = useCallback((row: RowDto | null, from?: ListPosition) => {
-    continuation.current = row && from && row.missing !== true
-      ? { position: from, trackId: row.id }
-      : null;
-    deckLoaders.a(row);
-  }, [deckLoaders]);
-
-  /**
    * Loads the row after (or before) deck 1's track in the list it came
    * from, and plays it if `play`: the end of a track (`continuePlaylist`) and
    * the track skip buttons, which rekordbox runs through the same
@@ -1422,8 +1527,7 @@ function AppBody() {
       const [row] = await backend.fetchRows(handle.viewId, index, 1);
       // Something else was loaded while the list was read.
       if (!row || continuation.current !== from) return;
-      openInDeckA(row, { spec: listed, index });
-      if (!play || row.missing === true) return;
+      if (!await openInDeckA(row, { spec: listed, index }) || !play) return;
       await whenLoaded("a", row.id);
       setPlaying("a", true);
     } catch {
@@ -1633,23 +1737,50 @@ function AppBody() {
     [write],
   );
 
-  // Sort Items: the folder's children in name order, case and accents
-  // aside [ASSUME: whether rekordbox puts folders first is not captured],
-  // one move each, from the top.
+  // Sort Items on a folder or the Playlists heading: its children in name
+  // order, one level, folders and playlists together, by the ICU collation
+  // rekordbox uses for the UI's language — all decided and written by the
+  // backend as one Undo step [OBS static, rekordbox 7.2.19:
+  // `TreeViewer::treeMessageSortItem` @0x10156621c]. While the tree is
+  // searched rekordbox refuses it with its own message (the check at
+  // @0x101566324).
   const sortItems = useCallback(
-    (folder: TreeNode) => {
-      const children = childrenOf(tree, folder.id);
-      if (children.length < 2) return;
-      const sorted = [...children].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+    (folder: TreeNode, searching = false) => {
+      if (searching) {
+        refuse(t("Playlist cannot be edited or deleted while searching."));
+        return;
+      }
+      if (readOnly) {
+        explainEditLock();
+        return;
+      }
+      const parent = folder.kind === "collection" ? TREE_ROOT : folder.id;
+      if (childrenOf(tree, parent).length < 2) return;
       write(async (backend) => {
-        for (const [index, node] of sorted.entries()) {
-          await backend.edits.movePlaylist(node.id, folder.id, index);
-        }
-        return `Sorted ${folder.name}.`;
+        const history = await backend.edits.sortItems(parent, viewPrefs.locale);
+        setEditHistory(history);
+        setLibraryEditHistory(history.undoLabel, history.redoLabel);
+        return t("Sorted {name}.", { name: folder.kind === "collection" ? t("Playlists") : folder.name });
       });
     },
-    [tree, write],
+    [tree, write, refuse, t, viewPrefs.locale, readOnly, explainEditLock],
   );
+  // Playlist › Sort Items (0x500d) from a key or the menu bar: the folder
+  // selected in the tree, as rekordbox's command acts on the tree's
+  // selection.
+  // rekordbox runs the menu-bar and key command through the same handler as
+  // the tree's menu (`TreeViewer::performCommand` @0x10157f264 ->
+  // `treeMessageSortItem`), so it refuses over a searched tree as well.
+  const treeSearching = useRef(false);
+  const setTreeSearching = useCallback((searching: boolean) => { treeSearching.current = searching; }, []);
+  useCommands({
+    sortItems: () => {
+      const node = selectedNode;
+      if (node?.kind !== "folder" && node?.kind !== "collection") return false;
+      sortItems(node, treeSearching.current);
+      return true;
+    },
+  });
 
   // Add To Shortcut: the rail takes the playlist as a button of its own.
   // rekordbox 7.2.11 takes the same playlist twice; a second button that
@@ -1764,7 +1895,8 @@ function AppBody() {
     query === "" &&
     spec.filter === undefined;
 
-  // Asked first, as rekordbox asks (its history wording); there is no undo.
+  // Asked first, as rekordbox asks (its history wording). One Undo entry
+  // for the whole selection; play counts stay as they are (#508).
   const removeTracksFromHistory = useCallback(
     async (history: string, ids: readonly string[]): Promise<boolean> => {
       if (ids.length === 0) return false;
@@ -1990,7 +2122,8 @@ function AppBody() {
     [write],
   );
 
-  // Asked first, as rekordbox asks; there is no undo.
+  // Asked first, as rekordbox asks. One Undo entry for the whole selection
+  // (#508).
   const removeFromTagList = useCallback(
     async (ids: readonly string[]): Promise<boolean> => {
       if (ids.length === 0) return false;
@@ -2029,6 +2162,17 @@ function AppBody() {
       })();
     },
     [devices, report, refuse, stickDefaults, compatibilityFormat, t],
+  );
+
+  // Tracks dropped on a stick in the Devices tree: Export Track to it, as
+  // rekordbox exports what is dragged there (manual 7.2.18 p. 108).
+  const exportDraggedTo = useCallback(
+    (path: string) => {
+      const ids = draggedTracks?.ids;
+      setDraggedTracks(null);
+      if (ids && !hasLooseId(ids)) exportTrackTo(path, ids);
+    },
+    [draggedTracks, exportTrackTo],
   );
 
   // Export Loop As WAV: where to, then the loop's stretch of the track.
@@ -2111,13 +2255,14 @@ function AppBody() {
 
   // Analysis writes the result to the library, so it is refused the way any
   // other write is while rekordbox holds the file or the library is protected.
-  const ANALYSIS_REFUSED = "The library is read-only, so nothing can be analysed.";
+  // The message names the real cause, as every other write refusal does.
+  const refuseAnalysis = useEventCallback(() => refuse(refusal(advancedPrefs.protectLibrary)));
   const [analysisSelection, setAnalysisSelection] = useState<readonly QueueItem[] | null>(null);
   /** Capture either browser's selection before opening the settings dialog. */
   const analyseTracks = useEventCallback((tracks: readonly { id: string; title: string }[]) => {
     if (tracks.length === 0) return;
     if (readOnly) {
-      refuse(ANALYSIS_REFUSED);
+      refuseAnalysis();
       return;
     }
     setAnalysisSelection(tracks.map(({ id, title }) => ({ id, title })));
@@ -2134,12 +2279,12 @@ function AppBody() {
   const analyseOne = useCallback(
     (id: string, title: string) => {
       if (readOnly) {
-        refuse(ANALYSIS_REFUSED);
+        refuseAnalysis();
         return;
       }
       setAnalysisSelection([{ id, title }]);
     },
-    [readOnly, refuse],
+    [readOnly, refuseAnalysis],
   );
   // Once, at launch, with Auto Analysis on: rekordbox asks "Auto Analysis is
   // starting." before it analyses the Collection tracks it never analysed.
@@ -2158,7 +2303,7 @@ function AppBody() {
   const startAutoAnalysis = useEventCallback(async (offer: UnanalysedTracks, settings: AnalysisChoice) => {
     setAutoAnalysis(null);
     if (readOnly) {
-      refuse(ANALYSIS_REFUSED);
+      refuseAnalysis();
       return;
     }
     // Gathered before queueing, so stopping the run cannot be undone by a
@@ -2280,6 +2425,7 @@ function AppBody() {
     }
     if (outcome.action === "info") {
       setInfoOpen((open) => !open);
+      setMyTagOpen(false);
       return;
     }
     if (outcome.action === "locate-loaded") {
@@ -2287,9 +2433,10 @@ function AppBody() {
       return;
     }
     if (outcome.action === "bar-command" && outcome.item) {
-      // Track and Playlist menu items: the command the focused list or tree
-      // registered, which its context-menu entry runs too.
-      runCommand(outcome.item.action, { scope: menuBarSide(browserFocus()) });
+      // Track and Playlist items use the same command as their other entry
+      // points. Sort Items is owned by App and has no browser-side scope.
+      runCommand(outcome.item.action, outcome.item.scope === "global"
+        ? undefined : { scope: menuBarSide(browserFocus()) });
       return;
     }
     if (outcome.action === "analyze-track") {
@@ -2336,7 +2483,7 @@ function AppBody() {
         focus: browserFocus(),
         ...menuBarState(),
         // Analyze Track is the shell's own command, not a list's.
-        has: (action, side) => action === "analyseSelection" ? hasCommand(action) : hasCommand(action, side),
+        has: (action, side) => side === undefined ? hasCommand(action) : hasCommand(action, side),
       });
       const changed: Record<string, boolean> = {};
       for (const [id, on] of Object.entries(enabled)) {
@@ -2608,6 +2755,51 @@ function AppBody() {
     },
     [deviceLibraries, deviceBusy, report, refuse, t],
   );
+  const addDraggedToDevice = useCallback((node: TreeNode) => {
+    const drag = draggedTracks;
+    setDraggedTracks(null);
+    const ref = parseDeviceNodeId(node.id);
+    if (!drag || node.kind !== "devicePlaylist" || !ref) return;
+    if (deviceBusy) {
+      refuse(t("Wait for the device to finish before changing its playlists."));
+      return;
+    }
+    setSyncing(true);
+    void (async () => {
+      try {
+        const backend = await getBackend();
+        if (drag.sourceKind === "folder" && drag.ids.some((id) => id.startsWith("file:"))) {
+          const result = await backend.devicePlaylistAddFiles(ref.path, ref.format, ref.id, [...drag.ids]);
+          if (result.changed > 0) report(t("Added to {name}.", { name: node.name }));
+          await deviceLibraries.refresh(ref.path);
+          setDevices(await backend.listDevices());
+          return;
+        }
+        const edit = drag.sourceKind === "device"
+          ? await (async () => {
+            const tracks = [...drag.ids];
+            const held = await backend.devicePlaylistDuplicates(ref.path, ref.format, ref.id, tracks);
+            const duplicates = await askDuplicates(held.length, tracks.length, node.name);
+            return duplicates === null ? null : { kind: "add" as const, playlist: ref.id, tracks, duplicates };
+          })()
+          : await prepareDevicePlaylistDrop(
+            backend, ref.path, ref.format, ref.id, drag.ids, stickDefaults, compatibilityFormat,
+            askDuplicates, node.name,
+          );
+        if (edit === null) return;
+        if (edit.tracks.length === 0) return;
+        const result = await deviceLibraries.edit(ref.path, ref.format, edit);
+        if (result.changed > 0) report(t("Added to {name}.", { name: node.name }));
+        // Export Track can add loose files before the playlist edit. Re-read
+        // both the volume list and the playlist tree after the full operation.
+        setDevices(await backend.listDevices());
+      } catch (error) {
+        refuse(error instanceof Error ? t(error.message) : t("The device library could not be changed."));
+      } finally {
+        setSyncing(false);
+      }
+    })();
+  }, [draggedTracks, deviceBusy, stickDefaults, compatibilityFormat, askDuplicates, deviceLibraries, report, refuse, t]);
   const createOnDevice = useCallback(
     (parent: TreeNode, folder: boolean) => {
       const at = deviceParentFor(parent);
@@ -2659,7 +2851,17 @@ function AppBody() {
   // `importFromDeviceReportWindow` @0x10018b1ec] and its older device
   // import's refusal when no track is in the collection
   // (`importDevicePlaylistLegacy` @0x1016689bc).
-  const [copyPrompt, setCopyPrompt] = useState<{ plan: DevicePlaylistImportPlan; settle: (copy: boolean) => void } | null>(null);
+  // Change… in the question picks another folder for the copies, as
+  // rekordbox's does [static, 7.2.19 `importFromDeviceCopySettingWindow::
+  // buttonClicked` @0x1001d802c]: the plan is asked again for that folder's
+  // free space, and OK copies there.
+  const [copyPrompt, setCopyPrompt] = useState<{
+    plan: DevicePlaylistImportPlan;
+    /** The folder picked with Change…, or null for the default. */
+    chosen: string | null;
+    ref: { path: string; format: DeviceFormat; id: string };
+    settle: (destination: string | null | false) => void;
+  } | null>(null);
   const importFromDevice = useCallback(
     (node: TreeNode) => {
       const ref = parseDeviceNodeId(node.id);
@@ -2669,15 +2871,18 @@ function AppBody() {
         try {
           const preference = advancedPrefs.deviceImportMissing;
           const missing: DeviceImportMissing = preference === "ask" ? "copy" : preference;
+          let destination: string | null = null;
           if (preference === "ask") {
             const plan = await backend.devicePlaylistImportPlan(ref.path, ref.format, ref.id);
             if (plan.files > 0) {
-              const copy = await new Promise<boolean>((settle) => setCopyPrompt({ plan, settle }));
+              const answer = await new Promise<string | null | false>((settle) =>
+                setCopyPrompt({ plan, chosen: null, ref: { path: ref.path, format: ref.format, id: ref.id }, settle }));
               setCopyPrompt(null);
-              if (!copy) return;
+              if (answer === false) return;
+              destination = answer;
             }
           }
-          const result = await backend.devicePlaylistImport(ref.path, ref.format, ref.id, missing);
+          const result = await backend.devicePlaylistImport(ref.path, ref.format, ref.id, missing, destination);
           if (result.cancelled) {
             refuse(`${t("Cannot import the playlist:")} ${result.name} ${result.missing === 1
               ? t("{count} track is not in the collection.", { count: result.missing })
@@ -2693,7 +2898,11 @@ function AppBody() {
               ? `${t("Playlist name was changed because there was a playlist with the same name in your collection.")} "${result.name}"`
               : t("Imported {name}.", { name: result.name }),
           ];
-          if (result.copied > 0) {
+          if (result.copied > 0 && destination !== null) {
+            said.push(result.copied === 1
+              ? t("Copied {count} music file to {folder}.", { count: result.copied, folder: destination })
+              : t("Copied {count} music files to {folder}.", { count: result.copied, folder: destination }));
+          } else if (result.copied > 0) {
             said.push(result.copied === 1
               ? t("Copied {count} music file to PioneerDJ/Imported from Device.", { count: result.copied })
               : t("Copied {count} music files to PioneerDJ/Imported from Device.", { count: result.copied }));
@@ -2785,9 +2994,8 @@ function AppBody() {
    */
   const writeToDevice = useCallback(
     async (playlistId: string, device: { name: string; path: string }): Promise<string> => {
-      const name = tree.find((n) => n.id === playlistId)?.name ?? "the playlist";
       setSyncing(true);
-      report(`Writing ${name} to ${device.name}…`);
+      report(t("Writing to {device}…", { device: device.name }));
       try {
         const backend = await getBackend();
         const written = await backend.exportPlaylist(playlistId, device.path, stickDefaults, deleteUnlistedMusic, compatibilityFormat);
@@ -2806,7 +3014,7 @@ function AppBody() {
         setSyncing(false);
       }
     },
-    [tree, report, refuse, stickDefaults, deleteUnlistedMusic, compatibilityFormat, t],
+    [report, refuse, stickDefaults, deleteUnlistedMusic, compatibilityFormat, t],
   );
 
   const syncToDevice = useCallback(
@@ -2884,10 +3092,14 @@ function AppBody() {
   // Export Playlist / Export Folder › a stick: the tree menu lists the
   // connected sticks, so the export goes straight to the one chosen.
   const exportPlaylist = useCallback((node: TreeNode, path: string) => {
-    const device = devices.find((d) => d.path === path) ?? { name: path, path };
+    const device = devices.find((d) => d.path === path);
+    if (!device) {
+      refuse(t("That device is no longer connected."));
+      return;
+    }
     // Said in the note already; nothing else to do with it here.
     void writeToDevice(node.id, device).catch(() => undefined);
-  }, [devices, writeToDevice]);
+  }, [devices, refuse, t, writeToDevice]);
 
   // The top of the current view, kept only to write the next start's opening
   // screen. The library itself still lives entirely in Rust.
@@ -2922,6 +3134,7 @@ function AppBody() {
       treeExpansion,
       sort: sortState,
       infoOpen,
+      myTagOpen,
       subOpen,
       filterOpen,
       // Only once the real library is up: storing the seed back over itself
@@ -2933,10 +3146,12 @@ function AppBody() {
       subWidth,
       subTreeWidth,
       trafficLight,
+      artworkMode: savedArtworkMode,
       waveformZoom,
+      jumpSize,
       dualControl: dual,
     });
-  }, [sessionReady, treeWidth, selectedNode, treeExpansion, sortState, infoOpen, subOpen, filterOpen, tree, screen, layout, subWidth, subTreeWidth, trafficLight, waveformZoom, dual]);
+  }, [sessionReady, treeWidth, selectedNode, treeExpansion, sortState, infoOpen, myTagOpen, subOpen, filterOpen, tree, screen, layout, subWidth, subTreeWidth, trafficLight, savedArtworkMode, waveformZoom, jumpSize, dual]);
 
   // The last screen, handed to the table until the backend answers. Dropped as
   // soon as the library is up, so a stale row cannot outlive its replacement —
@@ -2961,17 +3176,19 @@ function AppBody() {
 
   const tip = useTooltip();
   const openViewSettings = useCallback(() => openPreferences("view"), [openPreferences]);
-  const ejectA = useCallback(() => setPlayerTrack(null), []);
-  const ejectB = useCallback(() => setPlayerTrackB(null), []);
+  const ejectA = useCallback(() => { loadRequest.current.a++; setPlayerTrack(null); }, []);
+  const ejectB = useCallback(() => { loadRequest.current.b++; setPlayerTrackB(null); }, []);
   const masterA = useCallback(() => setSyncMaster("a"), [setSyncMaster]);
   const masterB = useCallback(() => setSyncMaster("b"), [setSyncMaster]);
   const exportDeckTrack = useCallback((device: string, id: string) => exportTrackTo(device, [id]), [exportTrackTo]);
-  const showInformation = useCallback((row: RowDto) => { setPlayerTrack(row); setInfoOpen(true); }, []);
+  const showInformation = useCallback((row: RowDto) => { loadRequest.current.a++; setPlayerTrack(row); setInfoOpen(true); setMyTagOpen(false); }, []);
   const toggleFilter = useCallback(() => setFilterOpen(was => !was), []);
   const filterBar = useMemo(() => <TrackFilter state={filterState} onChange={setFilterState}
     values={filterValues} masterBpmX100={masterBpmX100} />, [filterState, filterValues, masterBpmX100]);
   const subTree = useMemo(() => ({
     dragging: draggedTracks !== null, onDropTracks: addDraggedTo,
+    canDropToDevicePlaylists: draggedTracks?.sourceKind !== "device", onDropDeviceTracks: addDraggedToDevice,
+    draggingToDevice: draggedTracks !== null && !hasLooseId(draggedTracks.ids), onDropTracksOnDevice: exportDraggedTo,
     onDropFiles: readOnly ? undefined : importDroppedFilesTo,
     onExport: exportPlaylist, exportDevices: menuDevices, onExportFile: exportPlaylistFile, onCreatePlaylist: createPlaylistIn,
     onCreateFolder: createFolderIn, onDeleteNode: deleteNode, onRenameNode: renameNode,
@@ -2979,19 +3196,22 @@ function AppBody() {
     showCounts: viewPrefs.playlistCounts, onOpenSync: openSyncManager,
     onCreateSmartPlaylist: createSmartPlaylistIn, onEditSmartPlaylist: editSmartPlaylist,
     onAddArtwork: addPlaylistArtwork, onAddToShortcut: addToShortcut, onSortItems: sortItems,
+    onDeviceCreate: createOnDevice, onDeviceRename: renameOnDevice,
+    onDeviceDelete: deleteOnDevice, onDeviceImport: importFromDevice,
     onEjectDevice: (node: TreeNode) => { void ejectDeviceFromTree(node); },
     ejectingDeviceId, deviceBusy: syncing || exportRunning || ejectingDeviceId !== null, readOnly,
   }), [
-    draggedTracks, addDraggedTo, readOnly, importDroppedFilesTo, exportPlaylist, menuDevices, exportPlaylistFile,
+    draggedTracks, addDraggedTo, addDraggedToDevice, exportDraggedTo, readOnly, importDroppedFilesTo, exportPlaylist, menuDevices, exportPlaylistFile,
     createPlaylistIn, createFolderIn, deleteNode, renameNode, moveNode, expandNode,
     viewPrefs.playlistCounts, openSyncManager, createSmartPlaylistIn, editSmartPlaylist,
-    addPlaylistArtwork, addToShortcut, sortItems, ejectDeviceFromTree, ejectingDeviceId, syncing,
+    addPlaylistArtwork, addToShortcut, sortItems, createOnDevice, renameOnDevice, deleteOnDevice,
+    importFromDevice, ejectDeviceFromTree, ejectingDeviceId, syncing,
     exportRunning,
   ]);
   const subList = useMemo(() => ({
     onDragTracks: setDraggedTracks, onDragError: refuse, players: deckCount(layout), onLoadTrack: loadTrack,
     onShowInformation: showInformation, onShowInFinder: revealTrack, onRate: rateTrack,
-    onComment: commentTrack, onResetPlayCount: resetPlayCount, onConvertMemoryCues: convertMemoryCues,
+    onComment: commentTrack, onEditColor: editTrackColor, onResetPlayCount: resetPlayCount, onConvertMemoryCues: convertMemoryCues,
     onRemoveFromCollection: removeFromCollection, onImportToCollection: importToCollection,
     onAutoRelocate: autoRelocate, onRelocate: relocate,
     onAnalysisLock: analysisLock, onAddToPlaylist: addToPlaylist, onAddToTagList: addToTagList,
@@ -3004,7 +3224,7 @@ function AppBody() {
     onRemoveTracksFromHistory: removeTracksFromHistory, onReorderPlaylist: reorderPlaylist,
     onDropFilesIntoPlaylist: importDroppedFilesTo, onAnalyseTracks: analyseTracks,
   }), [
-    layout, loadTrack, openInDeckA, showInformation, revealTrack, rateTrack, commentTrack, resetPlayCount,
+    layout, loadTrack, openInDeckA, showInformation, revealTrack, rateTrack, commentTrack, editTrackColor, resetPlayCount,
     convertMemoryCues, removeFromCollection, importToCollection, autoRelocate, relocate, analysisLock, addToPlaylist,
     addToTagList, removeFromTagList, reloadTag, exportTrackTo, menuPlaylists, menuDevices,
     editTrackField, readOnly, explainEditLock, pendingEdits, draggedTracks, addDraggedTo,
@@ -3098,14 +3318,18 @@ function AppBody() {
             transportSlot={deckCount(layout) > 1 ? transportA : null}
             dual={deckCount(layout) > 1}
             publishZoom={deckCount(layout) > 1 ? publishZoom.a : undefined}
+            onWheelZoom={deckCount(layout) > 1 ? zoomBoth : undefined}
             bars={deckCount(layout) > 1 && dual ? dualBars : waveformZoom.a}
             onBars={deckCount(layout) > 1 && dual ? setLinkedZoom : setZoomA}
-            {...(deckCount(layout) > 1 ? linked : {})}
+            jumpSize={jumpSize.a}
+            onJumpSize={deckCount(layout) > 1 && dual ? setLinkedJump : setJumpA}
             publishSync={publishSync.a}
             {...(deckCount(layout) > 1 ? { peerSync: peerSync.a } : {})}
             isMaster={syncMaster === "a"}
             onMaster={masterA}
-            synced={synced.a && syncMaster !== "a"}
+            synced={isFollowing(sync, "a")}
+            syncOn={sync.on.a}
+            onStartPlaying={startedPlaying.a}
             onSyncToggle={deckCount(layout) > 1 ? toggleSync.a : undefined}
             leaderBpmX100={syncMaster === "a" ? null : leaderBpmX100}
             onPlayingBpm={reportPlayingBpm.a}
@@ -3129,18 +3353,23 @@ function AppBody() {
               dragging={draggedTracks !== null}
               onDropTrack={loadDroppedInto.b}
               onLoadSelected={loadSelectedInto.b}
+              selectedTrackId={selectedRow?.id ?? null}
               transportSlot={transportB}
               flipped
               dual
               publishZoom={publishZoom.b}
+              onWheelZoom={zoomBoth}
               bars={dual ? dualBars : waveformZoom.b}
               onBars={dual ? setLinkedZoom : setZoomB}
-              {...linked}
+              jumpSize={dual ? jumpSize.a : jumpSize.b}
+              onJumpSize={dual ? setLinkedJump : setJumpB}
               publishSync={publishSync.b}
               peerSync={peerSync.b}
               isMaster={syncMaster === "b"}
               onMaster={masterB}
-              synced={synced.b && syncMaster !== "b"}
+              synced={isFollowing(sync, "b")}
+              syncOn={sync.on.b}
+              onStartPlaying={startedPlaying.b}
               onSyncToggle={toggleSync.b}
               leaderBpmX100={syncMaster === "b" ? null : leaderBpmX100}
               onPlayingBpm={reportPlayingBpm.b}
@@ -3154,7 +3383,7 @@ function AppBody() {
               After the decks, so it paints over both. */}
           {deckCount(layout) > 1 ? (
             <div className={styles.zoomSlot}>
-              <DualZoom onZoom={zoomBoth} />
+              <DualZoom onZoom={zoomBoth} onReset={resetZoom} />
             </div>
           ) : null}
           <div className={styles.playerGutter} aria-hidden />
@@ -3165,7 +3394,8 @@ function AppBody() {
         className={styles.body}
         ref={bodyRef}
         style={{ ["--tree-w" as string]: `${treeWidth}px` }}
-        data-info={infoOpen ? "" : undefined}
+        data-info={infoOpen || myTagOpen ? "" : undefined}
+        data-mytag={myTagOpen ? "" : undefined}
         data-sub={subOpen ? "" : undefined}
       >
         <TreeView
@@ -3173,7 +3403,11 @@ function AppBody() {
           selectedId={selectedNode?.id ?? null}
           onSelect={setSelectedNode}
           dragging={draggedTracks !== null}
+          canDropToDevicePlaylists={Boolean(draggedTracks)}
+          onDropDeviceTracks={addDraggedToDevice}
           onDropTracks={addDraggedTo}
+          draggingToDevice={draggedTracks !== null && !hasLooseId(draggedTracks.ids)}
+          onDropTracksOnDevice={exportDraggedTo}
           onDropFiles={readOnly ? undefined : importDroppedFilesTo}
           onExport={exportPlaylist}
           exportDevices={menuDevices}
@@ -3194,6 +3428,7 @@ function AppBody() {
           onAddArtwork={addPlaylistArtwork}
           onAddToShortcut={addToShortcut}
           onSortItems={sortItems}
+          onSearchingChange={setTreeSearching}
           railShortcuts={railShortcuts}
           onOpenShortcut={openShortcut}
           onDeleteShortcut={deleteShortcut}
@@ -3261,7 +3496,9 @@ function AppBody() {
           trafficLight={activeTrafficLight}
           onTrafficLight={setTrafficLight}
           trafficKey={trafficKey}
-          onFocusedRow={openInDeckA}
+          artworkMode={artworkMode}
+          onArtworkMode={setArtworkMode}
+          onFocusedRow={(row, from) => { void openInDeckA(row, from); }}
           onSelectedRow={setSelectedRow}
           onDragTracks={setDraggedTracks}
           dragging={draggedTracks !== null}
@@ -3272,6 +3509,7 @@ function AppBody() {
           onLoadTrack={loadTrack}
           onRate={rateTrack}
           onComment={commentTrack}
+          onEditColor={editTrackColor}
           // The sub-browser's list is left out on purpose: it has a source and
           // a sort of its own, which this gate does not describe.
           onReorder={canReorder ? reorderPlaylistTracks : undefined}
@@ -3305,7 +3543,7 @@ function AppBody() {
         )}
         {subOpen ? (
           <SubBrowser
-            nodes={tree}
+            nodes={treeNodes}
             libraryGeneration={libraryGeneration}
             width={subWidth}
             treeWidth={subTreeWidth}
@@ -3316,6 +3554,8 @@ function AppBody() {
             // load decks and take edits the same way.
             tree={subTree}
             list={subList}
+            artworkMode={subArtworkMode}
+            onArtworkMode={setSubArtworkMode}
           />
         ) : null}
         {infoOpen ? (
@@ -3330,12 +3570,26 @@ function AppBody() {
             onRate={rateTracks}
             onComment={commentTracks}
             onEdit={runEdit}
+            onOpenPlaylist={(id) => {
+              const node = tree.find((n) => n.id === id);
+              if (node) setSelectedNode(node);
+            }}
           /></Suspense>
+        ) : null}
+        {myTagOpen ? (
+          <MyTagPanel
+            selection={infoSelection}
+            readOnly={readOnly}
+            libraryGeneration={libraryGeneration}
+            onEdit={runEdit}
+          />
         ) : null}
         <RightRail
           className={styles.rightRail}
+          myTagOpen={myTagOpen}
+          onToggleMyTag={() => { setMyTagOpen((open) => !open); setInfoOpen(false); }}
           infoOpen={infoOpen}
-          onToggleInfo={() => setInfoOpen((open) => !open)}
+          onToggleInfo={() => { setInfoOpen((open) => !open); setMyTagOpen(false); }}
           subOpen={subOpen}
           onToggleSub={() => setSubOpen((open) => !open)}
         />
@@ -3355,7 +3609,26 @@ function AppBody() {
           total={duplicatePrompt.total} onAnswer={duplicatePrompt.settle} />
       ) : null}
       {folderClashPrompt ? <FolderClashDialog name={folderClashPrompt.name} onAnswer={folderClashPrompt.settle} /> : null}
-      {copyPrompt ? <DeviceImportCopyDialog plan={copyPrompt.plan} onAnswer={copyPrompt.settle} /> : null}
+      {copyPrompt ? (
+        <DeviceImportCopyDialog
+          plan={copyPrompt.plan}
+          onAnswer={(copy) => copyPrompt.settle(copy ? copyPrompt.chosen : false)}
+          onChange={() => {
+            void (async () => {
+              const backend = await getBackend();
+              const picked = await backend.pickFolder(t("Music file copy destination:"));
+              if (!picked) return;
+              try {
+                const { path, format, id } = copyPrompt.ref;
+                const plan = await backend.devicePlaylistImportPlan(path, format, id, picked);
+                setCopyPrompt((open) => (open === null ? open : { ...open, plan, chosen: picked }));
+              } catch (e) {
+                refuse(e instanceof Error ? t(e.message) : t("That folder could not be found."));
+              }
+            })();
+          }}
+        />
+      ) : null}
       {missingLibrary !== null ? (
         <NewLibraryDialog key={missingLibrary.kind} problem={missingLibrary}
           onCreate={async () => {
@@ -3383,9 +3656,10 @@ function AppBody() {
         <AnalysisDialog count={analysisSelection.length} initialMode={analysisPrefs.mode}
           initialBpmRange={analysisPrefs.bpmRange}
           initialFirstBeatCue={analysisPrefs.firstBeatCue}
+          initialKey={analysisPrefs.detectKey}
           onCancel={() => setAnalysisSelection(null)}
           onConfirm={settings => {
-            if (readOnly) { refuse(ANALYSIS_REFUSED); return; }
+            if (readOnly) { refuseAnalysis(); return; }
             analysis.add(analysisSelection, settings);
             setAnalysisSelection(null);
           }} />
@@ -3394,6 +3668,7 @@ function AppBody() {
         <AnalysisDialog auto count={autoAnalysis.tracks.length} initialMode={analysisPrefs.mode}
           initialBpmRange={analysisPrefs.bpmRange}
           initialFirstBeatCue={analysisPrefs.firstBeatCue}
+          initialKey={analysisPrefs.detectKey}
           onCancel={() => setAutoAnalysis(null)}
           onConfirm={settings => void startAutoAnalysis(autoAnalysis, settings)} />
       ) : null}

@@ -120,6 +120,7 @@ test("a track dropped on a new playlist is in it, and its menu takes it out agai
   await page.getByRole("alertdialog", { name: "Duplicate tracks" })
     .getByRole("button", { name: "Skip duplicates" }).click();
   await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  await expect(page.getByRole("contentinfo")).toContainText("Already in New playlist.");
 
   await made.click();
   await expect(page.getByTestId("browser-title")).toHaveText("New playlist (1 Tracks)");
@@ -137,6 +138,47 @@ test("a track dropped on a new playlist is in it, and its menu takes it out agai
   await expect(page.getByRole("contentinfo")).toContainText("Removed 1 track.");
   await expect(rows(page)).toHaveCount(0);
   await expect(page.getByTestId("browser-title")).toHaveText("New playlist (0 Tracks)");
+});
+
+test("a repeated input ID reports the one membership actually added", async ({ page }) => {
+  await open(page);
+  await chooseFromTreeMenu(page, item(page, "Hardstyle"), "Create New Playlist");
+  const made = item(page, "New playlist");
+  await expect(made).toBeVisible();
+
+  // The ordinary selection is a Set, so the browser cannot produce repeated
+  // IDs by clicking rows. Inject them at its drag handoff to exercise the UI's
+  // count from the backend result rather than from attempted input IDs.
+  const source = rows(page).nth(1);
+  const title = (await source.locator('[data-col="title"]').innerText()).trim();
+  await source.locator('[data-col="title"]').click();
+  await page.evaluate(() => {
+    const original = Set.prototype[Symbol.iterator];
+    let injected = false;
+    // The first read fills the drag payload; the second passes IDs to App.
+    let selectedReads = 0;
+    Object.defineProperty(Set.prototype, Symbol.iterator, { configurable: true, writable: true, value: function* (this: Set<unknown>) {
+      const values = [...original.call(this)] as unknown[];
+      yield* values;
+      if (!injected && values.length === 1 && typeof values[0] === "string"
+        && /^\d+$/.test(values[0]) && ++selectedReads === 2) {
+        injected = true;
+        Set.prototype[Symbol.iterator] = original;
+        yield values[0];
+      }
+    } });
+    (window as typeof window & { repeatedPlaylistDragInjected?: () => boolean })
+      .repeatedPlaylistDragInjected = () => injected;
+  });
+
+  await source.dragTo(made);
+  expect(await page.evaluate(() => (window as typeof window & { repeatedPlaylistDragInjected?: () => boolean })
+    .repeatedPlaylistDragInjected?.())).toBe(true);
+  await expect(page.getByRole("contentinfo")).toContainText("Added 1 track to New playlist.");
+  await made.click();
+  await expect(page.getByTestId("browser-title")).toHaveText("New playlist (1 Tracks)");
+  await expect(rows(page)).toHaveCount(1);
+  await expect(rows(page).first().locator('[data-col="title"]')).toHaveText(title);
 });
 
 test("Tag List stays available after a library write", async ({ page }) => {
@@ -242,6 +284,20 @@ test("deleting a playlist takes it out of the tree and the view moves off it", a
   await chooseFromTreeMenu(page, item(page, "Drum and Bass"), "Delete Playlist");
   await expect(page.getByRole("treeitem").filter({ hasText: "Drum and Bass" })).toHaveCount(0);
   await expect(item(page, "Eurodance")).toBeVisible();
+});
+
+test("Create New Playlist is one Undo and one Redo (#500)", async ({ page }) => {
+  await open(page);
+  await chooseFromTreeMenu(page, item(page, "Melodic Vox"), "Create New Playlist");
+  await expect(item(page, "New playlist")).toBeVisible();
+
+  const menu = (id: string) => page.evaluate((m) => (window as unknown as { __menu?: (id: string) => void }).__menu?.(m), id);
+  await menu("undo");
+  await expect(page.getByRole("contentinfo")).toContainText("Edit undone.");
+  await expect(page.getByRole("treeitem").filter({ hasText: "New playlist" })).toHaveCount(0);
+  await menu("redo");
+  await expect(page.getByRole("contentinfo")).toContainText("Edit redone.");
+  await expect(item(page, "New playlist")).toBeVisible();
 });
 
 test("a folder's menu deletes the folder", async ({ page }) => {

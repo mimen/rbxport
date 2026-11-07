@@ -51,7 +51,10 @@ pub enum AnlzError {
 
 pub type Result<T> = std::result::Result<T, AnlzError>;
 
-pub use encode::{author, author_with_overview, share_tree_ppth, AnalysisFiles, BandColumn, Existing};
+pub use encode::{
+    author, author_with_overview, author_with_rekordbox_waves, share_tree_ppth, AnalysisFiles, BandColumn, Existing,
+    RekordboxWaves,
+};
 pub use phrase::{Mood, Phrase, PhraseEdit, SongStructure};
 pub use vocal::{VOCAL_FRAME_MS, VOCAL_MAX};
 pub use write::AnlzBuilder;
@@ -182,6 +185,36 @@ impl Section {
         }
         Some(entries)
     }
+
+    /// DAT's legacy `PCOB` entries contain cue positions and loop state,
+    /// without the extended comment or colour fields.
+    pub fn as_legacy_cue_entries(&self) -> Option<Vec<CueEntry>> {
+        if self.tag != FourCc::new(b"PCOB") {
+            return None;
+        }
+        let Some(count) = self.header.get(6..8) else {
+            return Some(Vec::new());
+        };
+        let count = usize::from(u16::from_be_bytes([count[0], count[1]]));
+        let mut entries = Vec::new();
+        for entry in self.payload.chunks_exact(56).take(count) {
+            if entry.get(..4) != Some(b"PCPT") || be32(entry, 8) != 56 {
+                break;
+            }
+            entries.push(CueEntry {
+                hot_cue: be32(entry, 12),
+                active_loop: be32(entry, 16) == 4,
+                kind: entry[28],
+                time_ms: be32(entry, 32),
+                loop_time_ms: be32(entry, 36),
+                color_id: 0,
+                comment: None,
+                color_code: None,
+                rgb: None,
+            });
+        }
+        Some(entries)
+    }
 }
 
 /// One entry of an extended cue list.
@@ -193,6 +226,8 @@ impl Section {
 pub struct CueEntry {
     /// Zero for a memory cue, otherwise the hot cue's slot — 1 is A.
     pub hot_cue: u32,
+    /// The legacy memory loop's active marker (PCPT word at offset 16).
+    pub active_loop: bool,
     /// 1 is a cue, 2 a loop.
     pub kind: u8,
     pub time_ms: u32,
@@ -206,6 +241,34 @@ pub struct CueEntry {
     pub color_code: Option<u8>,
     /// What rekordbox paints for that index.
     pub rgb: Option<[u8; 3]>,
+}
+
+impl CueEntry {
+    /// The `djmdCue.Kind` this entry is stored as: 0 a memory cue, 1-3 hot
+    /// cues A-C, 5-17 D-P (Kind 4 is the Active Loop, not a slot).
+    pub fn library_kind(&self) -> u32 {
+        if self.hot_cue == 0 && self.kind == 2 && self.active_loop { 4 }
+        else if self.hot_cue >= 4 { self.hot_cue + 1 } else { self.hot_cue }
+    }
+
+    /// The `djmdCue.Color` this entry is stored with: a memory cue's colour
+    /// row read back as rekordbox does ([`cues::memory_colour_of_row`]), 255
+    /// for a memory cue without one, and -1 on a hot cue, as RBX writes both.
+    pub fn library_color(&self) -> i64 {
+        if self.hot_cue == 0 {
+            cues::memory_colour_of_row(self.color_id).map_or(255, i64::from)
+        } else {
+            -1
+        }
+    }
+
+    /// The `djmdCue.ColorTableIndex` this entry is stored with: its colour
+    /// code. A hot cue whose entry ends before the code falls back to the
+    /// colour row; a memory cue's colour is [`Self::library_color`], so it
+    /// takes 0, as a memory cue RBX adds does.
+    pub fn library_color_table_index(&self) -> u8 {
+        self.color_code.unwrap_or(if self.hot_cue == 0 { 0 } else { self.color_id })
+    }
 }
 
 /// Magic, the two lengths, the hot cue, the kind, the two times, the colour
@@ -377,6 +440,7 @@ pub fn cue_colour_drawn(index: u8) -> Option<[u8; 3]> {
 fn cue_entry(e: &[u8], len_entry: usize) -> CueEntry {
     let mut entry = CueEntry {
         hot_cue: be32(e, 12),
+        active_loop: false,
         kind: e.get(16).copied().unwrap_or(0),
         time_ms: be32(e, 20),
         loop_time_ms: be32(e, 24),
@@ -555,8 +619,35 @@ impl Anlz {
             .collect()
     }
 
+    /// DAT's legacy cue lists, used when no EXT analysis file is present.
+    pub fn legacy_cue_entries(&self) -> Vec<CueEntry> {
+        self.sections.iter().filter_map(Section::as_legacy_cue_entries).flatten().collect()
+    }
+
     pub fn path(&self) -> Option<String> {
         self.sections.iter().find_map(Section::as_path)
+    }
+
+    /// The file with its `PPTH` naming `path` and every other section
+    /// byte-for-byte as it was; a file without one gains it first.
+    ///
+    /// What rekordbox does to a stick's analysis files when Import Playlist
+    /// copies a track to the computer: the stick's `PPTH` is the full
+    /// `/Contents/…` path, and the copies in the share tree are given the
+    /// new file's [static, rekordbox 7.2.19 macOS arm64:
+    /// `importFromDeviceThread::import_device_analysis` @0x1001db460 copies
+    /// the `.DAT`, `.EXT` and `.2EX`, then
+    /// `CAnalyzerIF::initPathAndDeviceCue` sets their path].
+    #[must_use]
+    pub fn with_path(&self, path: &str) -> Vec<u8> {
+        let replacement = write::path_section(path);
+        let mut sections = self.sections.clone();
+        if let Some(at) = sections.iter().position(|s| s.tag == FourCc::new(b"PPTH")) {
+            sections[at] = replacement;
+        } else {
+            sections.insert(0, replacement);
+        }
+        write::render(&self.header_extra, &sections)
     }
 
     /// Waveform payload and its stride for a given tag.
@@ -735,5 +826,38 @@ mod grid_offset_tests {
             assert_eq!(parsed.with_grid_offset(0).unwrap(), before);
         }
         assert!(Anlz::default().with_grid_offset(1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn a_new_path_replaces_the_old_and_leaves_every_other_section_as_it_was() {
+        let mut stick = write::AnlzBuilder::new();
+        stick
+            .path("/Contents/Artist/Album/track.mp3")
+            .beat_grid(&[Beat { beat_number: 1, tempo_x100: 12800, time_ms: 250 }])
+            .waveform_preview(b"PWAV", &[1, 2, 3])
+            .cue_lists(true);
+        let original = parse(&stick.finish()).unwrap();
+        let moved = parse(&original.with_path("?/track.mp3")).unwrap();
+        assert_eq!(moved.path().as_deref(), Some("?/track.mp3"));
+        assert_eq!(moved.sections.len(), original.sections.len());
+        assert_eq!(moved.sections[1..], original.sections[1..]);
+        assert_eq!(moved.header_extra, original.header_extra);
+        // Back again gives the stick's own bytes.
+        assert_eq!(moved.with_path("/Contents/Artist/Album/track.mp3"), original.to_bytes());
+    }
+
+    #[test]
+    fn a_file_without_a_path_gains_one_first() {
+        let mut bare = write::AnlzBuilder::new();
+        bare.beat_grid(&[Beat { beat_number: 1, tempo_x100: 12000, time_ms: 0 }]);
+        let named = parse(&parse(&bare.finish()).unwrap().with_path("?/a.wav")).unwrap();
+        assert_eq!(named.sections[0].as_path().as_deref(), Some("?/a.wav"));
+        assert!(named.beat_grid().is_some());
     }
 }

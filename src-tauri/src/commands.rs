@@ -6,6 +6,7 @@
 //! instead of taking the process down.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rbl_deck::{Band, Curve};
 use rbl_index::Library;
@@ -692,6 +693,8 @@ pub(crate) enum Touched {
     Metadata(Vec<String>),
     /// History membership, optionally with play counts to refresh.
     Histories(Vec<String>),
+    /// One track's cues, re-read on their own as a cue edit does (#504).
+    Cues(String),
 }
 
 impl Touched {
@@ -718,7 +721,7 @@ where
     let event = touched.event();
     let (generation, history) = blocking(name, move || {
         let _gate = state.edit_gate.lock();
-        let generation = state.write_then(action, |db, ()| refresh_after_edit(&state, db, touched)).map_err(write_error)?;
+        let generation = state.write_history_then(action, |db, ()| refresh_after_edit(&state, db, touched)).map_err(write_error)?;
         // Any non-recorded edit after an undo starts a new branch.
         let mut history = state.edit_history.lock();
         history.clear_redo();
@@ -745,7 +748,7 @@ where
     let event = touched.event();
     let (generation, history) = blocking(name, move || {
         let _gate = state.edit_gate.lock();
-        let generation = state.write_then(action, |db, ()| refresh_after_edit(&state, db, touched))
+        let generation = state.write_history_then(action, |db, ()| refresh_after_edit(&state, db, touched))
             .map_err(write_error)?;
         let mut history = state.edit_history.lock();
         history.clear();
@@ -754,6 +757,35 @@ where
     let _ = tauri::Emitter::emit(&app, event, generation);
     let _ = tauri::Emitter::emit(&app, "edit-history:changed", history);
     Ok(generation)
+}
+
+/// Ends the library history's redo branch after a write the history does
+/// not record (an import, a relocation), as [`edit`] does: a Redo replayed
+/// over that write would put back values it has since changed. `permanent`
+/// drops Undo as well, as [`permanent_edit`] does, for a write that removed
+/// or replaced rows an older entry may name. No caller needs that since an
+/// XML or iTunes import's Replace existing became an entry (#501).
+///
+/// Call it while holding the edit gate taken around the write, so no Undo
+/// can run between the write and this; then [`announce_history`].
+pub(crate) fn wrote_outside_history(state: &AppState, permanent: bool) {
+    let mut history = state.edit_history.lock();
+    if permanent {
+        history.clear();
+    } else {
+        history.clear_redo();
+    }
+}
+
+/// Tells the window what Undo and Redo offer now, after
+/// [`wrote_outside_history`].
+pub(crate) fn announce_history<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &AppState) {
+    let _ = tauri::Emitter::emit(app, "edit-history:changed", current_history(state));
+}
+
+/// What Undo and Redo offer now, as `edit-history:changed` reports it.
+pub fn current_history(state: &AppState) -> EditHistoryDto {
+    history_dto(state.summary().3, &state.edit_history.lock())
 }
 
 fn history_dto(generation: u32, history: &EditHistory) -> EditHistoryDto {
@@ -777,20 +809,42 @@ pub(crate) async fn recorded_edit<R: tauri::Runtime, F>(
 where
     F: FnOnce(&mut rbl_db::write::Writer) -> Result<LibraryEdit, rbl_db::DbError> + Send + 'static,
 {
+    recorded_edit_with(app, state, name, touched, action, move |history, reversible: LibraryEdit| {
+        if !reversible.is_empty() {
+            history.record(reversible, label);
+        }
+    }).await
+}
+
+/// [`recorded_edit`], with the caller deciding how the write's result goes
+/// into the history: an add sent a slice at a time joins the entry its
+/// first slice made (#499).
+pub(crate) async fn recorded_edit_with<R: tauri::Runtime, F, T, G>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    name: &'static str,
+    touched: Touched,
+    action: F,
+    record: G,
+) -> AppResult<EditHistoryDto>
+where
+    F: FnOnce(&mut rbl_db::write::Writer) -> Result<T, rbl_db::DbError> + Send + 'static,
+    T: Send + 'static,
+    G: FnOnce(&mut EditHistory, T) + Send + 'static,
+{
     let state = Arc::clone(&state);
+    let event = touched.event();
     let dto = blocking(name, move || {
         let _gate = state.edit_gate.lock();
-        let (generation, reversible) = state.write_then(
+        let (generation, reversible) = state.write_history_then(
             action,
             |db, reversible| refresh_after_edit(&state, db, touched).map(|generation| (generation, reversible)),
         ).map_err(write_error)?;
         let mut history = state.edit_history.lock();
-        if !reversible.is_empty() {
-            history.record(reversible, label);
-        }
+        record(&mut history, reversible);
         Ok(history_dto(generation, &history))
     }).await?;
-    let _ = tauri::Emitter::emit(&app, "library:changed", dto.generation);
+    let _ = tauri::Emitter::emit(&app, event, dto.generation);
     let _ = tauri::Emitter::emit(&app, "edit-history:changed", dto.clone());
     Ok(dto)
 }
@@ -798,12 +852,68 @@ where
 fn touched_by(edit: &LibraryEdit) -> Touched {
     match edit {
         LibraryEdit::DeletePlaylist(_) | LibraryEdit::RenamePlaylist(_) |
-        LibraryEdit::MovePlaylist(_) | LibraryEdit::RemovePlaylistTracks(_) |
+        LibraryEdit::MovePlaylist(_) | LibraryEdit::SortPlaylists(_) | LibraryEdit::RemovePlaylistTracks(_) |
+        LibraryEdit::CreatePlaylist(_) | LibraryEdit::PlaylistEdit(_) |
+        LibraryEdit::AddPlaylistTracks { .. } | LibraryEdit::ReorderPlaylist(_) |
         // The tracks a replacement imported stay in the collection.
-        LibraryEdit::ReplacePlaylist(_) => Touched::Playlists,
+        LibraryEdit::ReplacePlaylist(_) | LibraryEdit::ReplacePlaylistContents(_) => Touched::Playlists,
         // Tokens keep their database row ids private; a full reload after an
         // undo is uncommon and guarantees every view and sort follows it.
-        LibraryEdit::Track(_) | LibraryEdit::TrackTags(_) => Touched::Tracks,
+        // The index's My Tag list (filters, panel) is read in a full load.
+        LibraryEdit::Track(_) | LibraryEdit::KeyEdit { .. } | LibraryEdit::TrackTags { .. } | LibraryEdit::Relocate(_)
+        | LibraryEdit::MyTagOrder(_) => Touched::Tracks,
+        LibraryEdit::Cues(revision) => Touched::Cues(revision.content().to_owned()),
+        LibraryEdit::ListRemoval(removal) => match removal.list() {
+            rbl_db::write::RemovalList::TagList => Touched::TagList,
+            rbl_db::write::RemovalList::History(_) => Touched::Histories(Vec::new()),
+        },
+    }
+}
+
+/// Refuses, with [`rbl_db::DbError::Conflict`] and before anything is
+/// written, an entry of several steps any one of which no longer finds the
+/// value it expects. An entry of one step, or one written in a single
+/// transaction, is checked by the writer as it runs.
+fn check_history(writer: &rbl_db::write::Writer, edit: &LibraryEdit, undo: bool) -> Result<(), rbl_db::DbError> {
+    match edit {
+        LibraryEdit::Track(values) => values.iter().try_for_each(|value| writer.check_track_edit(value, undo)),
+        // The library's rows and every file the edit wrote, before either is
+        // written (#507).
+        LibraryEdit::KeyEdit { tracks, files } => {
+            tracks.iter().try_for_each(|value| writer.check_track_edit(value, undo))?;
+            crate::key_tag::check_restore(files, undo, TRACK_EDIT)
+        }
+        LibraryEdit::TrackTags { tags, comments } => {
+            tags.iter().try_for_each(|value| writer.check_tag_edit(value, undo))?;
+            comments.iter().try_for_each(|value| writer.check_track_edit(value, undo))
+        }
+        LibraryEdit::DeletePlaylist(_) | LibraryEdit::RenamePlaylist(_) | LibraryEdit::MovePlaylist(_)
+        | LibraryEdit::ReplacePlaylist(_) | LibraryEdit::SortPlaylists(_) | LibraryEdit::RemovePlaylistTracks(_)
+        | LibraryEdit::AddPlaylistTracks { .. } | LibraryEdit::ReorderPlaylist(_)
+        // Checked in the one transaction that writes it (#508).
+        | LibraryEdit::ListRemoval(_)
+        // Checked in the transaction that writes it.
+        | LibraryEdit::MyTagOrder(_)
+        // Every playlist of a replacement is checked in the one transaction
+        // that writes them.
+        | LibraryEdit::ReplacePlaylistContents(_) => Ok(()),
+        // One transaction, but the pad check reads rows the entry does not
+        // name, so it is done here as well as in the writer (#504).
+        LibraryEdit::Cues(revision) => match writer.cue_revision_conflict(revision, undo)? {
+            Some(reason) => Err(rbl_db::DbError::Conflict(reason)),
+            None => Ok(()),
+        },
+        // Checked again in the writer's transaction (#500).
+        LibraryEdit::CreatePlaylist(creation) => match writer.creation_conflict(creation, undo)? {
+            Some(reason) => Err(rbl_db::DbError::Conflict(reason)),
+            None => Ok(()),
+        },
+        LibraryEdit::PlaylistEdit(value) => writer.check_playlist_edit(value, undo),
+        // Checked again in the writer's transaction (#502).
+        LibraryEdit::Relocate(relocation) => match writer.relocation_conflict(relocation, undo)? {
+            Some(reason) => Err(rbl_db::DbError::Conflict(reason)),
+            None => Ok(()),
+        },
     }
 }
 
@@ -813,7 +923,15 @@ fn apply_history(writer: &mut rbl_db::write::Writer, edit: &LibraryEdit, undo: b
         LibraryEdit::RenamePlaylist(value) => if undo { writer.undo_rename(value) } else { writer.redo_rename(value) }.map(|_| ()),
         LibraryEdit::MovePlaylist(value) => if undo { writer.undo_move(value) } else { writer.redo_move(value) }.map(|_| ()),
         LibraryEdit::ReplacePlaylist(value) => if undo { writer.undo_replacement(value) } else { writer.redo_replacement(value) }.map(|_| ()),
+        LibraryEdit::ReplacePlaylistContents(values) => if undo {
+            writer.undo_membership_replacements(values)
+        } else {
+            writer.redo_membership_replacements(values)
+        }.map(|_| ()),
+        LibraryEdit::SortPlaylists(value) => if undo { writer.undo_sort(value) } else { writer.redo_sort(value) }.map(|_| ()),
         LibraryEdit::RemovePlaylistTracks(value) => if undo { writer.undo_track_removal(value) } else { writer.redo_track_removal(value) }.map(|_| ()),
+        LibraryEdit::AddPlaylistTracks { addition, .. } => if undo { writer.undo_track_addition(addition) } else { writer.redo_track_addition(addition) }.map(|_| ()),
+        LibraryEdit::ReorderPlaylist(value) => if undo { writer.undo_reorder(value) } else { writer.redo_reorder(value) }.map(|_| ()),
         LibraryEdit::Track(values) => {
             let ordered: Box<dyn Iterator<Item = _>> = if undo {
                 Box::new(values.iter().rev())
@@ -825,12 +943,115 @@ fn apply_history(writer: &mut rbl_db::write::Writer, edit: &LibraryEdit, undo: b
             }
             Ok(())
         }
-        LibraryEdit::TrackTags(value) => if undo {
-            writer.undo_tag_edit(value)
-        } else {
-            writer.redo_tag_edit(value)
-        }.map(|_| ()),
+        // The files first: they are what can still fail after the check (a
+        // file made read-only since). A failure there has put back the files
+        // it wrote and leaves the library as it was; a failure in the library
+        // puts the files and the tracks already written back (#507).
+        LibraryEdit::KeyEdit { tracks, files } => {
+            crate::key_tag::restore(files, undo, TRACK_EDIT)?;
+            let error = match step_track_edits(writer, tracks, undo) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            let written: Vec<_> = if undo { files.iter().rev().collect() } else { files.iter().collect() };
+            let stranded = crate::key_tag::revert(&written, undo);
+            if stranded == 0 {
+                return Err(error);
+            }
+            Err(rbl_db::DbError::Io(std::io::Error::other(format!(
+                "{error}; {stranded} of {} files could not be changed back",
+                files.len()
+            ))))
+        }
+        LibraryEdit::TrackTags { tags, comments } => step_track_tags(writer, tags, comments, undo),
+        LibraryEdit::MyTagOrder(value) => if undo { writer.undo_my_tag_order(value) } else { writer.redo_my_tag_order(value) }.map(|_| ()),
+        LibraryEdit::Cues(value) => if undo { writer.undo_cue_revision(value) } else { writer.redo_cue_revision(value) }.map(|_| ()),
+        LibraryEdit::CreatePlaylist(value) => if undo { writer.undo_creation(value) } else { writer.redo_creation(value) }.map(|_| ()),
+        LibraryEdit::PlaylistEdit(value) => if undo { writer.undo_playlist_edit(value) } else { writer.redo_playlist_edit(value) }.map(|_| ()),
+        LibraryEdit::Relocate(value) => if undo { writer.undo_relocation(value) } else { writer.redo_relocation(value) }.map(|_| ()),
+        LibraryEdit::ListRemoval(value) => if undo { writer.undo_list_removal(value) } else { writer.redo_list_removal(value) }.map(|_| ()),
     }
+}
+
+/// The history label of an Info panel, rating, colour or comment edit.
+pub(crate) const TRACK_EDIT: &str = "Track Edit";
+
+/// Undoes or redoes a My Tag entry: the tags, and the comments Add "My
+/// Tag" to the "Comments" rewrote with them (#605), the comments in one
+/// transaction. Undo puts the comments back before the tags, Redo writes
+/// them after, so a refused comment step leaves the tags as they were; a
+/// tag step that fails after the comments has them stepped back again.
+fn step_track_tags(
+    writer: &mut rbl_db::write::Writer,
+    tags: &[rbl_db::write::TrackTagEdit],
+    comments: &[rbl_db::write::TrackEdit],
+    undo: bool,
+) -> Result<(), rbl_db::DbError> {
+    let step_tags = |writer: &mut rbl_db::write::Writer| -> Result<(), rbl_db::DbError> {
+        let ordered: Box<dyn Iterator<Item = _>> = if undo { Box::new(tags.iter().rev()) } else { Box::new(tags.iter()) };
+        for value in ordered {
+            if undo { writer.undo_tag_edit(value)?; } else { writer.redo_tag_edit(value)?; }
+        }
+        Ok(())
+    };
+    if !undo {
+        step_tags(writer)?;
+        if comments.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = writer.step_track_edits_at_once(comments, false) {
+            for value in tags.iter().rev() {
+                if let Err(back) = writer.undo_tag_edit(value) {
+                    tracing::error!(%back, "a My Tag edit could not be put back after a failed Redo");
+                }
+            }
+            return Err(error);
+        }
+        return Ok(());
+    }
+    if !comments.is_empty() {
+        writer.step_track_edits_at_once(comments, true)?;
+    }
+    if let Err(error) = step_tags(writer) {
+        if !comments.is_empty() {
+            if let Err(back) = writer.step_track_edits_at_once(comments, false) {
+                tracing::error!(%back, "the My Tag comments could not be written again after a failed Undo");
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Undoes (`undo`, last first) or redoes the steps of a track edit, all or
+/// none: a step that fails has the ones before it put back.
+fn step_track_edits(
+    writer: &mut rbl_db::write::Writer,
+    values: &[rbl_db::write::TrackEdit],
+    undo: bool,
+) -> Result<(), rbl_db::DbError> {
+    let ordered: Vec<&rbl_db::write::TrackEdit> = if undo { values.iter().rev().collect() } else { values.iter().collect() };
+    for (at, value) in ordered.iter().enumerate() {
+        let step = if undo { writer.undo_track_edit(value) } else { writer.redo_track_edit(value) };
+        if let Err(error) = step {
+            let mut stranded = 0usize;
+            for done in ordered.get(..at).unwrap_or_default().iter().rev() {
+                let back = if undo { writer.redo_track_edit(done) } else { writer.undo_track_edit(done) };
+                if let Err(back) = back {
+                    tracing::error!(error = %back, "could not put a track back after a failed Undo or Redo");
+                    stranded += 1;
+                }
+            }
+            if stranded == 0 {
+                return Err(error);
+            }
+            return Err(rbl_db::DbError::Io(std::io::Error::other(format!(
+                "{error}; {stranded} of {} already-changed tracks could not be changed back",
+                ordered.len()
+            ))));
+        }
+    }
+    Ok(())
 }
 
 /// Shared by desktop and CDJ edits; the writer holds the edit gate until
@@ -839,6 +1060,11 @@ pub(crate) fn refresh_after_edit(state: &AppState, db: &rbl_db::Library, touched
     match touched {
         Touched::Metadata(ids) => state.refresh_metadata(db, &ids, false),
         Touched::Histories(ids) if !ids.is_empty() => state.refresh_metadata(db, &ids, true),
+        Touched::Cues(track) => {
+            let library = state.library().map_err(|e| rbl_db::DbError::Open(e.to_string()))?;
+            rbl_index::reload_cues_of(db, &library, &track)?;
+            Ok(state.summary().3)
+        }
         Touched::Tracks => {
             let started = std::time::Instant::now();
             let (library, _) = rbl_index::load(db)?;
@@ -866,6 +1092,7 @@ pub(crate) fn refresh_after_edit(state: &AppState, db: &rbl_db::Library, touched
 pub(crate) fn write_error(error: rbl_db::DbError) -> AppError {
     match error {
         rbl_db::DbError::WriteRefused(reason) => AppError::new(ErrorKind::ReadOnly, reason),
+        rbl_db::DbError::Conflict(reason) => AppError::new(ErrorKind::Conflict, reason),
         other => AppError::new(ErrorKind::Internal, other.to_string()),
     }
 }
@@ -1300,7 +1527,16 @@ fn sync_one_device<R: tauri::Runtime>(
         },
         Err(e) => {
             progress("failed");
-            tracing::warn!(destination, error = %e, detail = e.detail.as_deref().unwrap_or(""), "sync to one device failed");
+            let disk = rbl_devices::survey::disk_holding(std::path::Path::new(&destination));
+            tracing::warn!(
+                destination,
+                file_system = disk.as_ref().map_or("unknown", |d| d.file_system.as_str()),
+                total_bytes = disk.as_ref().map_or(0, |d| d.total_bytes),
+                mount_point = disk.as_ref().map_or("unknown", |d| d.mount_point.as_str()),
+                error = %e,
+                detail = e.detail.as_deref().unwrap_or(""),
+                "sync to one device failed"
+            );
             // The Sync Manager shows this line on its own, so an internal
             // error's detail — what actually failed — goes with its summary.
             let message = e.full_message();
@@ -1324,23 +1560,33 @@ pub async fn estimate_sync(
     let share = state.share_root();
     let state = Arc::clone(&state);
     blocking("estimate_sync", move || {
-        let selection = ExportSelection::from_playlists(&state, &library, &share, &playlists, false)?;
+        // A selection that cannot be built (a library row that does not read)
+        // is every stick's estimate error, with its real cause, rather than a
+        // rejection of the whole command that the interface can only report
+        // as a generic failure (#781).
+        let selection = ExportSelection::from_playlists(&state, &library, &share, &playlists, false);
         let available: std::collections::HashMap<_, _> = rbl_devices::list().into_iter().filter(|d| d.total_bytes > 0).map(|d| (d.mount_point.to_string_lossy().into_owned(), d.free_bytes)).collect();
         Ok(destinations
             .into_iter()
             .map(|path| {
-                let options = rbl_export::ExportOptions { sync: Some(&selection.sync), compatibility: compatibility_format,
-                    cache: Some(&EXPORT_CACHE), ..Default::default() };
-                let plan = selection.for_stick_inspected(&state, &library, &share, std::path::Path::new(&path), delete_unlisted_music.unwrap_or(false), false)
-                    .map_err(|e| rbl_export::ExportError::Conflict(e.to_string()))
-                    .and_then(|selection| rbl_export::plan::preview(std::path::Path::new(&path), &selection.tracks, &selection.playlists, &selection.my_tags, &options));
+                let selected = selection.as_ref().map_or(0, |selection| selection.tracks.len());
+                let plan = match &selection {
+                    Err(e) => Err(rbl_export::ExportError::Conflict(e.full_message())),
+                    Ok(selection) => {
+                        let options = rbl_export::ExportOptions { sync: Some(&selection.sync), compatibility: compatibility_format,
+                            cache: Some(&EXPORT_CACHE), ..Default::default() };
+                        selection.for_stick_inspected(&state, &library, &share, std::path::Path::new(&path), delete_unlisted_music.unwrap_or(false), false)
+                            .map_err(|e| rbl_export::ExportError::Conflict(e.to_string()))
+                            .and_then(|selection| rbl_export::plan::preview(std::path::Path::new(&path), &selection.tracks, &selection.playlists, &selection.my_tags, &options))
+                    }
+                };
                 let (found, net, peak, database_bytes, asset_bytes, unknown_size, kept_existing, approximate, error) = match plan {
                     Ok(plan) => (plan.estimate, plan.net_additional_bytes, plan.peak_bytes, plan.database_bytes, plan.asset_bytes, plan.unknown_size, plan.kept_existing, plan.approximate, None),
                     Err(error) => (rbl_export::estimate::Estimate::default(), 0, 0, 0, 0, true, 0, true, Some(error.to_string())),
                 };
                 let free = available.get(&path).copied();
                 tracing::debug!(
-                    %path, selected = selection.tracks.len(), copy_bytes = found.copy_bytes, reuse_bytes = found.reuse_bytes,
+                    %path, selected, copy_bytes = found.copy_bytes, reuse_bytes = found.reuse_bytes,
                     free_bytes = found.free_bytes, new = found.tracks_new, changed = found.tracks_changed,
                     kept = found.tracks_kept, removed = found.tracks_removed, missing = found.tracks_missing,
                     "sync estimate"
@@ -1670,13 +1916,13 @@ impl ExportSelection {
         // When each plain playlist's entries last changed, which a stick
         // rekordbox synced keeps in its record (#471).
         let plain: Vec<u64> = named.iter().filter(|(_, _, source)| matches!(source, rbl_index::TrackSource::Playlist(_))).map(|(id, _, _)| *id).collect();
-        let (my_tags, extras, db_id, entries_changed) = state
+        let (my_tags, extras, (db_id, cloud_db_id), entries_changed) = state
             .read_db(|db| {
                 let conn = db.connection();
                 Ok((
                     rbl_db::export_info::my_tags(conn)?,
                     rbl_db::export_info::track_extras(conn, &ids)?,
-                    rbl_db::export_info::db_id(conn)?,
+                    (rbl_db::export_info::db_id(conn)?, rbl_db::export_info::cloud_db_id(conn)?),
                     rbl_db::export_info::playlist_entries_changed(conn, &plain)?,
                 ))
             })
@@ -1698,7 +1944,7 @@ impl ExportSelection {
                 })
                 .collect()
         };
-        let sync = rbl_export::SyncSource { db_id, tree, automatic };
+        let sync = rbl_export::SyncSource { db_id, tree, automatic, cloud_db_id };
         let my_tags: Vec<rbl_export::SourceMyTag> = my_tags.iter().map(source_my_tag).collect();
 
         let mut tracks: Vec<rbl_export::SourceTrack> = Vec::new();
@@ -2142,6 +2388,23 @@ fn write_export_registered<R: tauri::Runtime>(
     result
 }
 
+/// What a failed sync says. A stick that filled up says so in rekordbox's
+/// words, "Not enough space available on the device" (its export's message
+/// for running out of room, rekordbox 7.2.19
+/// `browse::BrowseBasicView::dbMessageExportError`), rather than as the
+/// operating system's error (#591). The OS error follows in brackets, as the
+/// Sync Manager shows the message and its detail on one line.
+fn sync_error(e: &rbl_export::ExportError) -> AppError {
+    match e {
+        rbl_export::ExportError::Cancelled => AppError::new(ErrorKind::Cancelled, e.to_string()),
+        rbl_export::ExportError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull => AppError::new(
+            ErrorKind::ReadOnly,
+            "Not enough space available on the device",
+        ).with_detail(format!("({io})")),
+        _ => AppError::new(ErrorKind::Internal, e.to_string()),
+    }
+}
+
 #[allow(clippy::too_many_arguments, reason = "export options and independent progress/cancellation callbacks")]
 fn write_export_with_phase(
     destination: &std::path::Path,
@@ -2191,6 +2454,8 @@ fn write_export_with_phase(
             compatibility: compatibility_format,
             root: preferred_root,
             keep_unlisted: selection.keep_unlisted,
+            db_id_override: None,
+            my_tag_master_db_id_override: None,
             settings_files: &imported_settings,
             cache: Some(&EXPORT_CACHE),
             expected_volume,
@@ -2199,7 +2464,7 @@ fn write_export_with_phase(
         progress,
         cancelled,
     )
-    .map_err(|e| AppError::new(if matches!(e, rbl_export::ExportError::Cancelled) { ErrorKind::Cancelled } else { ErrorKind::Internal }, e.to_string()))?;
+    .map_err(|e| sync_error(&e))?;
     if !report.verified { return Err(AppError::internal("The exported generation was not verified.")); }
     phase("finalizing");
 
@@ -2224,6 +2489,21 @@ fn write_export_with_phase(
     })
 }
 
+/// The disks last written to the log, so a call that finds the same set logs nothing.
+static LOGGED_DISKS: std::sync::LazyLock<std::sync::Mutex<Option<Vec<rbl_devices::survey::DiskDecision>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Logs every disk the OS listed, offered or skipped and why, when that set
+/// differs from the last one logged.
+fn log_disks_if_changed(current: &[rbl_devices::survey::DiskDecision]) {
+    if current.is_empty() { return; }
+    let mut last = LOGGED_DISKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if rbl_devices::survey::changed(last.as_deref(), current) {
+        rbl_devices::survey::log(current);
+        *last = Some(current.to_vec());
+    }
+}
+
 /// Lists the volumes an export could be written to, and what is on each.
 ///
 /// Enumeration is cheap; reading a stick to see what it holds is not, so that
@@ -2232,7 +2512,9 @@ fn write_export_with_phase(
 #[tauri::command]
 pub async fn list_devices() -> AppResult<Vec<DeviceDto>> {
     blocking("list_devices", || {
-        Ok(rbl_devices::list()
+        let (devices, surveyed) = rbl_devices::list_surveyed();
+        log_disks_if_changed(&surveyed);
+        Ok(devices
             .into_iter()
             .map(|device| {
                 let found = rbl_devices::inspect(&device.mount_point);
@@ -2332,13 +2614,7 @@ pub async fn track_beats(
     blocking("track_beats", move || {
         let Some(dat) = dat else { return Ok(Vec::new()) };
         let beats = read_beat_grid(&dat);
-        let mut out: Vec<u8> = Vec::with_capacity(beats.len() * BEAT_BYTES);
-        for (time_ms, number, tempo_x100) in beats {
-            out.extend_from_slice(&time_ms.to_le_bytes());
-            out.push(number);
-            out.extend_from_slice(&tempo_x100.to_le_bytes());
-        }
-        Ok(out)
+        Ok(encode_beat_grid(&beats))
     })
     .await
     .map(tauri::ipc::Response::new)
@@ -2350,6 +2626,7 @@ pub async fn track_beats(
 fn read_beat_grid(path: &std::path::Path) -> Vec<(u32, u8, u16)> {
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
     let Ok(file) = rbl_anlz::parse(&bytes) else { return Vec::new() };
+    let offset = i64::from(file.grid_offset().unwrap_or(0));
     file.sections
         .iter()
         .find_map(rbl_anlz::Section::as_beat_grid)
@@ -2357,12 +2634,28 @@ fn read_beat_grid(path: &std::path::Path) -> Vec<(u32, u8, u16)> {
             beats
                 .iter()
                 .take(MAX_BEATS)
-                .map(|beat| {
-                    (beat.time_ms, u8::try_from(beat.beat_number).unwrap_or(0), beat.tempo_x100)
+                .filter_map(|beat| {
+                    u32::try_from(i64::from(beat.time_ms) + offset).ok().map(|time_ms| {
+                        (time_ms, u8::try_from(beat.beat_number).unwrap_or(0), beat.tempo_x100)
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn encode_beat_grid(beats: &[(u32, u8, u16)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(beats.len() * BEAT_BYTES);
+    for &(time_ms, number, tempo_x100) in beats {
+        out.extend_from_slice(&time_ms.to_le_bytes());
+        out.push(number);
+        out.extend_from_slice(&tempo_x100.to_le_bytes());
+    }
+    out
+}
+
+fn metronome_beat_grid(beats: &[(u32, u8, u16)]) -> Vec<(u32, bool)> {
+    beats.iter().map(|&(ms, number, _)| (ms, number == 1)).collect()
 }
 
 /// Bytes one beat takes in that encoding: `u32` milliseconds, its number, then
@@ -2417,7 +2710,7 @@ pub async fn deck_load<R: tauri::Runtime>(
     if player.loaded_tracks.lock().get(&which) == Some(&track) {
         engine.set_metronome_grid(
             which,
-            &grid.iter().map(|&(ms, number, _)| (ms, number == 1)).collect::<Vec<_>>(),
+            &metronome_beat_grid(&grid),
         );
     }
     Ok(())
@@ -2600,6 +2893,20 @@ pub async fn deck_move(
     Ok(())
 }
 
+/// Count grid beats from the engine head when the command arrives.
+#[tauri::command]
+pub async fn deck_move_grid(
+    player: State<'_, Arc<crate::player::Player>>,
+    deck: String,
+    grid_times_ms: Vec<f64>,
+    beats: f64,
+) -> AppResult<()> {
+    if let Some(engine) = player.opened() {
+        engine.move_grid_beats(crate::player::deck_of(&deck), &grid_times_ms, beats);
+    }
+    Ok(())
+}
+
 /// Sets a deck's loop between two points and turns it on; a head already
 /// past the out point goes back to the in point.
 #[tauri::command]
@@ -2612,6 +2919,29 @@ pub async fn deck_set_loop<R: tauri::Runtime>(
 ) -> AppResult<()> {
     if let Some(engine) = player.opened() {
         engine.set_loop_ms(crate::player::deck_of(&deck), in_ms, out_ms);
+        crate::player::start_ticker(&app);
+    }
+    Ok(())
+}
+
+/// Move a playing loop and the audio head together, with the head offset
+/// measured against the engine's position when this command arrives.
+#[allow(clippy::too_many_arguments, reason = "Tauri command arguments mirror the typed IPC contract")]
+#[tauri::command]
+pub async fn deck_move_loop<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    player: State<'_, Arc<crate::player::Player>>,
+    deck: String,
+    in_ms: f64,
+    out_ms: f64,
+    head_by_ms: f64,
+    grid_times_ms: Vec<f64>,
+    beats: f64,
+) -> AppResult<()> {
+    if let Some(engine) = player.opened() {
+        engine.move_loop_ms(
+            crate::player::deck_of(&deck), in_ms, out_ms, head_by_ms, &grid_times_ms, beats,
+        );
         crate::player::start_ticker(&app);
     }
     Ok(())
@@ -3020,7 +3350,9 @@ pub async fn preview_state(
 /// A hot cue's colour is what rekordbox paints for its `ColorTableIndex`,
 /// from the complete `rbl_anlz::DRAWN_CUE_COLOURS` table extracted from
 /// rekordbox. An invalid index is reported without a colour. A memory cue
-/// never carries one.
+/// carries its MEMORY list colour for `djmdCue.Color` 0-7, and none for
+/// anything else; the frontend draws its waveform marker from it
+/// (`memoryCueColours.ts`).
 #[tauri::command]
 pub async fn track_cues(
     state: State<'_, Arc<AppState>>,
@@ -3267,7 +3599,8 @@ async fn import_files_then<R: tauri::Runtime>(
     let writing = Arc::clone(&state);
     let report = blocking("import_files", move || {
         let files = expand_import_paths(&paths);
-        writing
+        let _gate = writing.edit_gate.lock();
+        let report = writing
             .write(|writer| {
                 let mut imported = 0_u32;
                 let mut skipped = Vec::new();
@@ -3296,14 +3629,21 @@ async fn import_files_then<R: tauri::Runtime>(
                 }
                 Ok(ImportReportDto { imported, skipped, tracks, existing })
             })
-            .map_err(write_error)
+            .map_err(write_error)?;
+        if report.imported > 0 {
+            wrote_outside_history(&writing, false);
+        }
+        Ok(report)
     })
     .await?;
 
     // Only reload if anything landed; a batch that imported nothing has not
     // changed the library.
-    if report.imported > 0 && reload_after {
-        reload(app, state_for_edit).await?;
+    if report.imported > 0 {
+        if reload_after {
+            reload(app.clone(), Arc::clone(&state_for_edit)).await?;
+        }
+        announce_history(&app, &state_for_edit);
     }
     Ok(report)
 }
@@ -3421,6 +3761,9 @@ pub async fn import_folder_playlist<R: tauri::Runtime>(
     Ok(report)
 }
 
+/// The history's name for every relocation run (#502): Undo Relocate.
+pub(crate) const RELOCATE_LABEL: &str = "Relocate";
+
 /// Relocate: points a track at the file chosen for it.
 ///
 /// [OBS rekordbox 7.2.19 static, `MissingFileTable::showFileChooser`
@@ -3440,8 +3783,11 @@ pub async fn relocate_track<R: tauri::Runtime>(
     if held {
         return Ok(false);
     }
-    edit(app, state, "relocate_track", Touched::Tracks, move |w| {
-        w.relocate(&track, std::path::Path::new(&path)).map(|_| ())
+    // One Relocate is one Undo step (#502): Undo points the track back at
+    // its old file, whether or not that file is there; no file is moved.
+    recorded_edit(app, state, "relocate_track", Touched::Tracks, RELOCATE_LABEL, move |w| {
+        w.relocate_manual_with_undo(&[(track, std::path::PathBuf::from(path))])
+            .map(|(_, relocation)| LibraryEdit::Relocate(relocation))
     })
     .await?;
     Ok(true)
@@ -3455,14 +3801,12 @@ pub async fn create_playlist<R: tauri::Runtime>(
     parent: String,
     index: Option<usize>,
 ) -> AppResult<u32> {
-    edit(app, state, "create_playlist", Touched::Playlists, move |w| {
-        let id = w.create_playlist(&name, &parent)?;
-        if index.is_some() {
-            w.move_to(&id, &parent, index)?;
-        }
-        Ok(())
+    recorded_edit(app, state, "create_playlist", Touched::Playlists, "Create Playlist", move |w| {
+        w.create_with_undo(&name, &parent, rbl_db::write::ATTRIBUTE_PLAYLIST, index)
+            .map(|(_, made)| LibraryEdit::CreatePlaylist(made))
     })
     .await
+    .map(|history| history.generation)
 }
 
 /// An intelligent playlist's rule, for the editor. Refused when the rule
@@ -3550,10 +3894,12 @@ pub async fn create_smart_playlist<R: tauri::Runtime>(
     rule: SmartRuleDto,
 ) -> AppResult<u32> {
     let rule = rule_from_dto(&rule)?;
-    edit(app, state, "create_smart_playlist", Touched::Playlists, move |w| {
-        w.create_smart_playlist(&name, &parent, |id| rule.to_xml(id.parse().unwrap_or(0))).map(|_| ())
+    recorded_edit(app, state, "create_smart_playlist", Touched::Playlists, "Create Intelligent Playlist", move |w| {
+        w.create_smart_playlist_with_undo(&name, &parent, |id| rule.to_xml(id.parse().unwrap_or(0)))
+            .map(|(_, made)| LibraryEdit::CreatePlaylist(made))
     })
     .await
+    .map(|history| history.generation)
 }
 
 /// Replaces an intelligent playlist's rule.
@@ -3566,7 +3912,11 @@ pub async fn set_smart_rule<R: tauri::Runtime>(
 ) -> AppResult<u32> {
     let rule = rule_from_dto(&rule)?;
     let xml = rule.to_xml(playlist.parse().unwrap_or(0));
-    edit(app, state, "set_smart_rule", Touched::Playlists, move |w| w.set_smart_list(&playlist, &xml).map(|_| ())).await
+    recorded_edit(app, state, "set_smart_rule", Touched::Playlists, "Edit Intelligent Playlist", move |w| {
+        w.set_smart_list_with_undo(&playlist, &xml).map(|(_, edit)| LibraryEdit::PlaylistEdit(edit))
+    })
+    .await
+    .map(|history| history.generation)
 }
 
 #[tauri::command]
@@ -3576,7 +3926,12 @@ pub async fn create_folder<R: tauri::Runtime>(
     name: String,
     parent: String,
 ) -> AppResult<u32> {
-    edit(app, state, "create_folder", Touched::Playlists, move |w| w.create_folder(&name, &parent).map(|_| ())).await
+    recorded_edit(app, state, "create_folder", Touched::Playlists, "Create Folder", move |w| {
+        w.create_with_undo(&name, &parent, rbl_db::write::ATTRIBUTE_FOLDER, None)
+            .map(|(_, made)| LibraryEdit::CreatePlaylist(made))
+    })
+    .await
+    .map(|history| history.generation)
 }
 
 #[tauri::command]
@@ -3604,6 +3959,23 @@ pub async fn move_playlist<R: tauri::Runtime>(
     }).await
 }
 
+/// Sort Items on a folder, or on the Playlists heading (`folder` is
+/// `"root"`): its children in name order, by the collator rekordbox uses for
+/// `language` (the app's UI language), as one Undo step.
+#[tauri::command]
+pub async fn sort_playlist_items<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    folder: String,
+    language: Option<String>,
+) -> AppResult<EditHistoryDto> {
+    recorded_edit(app, state, "sort_playlist_items", Touched::Playlists, "Sort Items", move |w| {
+        let collator = rbl_index::collate::NameCollator::new(language.as_deref());
+        w.sort_children_with_undo(&folder, |a, b| collator.compare(a, b))
+            .map(|(_, edit)| LibraryEdit::SortPlaylists(edit))
+    }).await
+}
+
 #[tauri::command]
 pub async fn delete_playlist<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -3620,24 +3992,7 @@ pub async fn undo_edit<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
 ) -> AppResult<EditHistoryDto> {
-    let state = Arc::clone(&state);
-    let dto = blocking("undo_edit", move || {
-        let _gate = state.edit_gate.lock();
-        let entry = state.edit_history.lock().undo.last().cloned()
-            .ok_or_else(|| AppError::new(ErrorKind::NotFound, "There is no library edit to undo."))?;
-        let touched = touched_by(&entry.edit);
-        let generation = state.write_then(
-            |w| apply_history(w, &entry.edit, true),
-            |db, ()| refresh_after_edit(&state, db, touched),
-        ).map_err(write_error)?;
-        let mut history = state.edit_history.lock();
-        history.undo.pop();
-        history.redo.push(entry);
-        Ok(history_dto(generation, &history))
-    }).await?;
-    let _ = tauri::Emitter::emit(&app, "library:changed", dto.generation);
-    let _ = tauri::Emitter::emit(&app, "edit-history:changed", dto.clone());
-    Ok(dto)
+    run_history(app, Arc::clone(&state), true).await
 }
 
 #[tauri::command]
@@ -3645,24 +4000,112 @@ pub async fn redo_edit<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
 ) -> AppResult<EditHistoryDto> {
-    let state = Arc::clone(&state);
-    let dto = blocking("redo_edit", move || {
-        let _gate = state.edit_gate.lock();
-        let entry = state.edit_history.lock().redo.last().cloned()
-            .ok_or_else(|| AppError::new(ErrorKind::NotFound, "There is no library edit to redo."))?;
-        let touched = touched_by(&entry.edit);
-        let generation = state.write_then(
-            |w| apply_history(w, &entry.edit, false),
-            |db, ()| refresh_after_edit(&state, db, touched),
-        ).map_err(write_error)?;
-        let mut history = state.edit_history.lock();
-        history.redo.pop();
-        history.undo.push(entry);
-        Ok(history_dto(generation, &history))
-    }).await?;
-    let _ = tauri::Emitter::emit(&app, "library:changed", dto.generation);
-    let _ = tauri::Emitter::emit(&app, "edit-history:changed", dto.clone());
-    Ok(dto)
+    run_history(app, Arc::clone(&state), false).await
+}
+
+/// Edit › Undo or Redo of the library history, and the window told what
+/// the menu offers next. A refused conflicting entry is gone from the
+/// history, so the window hears of that too.
+async fn run_history<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: Arc<AppState>,
+    undo: bool,
+) -> AppResult<EditHistoryDto> {
+    let worker = Arc::clone(&state);
+    let name = if undo { "undo_edit" } else { "redo_edit" };
+    let result = blocking(name, move || step_history(&worker, undo)).await;
+    match &result {
+        Ok((dto, stepped)) => {
+            // A cue entry names its track, as the cue edit itself does,
+            // rather than making every list fetch again (#504); a Tag List
+            // entry tells the Tag List alone, as its removal did (#508).
+            let _ = match stepped {
+                Stepped::Cues(track) => tauri::Emitter::emit(&app, "cues:changed", track),
+                Stepped::TagList => tauri::Emitter::emit(&app, Touched::TagList.event(), dto.generation),
+                Stepped::Library => tauri::Emitter::emit(&app, "library:changed", dto.generation),
+            };
+            let _ = tauri::Emitter::emit(&app, "edit-history:changed", dto.clone());
+        }
+        Err(error) if error.kind == ErrorKind::Conflict => announce_history(&app, &state),
+        Err(_) => {}
+    }
+    result.map(|(dto, _)| dto)
+}
+
+/// What an Undo or Redo changed, for the event the window is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Stepped {
+    Library,
+    TagList,
+    /// One track's cues (#504).
+    Cues(String),
+}
+
+/// Runs the next Undo (`undo`) or Redo entry of the library history.
+///
+/// Every row it would write is checked first against the value the entry
+/// expects there: the edit's result for Undo, what it replaced for Redo.
+/// When something outside the history (a player over LINK, an import,
+/// rekordbox) changed one since, nothing is written, the newer value stays,
+/// and only that entry leaves the history, refused with
+/// [`ErrorKind::Conflict`] and a message saying why. The rest of the
+/// history stays usable: each entry checks its own rows when it runs.
+/// Chris's decision of 2026-10-22 on #506 (refuse, keep unrelated history).
+/// Also answers what the window is to be told changed: the track a cue
+/// entry changed (`cues:changed`), the Tag List (`tag-list:changed`), or
+/// the library (`library:changed`).
+pub(crate) fn step_history(state: &AppState, undo: bool) -> AppResult<(EditHistoryDto, Stepped)> {
+    let _gate = state.edit_gate.lock();
+    let entry = {
+        let history = state.edit_history.lock();
+        if undo { history.undo.last().cloned() } else { history.redo.last().cloned() }
+    }
+    .ok_or_else(|| AppError::new(ErrorKind::NotFound, if undo {
+        "There is no library edit to undo."
+    } else {
+        "There is no library edit to redo."
+    }))?;
+    let touched = touched_by(&entry.edit);
+    let result = state.write_history_then(
+        |w| {
+            check_history(w, &entry.edit, undo)?;
+            apply_history(w, &entry.edit, undo)
+        },
+        |db, ()| refresh_after_edit(state, db, touched),
+    );
+    let mut history = state.edit_history.lock();
+    match result {
+        Ok(generation) => {
+            history.drop_next(undo);
+            let stepped = match &entry.edit {
+                LibraryEdit::Cues(revision) => Stepped::Cues(revision.content().to_owned()),
+                LibraryEdit::ListRemoval(removal) if matches!(removal.list(), rbl_db::write::RemovalList::TagList) => Stepped::TagList,
+                _ => Stepped::Library,
+            };
+            if undo { history.redo.push(entry); } else { history.undo.push(entry); }
+            Ok((history_dto(generation, &history), stepped))
+        }
+        Err(rbl_db::DbError::Conflict(reason)) => {
+            history.drop_next(undo);
+            tracing::info!(label = entry.label, undo, %reason, "library history entry refused: changed since");
+            Err(AppError::new(ErrorKind::Conflict, format!(
+                "Can't {} {}: {reason}. The newer change was kept.",
+                if undo { "undo" } else { "redo" },
+                entry.label,
+            )))
+        }
+        Err(error) => Err(write_error(error)),
+    }
+}
+
+/// Add Tracks to Playlist: one Undo per drop or menu choice (#499). The
+/// window sends a large add a slice at a time, each with the same
+/// `transaction`, and the slices join one history entry.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddTracksResultDto {
+    pub generation: u32,
+    pub added: usize,
 }
 
 #[tauri::command]
@@ -3672,12 +4115,24 @@ pub async fn add_tracks_to_playlist<R: tauri::Runtime>(
     playlist: String,
     tracks: Vec<String>,
     allow_duplicates: Option<bool>,
-) -> AppResult<u32> {
+    transaction: Option<String>,
+) -> AppResult<AddTracksResultDto> {
     let allow = allow_duplicates.unwrap_or(false);
-    edit(app, state, "add_tracks_to_playlist", Touched::Playlists, move |w| {
-        w.add_tracks_allowing(&playlist, &tracks, allow).map(|_| ())
-    })
-    .await
+    let added = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&added);
+    let dto = recorded_edit_with(
+        app,
+        state,
+        "add_tracks_to_playlist",
+        Touched::Playlists,
+        move |w| w.add_tracks_with_undo(&playlist, &tracks, allow).map(|(_, addition)| addition),
+        move |history, addition: rbl_db::write::PlaylistTrackAddition| {
+            count.store(addition.added().len(), Ordering::Relaxed);
+            history.record_addition(addition, transaction, "Add Tracks to Playlist");
+        },
+    )
+    .await?;
+    Ok(AddTracksResultDto { generation: dto.generation, added: added.load(Ordering::Relaxed) })
 }
 
 /// Which of `tracks` the playlist already holds, for the question asked
@@ -3705,19 +4160,31 @@ pub async fn playlist_duplicates(
 }
 
 /// Reload Tag: the file's tags read again over each track's row.
+///
+/// One Undo for the whole selection (#503), labelled "Track Edit" like the
+/// other multi-track edits: every column the files changed, with its exact
+/// value before and after. Undo puts the library's values back; it does not
+/// touch the files. Each track is its own transaction, so a track whose file
+/// cannot be read stops the reload and the tracks already reloaded are put
+/// back first, as [`each_track`] does: it lands on every track or on none.
 #[tauri::command]
 pub async fn reload_tags<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     tracks: Vec<String>,
 ) -> AppResult<u32> {
-    edit(app, state, "reload_tags", Touched::Tracks, move |w| {
+    recorded_edit(app, state, "reload_tags", Touched::Tracks, "Track Edit", move |w| {
+        let mut edits = Vec::new();
         for track in &tracks {
-            w.reload_tags(track)?;
+            match w.reload_tags_with_undo(track) {
+                Ok((_, changed)) => edits.extend(changed),
+                Err(error) => return Err(roll_back(w, &edits, error)),
+            }
         }
-        Ok(())
+        Ok(LibraryEdit::Track(edits))
     })
     .await
+    .map(|dto| dto.generation)
 }
 
 /// Puts tracks on the Tag List, rekordbox's temporary list, on the end.
@@ -3736,8 +4203,10 @@ pub async fn remove_from_tag_list<R: tauri::Runtime>(
     state: State<'_, Arc<AppState>>,
     tracks: Vec<String>,
 ) -> AppResult<u32> {
-    edit(app, state, "remove_from_tag_list", Touched::TagList, move |w| w.tag_list_remove(&tracks).map(|_| ()))
-        .await
+    recorded_list_removal(app, state, "remove_from_tag_list", Touched::TagList, "Remove from Tag List", move |w| {
+        w.tag_list_remove_with_undo(&tracks)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3745,7 +4214,30 @@ pub async fn clear_tag_list<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
 ) -> AppResult<u32> {
-    edit(app, state, "clear_tag_list", Touched::TagList, move |w| w.tag_list_clear().map(|_| ())).await
+    recorded_list_removal(app, state, "clear_tag_list", Touched::TagList, "Clear Tag List", rbl_db::write::Writer::tag_list_clear_with_undo)
+        .await
+}
+
+/// Remove from Tag List, Clear Tag List and Remove from History: one Undo
+/// entry for the whole selection or the whole clear (#508). The window
+/// still asks first, in rekordbox's words; nothing taken off records
+/// nothing. Answers the generation, as the edit did before it was recorded.
+async fn recorded_list_removal<R: tauri::Runtime, F>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    name: &'static str,
+    touched: Touched,
+    label: &'static str,
+    action: F,
+) -> AppResult<u32>
+where
+    F: FnOnce(&mut rbl_db::write::Writer) -> Result<(rbl_db::write::Changed, rbl_db::write::ListRemoval), rbl_db::DbError>
+        + Send
+        + 'static,
+{
+    recorded_edit(app, state, name, touched, label, move |w| action(w).map(|(_, removal)| LibraryEdit::ListRemoval(removal)))
+        .await
+        .map(|dto| dto.generation)
 }
 
 #[tauri::command]
@@ -3934,6 +4426,11 @@ pub async fn import_itunes_selected<R: tauri::Runtime>(
     .await
 }
 
+/// The Edit menu's name for an XML or iTunes import's Replace existing:
+/// "Undo Replace Playlist Contents". It names only what Undo reverses, the
+/// replaced playlists' members, not the tracks the import added.
+const REPLACE_PLAYLIST_CONTENTS: &str = "Replace Playlist Contents";
+
 /// Reads a collection file with `parse` and imports what it holds.
 ///
 /// A folder or playlist the file holds that already stands in the library
@@ -3973,6 +4470,7 @@ async fn import_collection<R: tauri::Runtime>(
         };
         // Looked for under the same edit gate as the import, so nothing can
         // make a same-named list between the question and the write.
+        let _gate = writing.edit_gate.lock();
         let outcome = writing
             .write(|writer| {
                 if !replace {
@@ -3985,7 +4483,7 @@ async fn import_collection<R: tauri::Runtime>(
                 rbl_db::xml::import(writer, &document, &mut on_progress).map(Ok)
             })
             .map_err(write_error)?;
-        let report = match outcome {
+        let mut report = match outcome {
             Ok(report) => report,
             Err(same_named) => {
                 return Ok((XmlImportReportDto {
@@ -4002,6 +4500,20 @@ async fn import_collection<R: tauri::Runtime>(
         // A replaced playlist may have changed without a list or track being
         // made: that, too, needs a reload.
         let changed_playlists = report.playlist_tracks > 0 || report.playlists_replaced > 0;
+        let replacements = std::mem::take(&mut report.replacements);
+        if !replacements.is_empty() {
+            // Replace existing is one step of history (#501): Undo puts back
+            // every replaced playlist's members and order, Redo the file's.
+            // The tracks and lists the import added stay. Recording it also
+            // ends the redo branch; older entries stay, each checking its
+            // own rows when it runs (#506).
+            writing.edit_history.lock().record(
+                LibraryEdit::ReplacePlaylistContents(replacements),
+                REPLACE_PLAYLIST_CONTENTS,
+            );
+        } else if report.imported > 0 || report.playlists > 0 || changed_playlists {
+            wrote_outside_history(&writing, false);
+        }
         Ok((XmlImportReportDto {
             imported: u32::try_from(report.imported).unwrap_or(u32::MAX),
             existing: u32::try_from(report.existing).unwrap_or(u32::MAX),
@@ -4014,7 +4526,8 @@ async fn import_collection<R: tauri::Runtime>(
     })
     .await?;
     if report.imported > 0 || report.playlists > 0 || changed_playlists {
-        reload(app, state_for_reload).await?;
+        reload(app.clone(), Arc::clone(&state_for_reload)).await?;
+        announce_history(&app, &state_for_reload);
     }
     Ok(report)
 }
@@ -4215,7 +4728,33 @@ pub async fn record_play<R: tauri::Runtime>(
     state: State<'_, Arc<AppState>>,
     track: String,
 ) -> AppResult<u32> {
-    edit(app, state, "record_play", Touched::Histories(vec![track.clone()]), move |w| w.record_play(&track).map(|_| ())).await
+    let marked = Arc::clone(&state);
+    let emitter = app.clone();
+    let id = track.clone();
+    let generation = edit(app, state, "record_play", Touched::Histories(vec![track.clone()]), move |w| w.record_play(&track).map(|_| ())).await?;
+    // The track list colours it from now on, as PERFORMANCE mode colours a
+    // track it adds to history (#540).
+    if marked.mark_deck_played(&id) {
+        let _ = tauri::Emitter::emit(&emitter, crate::link::PLAYED_CHANGED, ());
+    }
+    Ok(generation)
+}
+
+/// The tracks the track list colours as played, by id (#540).
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value, reason = "Tauri's State extractor is injected by value")]
+pub fn played_tracks(state: State<'_, Arc<AppState>>) -> Vec<String> {
+    state.played_tracks()
+}
+
+/// Preferences › View › Browse › Coloring of played tracks › RESET: no row
+/// is coloured as played any more (#540).
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value, reason = "Tauri's State extractor and AppHandle are injected by value")]
+pub fn reset_played_tracks<R: tauri::Runtime>(app: tauri::AppHandle<R>, state: State<'_, Arc<AppState>>) {
+    if state.reset_played() {
+        let _ = tauri::Emitter::emit(&app, crate::link::PLAYED_CHANGED, ());
+    }
 }
 
 /// Remove from History: the tracks' plays leave the session.
@@ -4226,8 +4765,8 @@ pub async fn remove_from_history<R: tauri::Runtime>(
     history: String,
     tracks: Vec<String>,
 ) -> AppResult<u32> {
-    edit(app, state, "remove_from_history", Touched::Histories(Vec::new()), move |w| {
-        w.remove_from_history(&history, &tracks).map(|_| ())
+    recorded_list_removal(app, state, "remove_from_history", Touched::Histories(Vec::new()), "Remove from History", move |w| {
+        w.remove_from_history_with_undo(&history, &tracks)
     })
     .await
 }
@@ -4277,6 +4816,7 @@ pub async fn remove_from_collection<R: tauri::Runtime>(
     .await
 }
 
+/// A drag into a new order, or Renumber Track Order: one Undo (#499).
 #[tauri::command]
 pub async fn reorder_playlist<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -4284,7 +4824,11 @@ pub async fn reorder_playlist<R: tauri::Runtime>(
     playlist: String,
     tracks: Vec<String>,
 ) -> AppResult<u32> {
-    edit(app, state, "reorder_playlist", Touched::Playlists, move |w| w.reorder(&playlist, &tracks).map(|_| ())).await
+    recorded_edit(app, state, "reorder_playlist", Touched::Playlists, "Reorder Playlist", move |w| {
+        w.reorder_with_undo(&playlist, &tracks).map(|(_, edit)| LibraryEdit::ReorderPlaylist(edit))
+    })
+    .await
+    .map(|dto| dto.generation)
 }
 
 /// Runs one track edit on each of `tracks` and keeps them as one step of
@@ -4429,6 +4973,58 @@ pub async fn filter_values(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{expand_import_paths, read_analysis};
+
+    #[test]
+    fn imported_dat_grid_correction_reaches_track_beats_and_metronome() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat = dir.path().join("ANLZ0000.DAT");
+        let beats = [
+            rbl_anlz::Beat { time_ms: 250, beat_number: 1, tempo_x100: 12_000 },
+            rbl_anlz::Beat { time_ms: 750, beat_number: 2, tempo_x100: 12_000 },
+            rbl_anlz::Beat { time_ms: 1_150, beat_number: 3, tempo_x100: 15_000 },
+        ];
+        let raw = rbl_anlz::parse(&rbl_anlz::AnlzBuilder::new().beat_grid(&beats).finish()).unwrap();
+        for (offset, times) in [(0, [250, 750, 1_150]), (125, [375, 875, 1_275]), (-100, [150, 650, 1_050])] {
+            std::fs::write(&dat, raw.with_grid_offset(offset).unwrap()).unwrap();
+            let parsed = super::read_beat_grid(&dat);
+            assert_eq!(parsed, [(times[0], 1, 12_000), (times[1], 2, 12_000), (times[2], 3, 15_000)], "offset {offset}");
+            let wire = super::encode_beat_grid(&parsed);
+            assert_eq!(wire.len(), 3 * super::BEAT_BYTES);
+            for (record, &(ms, number, tempo)) in wire.chunks_exact(super::BEAT_BYTES).zip(&parsed) {
+                assert_eq!(record, [&ms.to_le_bytes()[..], &[number], &tempo.to_le_bytes()[..]].concat());
+            }
+            assert_eq!(super::metronome_beat_grid(&parsed), [(times[0], true), (times[1], false), (times[2], false)]);
+        }
+    }
+
+    #[test]
+    fn imported_dat_grid_correction_drops_times_outside_u32() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat = dir.path().join("ANLZ0000.DAT");
+        let beats = [
+            rbl_anlz::Beat { time_ms: 0, beat_number: 1, tempo_x100: 12_000 },
+            rbl_anlz::Beat { time_ms: 250, beat_number: 2, tempo_x100: 12_000 },
+            rbl_anlz::Beat { time_ms: u32::MAX, beat_number: 3, tempo_x100: 15_000 },
+        ];
+        let raw = rbl_anlz::parse(&rbl_anlz::AnlzBuilder::new().beat_grid(&beats).finish()).unwrap();
+        for (offset, expected) in [(-1, vec![(249, 2, 12_000), (u32::MAX - 1, 3, 15_000)]), (1, vec![(1, 1, 12_000), (251, 2, 12_000)])] {
+            std::fs::write(&dat, raw.with_grid_offset(offset).unwrap()).unwrap();
+            assert_eq!(super::read_beat_grid(&dat), expected, "offset {offset}");
+        }
+    }
+
+    /// A stick that fills up mid-sync says so as rekordbox does, keeping the
+    /// operating system's error as the detail (#591).
+    #[test]
+    fn a_full_stick_fails_the_sync_in_rekordboxs_words() {
+        let full = rbl_export::ExportError::Io(std::io::Error::new(std::io::ErrorKind::StorageFull, "There is not enough space on the disk. (os error 112)"));
+        let error = super::sync_error(&full);
+        assert_eq!(error.message, "Not enough space available on the device");
+        assert_eq!(error.full_message(), "Not enough space available on the device (There is not enough space on the disk. (os error 112))");
+        assert_eq!(super::sync_error(&rbl_export::ExportError::Cancelled).kind, crate::error::ErrorKind::Cancelled);
+        let other = super::sync_error(&rbl_export::ExportError::Io(std::io::Error::other("bad sector")));
+        assert_eq!((other.kind, other.message.as_str()), (crate::error::ErrorKind::Internal, "bad sector"));
+    }
 
     /// A track whose analysis folder is gone from disk is exported without
     /// analysis; it does not stop the export of everything else.
@@ -4626,6 +5222,32 @@ mod tests {
         let want = ["Second", "First"];
         assert_eq!(roots(snapshot.legacy.as_ref().unwrap()), want, "export.pdb");
         assert_eq!(roots(snapshot.one.as_ref().unwrap()), want, "exportLibrary.db");
+        assert!(rbl_export::verify(&stick).unwrap().is_ok());
+    }
+
+    /// #781, #782, #774: a library cue at a negative position (the report's
+    /// "Integer -121 out of range at index 2") stopped the selection, so the
+    /// estimate for every stick failed before any stick was read. The cue is
+    /// kept at the track's start, and the stick estimates and syncs.
+    #[test]
+    fn a_library_cue_at_a_negative_position_still_estimates_and_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, location, stick_dir) = export_rig(dir.path(), |_| {});
+        for index in 0..rbl_db::fixture::Shape::default().tracks {
+            rbl_db::fixture::add_raw_cue(&location, index, -121).unwrap();
+        }
+        reload(&state, &location);
+        let stick = stick_dir.path().to_path_buf();
+        let a = rbl_db::fixture::playlist_id(0);
+        let library = state.library().unwrap();
+
+        let selection = super::ExportSelection::from_playlists(&state, &library, &location.share_root, &[a], false).unwrap();
+        let at_start = selection.tracks.iter().filter(|t| t.cues.as_ref().is_some_and(|cues| cues.iter().any(|cue| cue.time_ms == 0))).count();
+        assert!(at_start > 0, "the cue is kept, at the start of the track");
+        let options = rbl_export::ExportOptions { sync: Some(&selection.sync), ..Default::default() };
+        let plan = rbl_export::plan::preview(&stick, &selection.tracks, &selection.playlists, &selection.my_tags, &options).unwrap();
+        assert!(plan.estimate.tracks_new > 0, "the estimate counts the tracks");
+        super::write_export_with_phase(&stick, &selection, None, None, None, false, &mut |_| {}, &mut |_| {}, &|| false).unwrap();
         assert!(rbl_export::verify(&stick).unwrap().is_ok());
     }
 

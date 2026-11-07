@@ -34,6 +34,11 @@ export interface RowDto {
   hotCues: RowCue[];
   /** Memory-cue and memory-loop start positions, in milliseconds. */
   memoryCues?: number[];
+  /**
+   * Each memory cue's own colour, in `memoryCues` order: `djmdCue.Color` 0-7,
+   * 255 for none. Absent when none has one.
+   */
+  memoryCueColours?: number[];
   artworkHue: number;
   /** Whether the backend can serve artwork for this track. */
   hasArtwork: boolean;
@@ -240,7 +245,12 @@ export interface Diagnostics {
 
 /** Every command returns this shape on failure. */
 export interface AppErrorDto {
-  kind: "readOnly" | "notFound" | "malformed" | "cancelled" | "internal";
+  /**
+   * `conflict`: an Undo or Redo was refused because what it would write was
+   * changed since by something outside the history; nothing was written and
+   * the entry is gone (#506).
+   */
+  kind: "readOnly" | "notFound" | "malformed" | "cancelled" | "conflict" | "internal";
   message: string;
   detail?: string;
 }
@@ -416,7 +426,8 @@ export interface Backend {
    * decodes, and `onAnalysisProgress` says when there is more of it. That
    * costs a second waveform pass, so a batch leaves it off.
    */
-  analyseTrack(trackId: string, mode?: "rekordbox" | "rbxport", settings?: AnalysisSettings, keyTag?: KeyDisplay, drawing?: boolean): Promise<AnalysisResult>;
+  analysisStages(): Promise<AnalysisStageDescriptor[]>;
+  analyseTrack(trackId: string, mode?: "rekordbox" | "rbxport", settings?: AnalysisSettings, keyTag?: KeyDisplay, drawing?: boolean, keyDisplay?: KeyDisplay): Promise<AnalysisResult>;
 
   /**
    * A track's whole beat grid, as raw bytes: seven per beat, a little-endian
@@ -668,6 +679,16 @@ export interface Backend {
   takeLinkMasterTempo(): Promise<LinkStatus>;
   /** Called as LINK turns on or off and as the players change. */
   onLinkStatus(listener: (status: LinkStatus) => void): () => void;
+  /**
+   * The tracks the track list colours as played, by id: those the deck
+   * recorded a play of, and while LINK is on those a player added to its
+   * history (#540).
+   */
+  playedTracks(): Promise<string[]>;
+  /** Coloring of played tracks › RESET: nothing is coloured as played. */
+  resetPlayedTracks(): Promise<void>;
+  /** Called as the played tracks change; LINK turning on or off is `onLinkStatus`. */
+  onPlayedChanged(listener: () => void): () => void;
 
   /**
    * The decks.
@@ -691,12 +712,17 @@ export interface Backend {
   deckSeek(deck: DeckId, positionMs: number): Promise<void>;
   /** Moves the playhead by `byMs` from where the engine has it now. */
   deckMove(deck: DeckId, byMs: number): Promise<void>;
+  /** Count grid beats from the engine's head when the command arrives. */
+  deckMoveGrid(deck: DeckId, gridTimesMs: number[], beats: number): Promise<void>;
   /**
    * Sets a loop between two points and turns it on. A head already past
    * the out point goes back to the in point. The deck rounds at the out
    * point itself, on the frame, with nothing faded at the seam.
    */
   deckSetLoop(deck: DeckId, inMs: number, outMs: number): Promise<void>;
+  /** Move loop bounds and the engine head together by grid-derived distances. */
+  deckMoveLoop(deck: DeckId, inMs: number, outMs: number, headByMs: number,
+    gridTimesMs: number[], beats: number): Promise<void>;
   /** RELOOP (on): back in from the in point. EXIT (off): out, the range kept. */
   deckLoopActive(deck: DeckId, on: boolean): Promise<void>;
   deckClearLoop(deck: DeckId): Promise<void>;
@@ -845,9 +871,22 @@ export interface Backend {
   /**
    * A page of the Missing File Manager's list, `limit` tracks from `offset`.
    * `rescan` checks every track's file again; otherwise the page comes from
-   * the last check.
+   * the last check. `keepOrder` makes such a check keep the list's sorted
+   * order, as rekordbox's list keeps it after a relocate or delete.
    */
-  missingTracks(offset: number, limit: number, rescan: boolean): Promise<MissingTracks>;
+  missingTracks(offset: number, limit: number, rescan: boolean, keepOrder?: boolean): Promise<MissingTracks>;
+  /**
+   * Whether a track's file is gone, looked at now: rekordbox looks again
+   * at the one row selected (`BrowseBasicView::updateMissingStatus`).
+   * `null` for an id that is not a collection track.
+   */
+  trackMissing(trackId: string): Promise<boolean | null>;
+  /**
+   * A click on a Missing File Manager column heading: the list, as it
+   * stands, sorted by that column, forwards or backwards, rekordbox's way
+   * (`relocate::sorted_rows`).
+   */
+  sortMissingTracks(column: MissingColumn, forwards: boolean): Promise<void>;
   /**
    * The Missing File Manager's Delete: the missing tracks named, or every
    * missing track when `tracks` is null, leave the collection and every
@@ -1044,12 +1083,16 @@ export interface Backend {
    * tree. A stick with neither answers with none.
    */
   deviceLibraries(path: string): Promise<DeviceLibrary[]>;
+  /** Maps collection track ids to rows already in one of a stick's libraries. */
+  devicePlaylistCollectionTracks(path: string, format: DeviceFormat, tracks: string[]): Promise<(string | null)[]>;
   /**
    * Changes one library's playlists on a stick, as rekordbox's Devices tree
    * does: that library only, never the other. Resolves to the playlist or
    * folder the edit was about (the new one for a create).
    */
   devicePlaylistEdit(path: string, format: DeviceFormat, edit: DevicePlaylistEdit): Promise<DevicePlaylistEditResult>;
+  /** Analyse files already on this stick and add them to an existing device playlist in one publication. */
+  devicePlaylistAddFiles(path: string, format: DeviceFormat, playlist: string, tracks: string[]): Promise<DevicePlaylistEditResult>;
   /**
    * The rows of `tracks` whose track a stick playlist already holds, each
    * once: what rekordbox asks Add or Skip about before adding. Only reads.
@@ -1061,15 +1104,19 @@ export interface Backend {
    * stick playlist's tracks in its order. `missing` says what happens to a
    * track the collection does not have: `copy` copies its file to
    * `PioneerDJ/Imported from Device` in the Music folder and imports it
-   * (never over an existing file), `matched` leaves it out, `cancel`
-   * imports nothing. Writes the user's library; the stick is only read.
+   * (never over an existing file), with the stick's BPM, key, analysis
+   * files and cues, `matched` leaves it out, `cancel` imports nothing.
+   * `destination` is the folder picked with Change… for the copies, an
+   * existing folder; null or absent for `PioneerDJ/Imported from Device`.
+   * Writes the user's library; the stick is only read.
    */
-  devicePlaylistImport(path: string, format: DeviceFormat, id: string, missing: DeviceImportMissing): Promise<DevicePlaylistImportResult>;
+  devicePlaylistImport(path: string, format: DeviceFormat, id: string, missing: DeviceImportMissing, destination?: string | null): Promise<DevicePlaylistImportResult>;
   /**
    * What Import Playlist would copy for one of a stick's playlists, for the
-   * question rekordbox asks first. Only reads.
+   * question rekordbox asks first, copying to `destination` (see
+   * `devicePlaylistImport`). Only reads.
    */
-  devicePlaylistImportPlan(path: string, format: DeviceFormat, id: string): Promise<DevicePlaylistImportPlan>;
+  devicePlaylistImportPlan(path: string, format: DeviceFormat, id: string, destination?: string | null): Promise<DevicePlaylistImportPlan>;
 
   /**
    * One track's full record: what the information panel's Summary and Info
@@ -1079,6 +1126,7 @@ export interface Backend {
    * are wanted for one track at a time. About 1 KB.
    */
   trackDetails(trackId: string): Promise<TrackDetails>;
+  trackPlaylists(trackId: string): Promise<RelatedPlaylist[]>;
 
   /**
    * Several tracks for the information panel's multiple selection: the
@@ -1089,6 +1137,12 @@ export interface Backend {
 
   /** What the Info tab's Key and Genre dropdowns offer: what the library holds. */
   trackLookups(): Promise<TrackLookups>;
+
+  /**
+   * The My Tags every one of `trackIds` has: what the My Tag panel ticks.
+   * rekordbox ticks a tag only when all the selected tracks carry it.
+   */
+  selectionMyTags(trackIds: readonly string[]): Promise<string[]>;
 }
 
 /** Which deck. Two, named rather than indexed, as the mixer is. */
@@ -1400,6 +1454,10 @@ export interface DevicePlaylistImportResult {
   missing: number;
   /** Files copied to the computer and added to the collection. */
   copied: number;
+  /** Of those, the tracks given the stick's BPM, key, analysis files and cues. */
+  analysed: number;
+  /** Of those, the tracks the stick's analysis could not be given to. */
+  analysisFailed: number;
   /** Nothing was imported because a track was missing and the choice was to cancel. */
   cancelled: boolean;
 }
@@ -1682,6 +1740,17 @@ export interface ExportProgress {
 }
 
 /** Results selected for replacement, and timing options for this batch. */
+export interface AnalysisStageDescriptor {
+  id: string;
+  label: string;
+  description: string;
+  requires: string[];
+  produces: string[];
+  defaultEnabled: boolean;
+  requiresFullTrack: boolean;
+  revision: string;
+}
+
 export interface AnalysisSettings {
   bpmGrid: boolean;
   key: boolean;
@@ -1690,10 +1759,16 @@ export interface AnalysisSettings {
   maxBpm: number;
   /** Add a memory cue on the new grid's first beat unless one is there. */
   firstBeatCue: boolean;
+  /** Explicit selected stage order; omitted callers retain the legacy preset. */
+  stageOrder?: string[];
+  extensionStages?: string[];
+  stageSettings?: Record<string, unknown>;
 }
 
 /** What analysing one track found, now written to the library. */
 export interface AnalysisResult {
+  analysisArtifacts?: Record<string, unknown>;
+  completedStages?: string[];
   trackId: string;
   /** Key-only analysis preserves the existing analysed marker. */
   analysed?: number;
@@ -1847,6 +1922,9 @@ export interface UnanalysedTracks {
   next: number | null;
 }
 
+/** A Missing File Manager column, by its heading. */
+export type MissingColumn = "title" | "artist" | "album" | "location";
+
 export interface MissingTracks {
   /** Every missing track, not just the ones in this page. */
   total: number;
@@ -1898,14 +1976,24 @@ export interface Edits {
    * the node has been lifted out of wherever it was. Omitted, it is appended.
    */
   movePlaylist(id: string, parent: string, index?: number): Promise<EditHistoryState>;
+  /**
+   * Sort Items: the children of `folder` (`TREE_ROOT` for the Playlists
+   * heading) put in name order, one level, playlists and folders together,
+   * by the ICU collation rekordbox uses for `language` (a BCP 47 tag, the
+   * UI's language). One Undo step; a folder already in order is not written
+   * and records nothing.
+   */
+  sortItems(folder: string, language?: string): Promise<EditHistoryState>;
   deletePlaylist(id: string): Promise<EditHistoryState>;
   undoEdit(): Promise<EditHistoryState>;
   redoEdit(): Promise<EditHistoryState>;
   /**
    * Adds tracks to the end of a playlist. A track the playlist already holds
    * is left out unless `allowDuplicates` is true, which adds it again.
+   * One add is one step of Edit › Undo: the slices of one drop or menu
+   * choice share a `transaction` and join one entry (#499).
    */
-  addTracksToPlaylist(playlist: string, tracks: string[], allowDuplicates?: boolean): Promise<number>;
+  addTracksToPlaylist(playlist: string, tracks: string[], allowDuplicates?: boolean, transaction?: string): Promise<{ generation: number; added: number }>;
   /** The ones of `tracks` the playlist already holds. */
   playlistDuplicates(playlist: string, tracks: string[]): Promise<string[]>;
   /** Reload Tag: the files' tags read again over the rows. */
@@ -1923,6 +2011,7 @@ export interface Edits {
   removeFromHistory(history: string, tracks: string[]): Promise<number>;
   /** Remove from Collection: the tracks leave the library and every playlist. The files stay. */
   removeFromCollection(tracks: string[]): Promise<number>;
+  /** A new order, or Renumber Track Order: one step of Edit › Undo (#499). */
   reorderPlaylist(playlist: string, tracks: string[]): Promise<number>;
   /**
    * The edits below take every track they apply to — one from the list, or
@@ -1944,8 +2033,40 @@ export interface Edits {
    */
   /** `writeKeyTag`: an edited key also goes into each track's file. */
   setTrackField(tracks: readonly string[], field: TrackField, value: string, options?: { writeKeyTag?: boolean }): Promise<EditHistoryState>;
-  /** Sets the My Tags on a track to exactly these ids. */
-  setMyTags(track: string, tags: string[]): Promise<EditHistoryState>;
+  /**
+   * Sets the My Tags on a track to exactly these ids. `comments` (Add "My
+   * Tag" to the "Comments" on, #605) rewrites its comment in the same step.
+   */
+  setMyTags(track: string, tags: string[], comments?: boolean): Promise<EditHistoryState>;
+  /**
+   * A tick in the My Tag panel: `tag` goes on every one of `tracks` (`on`)
+   * or comes off them, as one step of history. `comments` as for `setMyTags`,
+   * for every one of `tracks`.
+   */
+  putMyTag(tracks: readonly string[], tag: string, on: boolean, comments?: boolean): Promise<EditHistoryState>;
+  /**
+   * Add "My Tag" to the "Comments" turned on or off (#605): every track with
+   * a My Tag gets its tags written after its comment, or taken off, as one
+   * step of history.
+   */
+  writeMyTagComments(on: boolean): Promise<EditHistoryState>;
+  /**
+   * Adding My Tag: a new tag at the end of a category, named "My Comment"
+   * or the first "My Comment (n)" the category lacks. Refused once the
+   * category holds 50, where rekordbox greys its `+`.
+   */
+  createMyTag(category: string): Promise<{ id: string; name: string }>;
+  /**
+   * Renames a My Tag or a category. Refused with "An item with the same
+   * name already exists!" when another under the same parent has it.
+   */
+  renameMyTag(id: string, name: string, comments?: readonly string[]): Promise<number>;
+  /**
+   * Deletes a My Tag and takes it off every track. Not undoable; categories
+   * are refused. `comments`, for both: the selected tracks whose comments
+   * Add "My Tag" to the "Comments" rewrites (#605).
+   */
+  deleteMyTag(id: string, comments?: readonly string[]): Promise<number>;
   /** Add Artwork: the image is filed in the share tree and the track points at it. */
   addArtwork(tracks: readonly string[], image: string): Promise<EditHistoryState>;
   /** Add Artwork on a playlist or folder, from the tree menu. */
@@ -1978,6 +2099,12 @@ export interface Edits {
   setCueColour(cue: string, colour: number | null): Promise<void>;
   /** Names a cue; an empty name leaves it unnamed. */
   setCueComment(cue: string, comment: string): Promise<void>;
+  /**
+   * Sets a memory loop as its track's Active Loop (`djmdCue.Kind` 4), the
+   * loop a CDJ engages by itself, or clears it; setting one clears the
+   * track's previous Active Loop. rekordbox's MEMORY row loop button.
+   */
+  setActiveLoop(cue: string, on: boolean): Promise<void>;
   deleteCue(cue: string): Promise<void>;
   /**
    * Convert Memory Cues to Hot Cues: each memory cue, by position, into the
@@ -2114,6 +2241,13 @@ export interface TrackDetails {
   myTags: string[];
 }
 
+export interface RelatedPlaylist {
+  id: string;
+  name: string;
+  /** Parent playlist/folder names, joined by " / "; empty at the root. */
+  path: string;
+}
+
 /**
  * Several selected tracks, as the information panel shows them.
  *
@@ -2137,7 +2271,7 @@ export interface TrackLookups {
   keys: string[];
   genres: string[];
   /** The library's My Tags by category, with the ids the toggles set. */
-  myTagCategories: { name: string; tags: { id: string; name: string }[] }[];
+  myTagCategories: { id: string; name: string; tags: { id: string; name: string }[] }[];
 }
 
 /** The fields the backend will write. Everything else on the Info tab is shown read-only. */
@@ -2170,6 +2304,19 @@ export interface TrackFilter {
   keys?: string[];
   ratings?: number[];
   colors?: string[];
+  /** One entry per ticked My Tag column with tags picked. */
+  tags?: TagPick[];
+}
+
+/**
+ * A My Tag column's picks. `category` is the column's position in
+ * `FilterValues.tags`; `tags` are names within it. `any` is OR (a track
+ * carrying any picked tag); otherwise AND (all of them).
+ */
+export interface TagPick {
+  category: number;
+  any: boolean;
+  tags: string[];
 }
 
 /** A value the bar can offer, with how many tracks of the list carry it. */
@@ -2178,7 +2325,7 @@ export interface Counted<T> {
   count: number;
 }
 
-/** A My Tag category and the tags under it, by name. Drawn, not filtered on. */
+/** A My Tag category and the tags under it, by name. */
 export interface TagCategory {
   name: string;
   tags: string[];

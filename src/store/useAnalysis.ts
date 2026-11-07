@@ -56,14 +56,16 @@ export function useAnalysis(
 ): Analysis {
   const stored = usePreferences();
   const storedPreferences = stored.analysis;
-  const { mode, concurrentTracks, firstBeatCue, bpmRange, writeKeyTag } = preferences ?? storedPreferences;
+  const { mode, concurrentTracks, firstBeatCue, bpmRange, writeKeyTag, detectKey } = preferences ?? storedPreferences;
   // "Write the value to the ID3 tag" is read when a track's analysis is
   // sent, not when it was queued: rekordbox reads `writeKeyInTag` as each
   // analysis completes. The key display format decides the notation.
   const keyTag = useRef<"classic" | "alphanumeric" | undefined>(undefined);
   const keyDisplay = stored.view.keyDisplay;
+  const keyDisplayRef = useRef(keyDisplay);
   useEffect(() => {
     keyTag.current = writeKeyTag ? keyDisplay : undefined;
+    keyDisplayRef.current = keyDisplay;
   }, [writeKeyTag, keyDisplay]);
   const [state, setState] = useState<QueueState>(emptyQueue);
   // The tracks whose request is in flight, so the effect below never sends
@@ -96,7 +98,9 @@ export function useAnalysis(
         try {
           const backend = await getBackend();
           const trackMode = track.analysis?.mode ?? mode;
-          const result = track.drawing
+          const result = keyDisplayRef.current === "alphanumeric"
+            ? await backend.analyseTrack(track.id, trackMode, track.analysis, keyTag.current, track.drawing || undefined, keyDisplayRef.current)
+            : track.drawing
             ? await backend.analyseTrack(track.id, trackMode, track.analysis, keyTag.current, true)
             : keyTag.current
               ? await backend.analyseTrack(track.id, trackMode, track.analysis, keyTag.current)
@@ -114,8 +118,8 @@ export function useAnalysis(
 
   // The preferred settings, for a track queued without the dialog.
   const preferred = useCallback(
-    (): NonNullable<QueueItem["analysis"]> => ({ mode, bpmGrid: true, key: true, highPrecision: true, ...bpmRangeLimits(bpmRange), firstBeatCue }),
-    [mode, firstBeatCue, bpmRange],
+    (): NonNullable<QueueItem["analysis"]> => ({ mode, bpmGrid: true, key: detectKey, highPrecision: true, ...bpmRangeLimits(bpmRange), firstBeatCue }),
+    [mode, firstBeatCue, bpmRange, detectKey],
   );
   const add = useCallback((items: readonly QueueItem[], settings?: QueueItem["analysis"]) => {
     // Capture settings at enqueue time, including automatic imports. Later

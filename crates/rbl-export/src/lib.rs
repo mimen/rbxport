@@ -319,7 +319,24 @@ fn fat_safe(name: &str) -> String {
     if out.is_empty() {
         out.push_str("Unknown");
     }
+    // Windows reserves these names for legacy devices (case-insensitively,
+    // up to the first dot) and `CreateFile`/`CreateDirectory` refuse them
+    // with `ERROR_INVALID_NAME` even written as e.g. `Con.mp3` (#844), so an
+    // artist, album or track named exactly one of these would fail every
+    // sync. Prefixing keeps the sync going with a name close to the original.
+    if is_reserved_device_name(out.split('.').next().unwrap_or(&out)) {
+        out.insert(0, '_');
+    }
     out
+}
+
+fn is_reserved_device_name(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM0" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT0" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    )
 }
 
 /// A rekordbox-style audio filename: FAT-safe and short enough for the player,
@@ -353,11 +370,16 @@ struct Interns<'a> {
     keys: &'a mut Intern,
 }
 
-/// Interns names into ids starting at 1, preserving first-seen order.
+/// Interns names into ids starting at 1, preserving first-seen order. A
+/// name can [`keep`](Intern::keep) an id it had before; new names then take
+/// the lowest free ids, so a slot a removed name left is used again.
 #[derive(Default)]
 struct Intern {
     ids: BTreeMap<String, u32>,
-    order: Vec<String>,
+    names: BTreeMap<u32, String>,
+    /// Every id up to here is taken: ids are only ever added, so the search
+    /// for a free one never has to look back.
+    taken_through: u32,
 }
 
 impl Intern {
@@ -368,17 +390,28 @@ impl Intern {
         if let Some(&id) = self.ids.get(name) {
             return id;
         }
-        let id = u32::try_from(self.order.len()).unwrap_or(0) + 1;
+        let mut id = self.taken_through + 1;
+        while self.names.contains_key(&id) {
+            id += 1;
+        }
+        self.taken_through = id;
         self.ids.insert(name.to_owned(), id);
-        self.order.push(name.to_owned());
+        self.names.insert(id, name.to_owned());
         id
     }
 
+    /// Gives `name` the id `id`, unless either is already taken or empty.
+    fn keep(&mut self, name: &str, id: u32) {
+        if name.is_empty() || id == 0 || self.ids.contains_key(name) || self.names.contains_key(&id) {
+            return;
+        }
+        self.ids.insert(name.to_owned(), id);
+        self.names.insert(id, name.to_owned());
+    }
+
+    /// Every id and its name, in id order.
     fn entries(&self) -> impl Iterator<Item = (u32, &str)> {
-        self.order
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (u32::try_from(i).unwrap_or(0) + 1, name.as_str()))
+        self.names.iter().map(|(id, name)| (*id, name.as_str()))
     }
 }
 
@@ -393,7 +426,29 @@ struct Layout {
     audio: String,
     /// The analysis directory, relative to the stick root.
     anlz_dir: String,
+    /// The analysis files' name in that directory, without extension.
+    anlz_name: String,
     file_name: String,
+}
+
+/// The analysis name every track this export places gets.
+const ANLZ_NAME: &str = "ANLZ0000";
+
+/// Whether `name` is an analysis name a stick's track can have: rekordbox
+/// puts a second track whose path hashes to a directory already in use in
+/// `ANLZ0001`, and so on, and a player tries `ANLZ0000` to `ANLZ0010` in
+/// that directory and takes the one whose `PPTH` names the track [OBS
+/// static: XDJ-R1 native reader, alphatheta-docs
+/// `platform/rekordbox-xdj-r1-native-reader.md`; a rekordbox stick in #616
+/// held `ANLZ0001` beside `ANLZ0000` in four directories] (#599).
+pub(crate) fn anlz_slot(name: &str) -> bool {
+    name.strip_prefix("ANLZ").is_some_and(|n| n.len() == 4 && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// One analysis file set on the stick, `ANLZ` name included, compared as
+/// the stick's file system compares paths.
+fn analysis_slot_key(dir: &str, name: &str) -> String {
+    path_key(&format!("{dir}/{name}"))
 }
 
 /// CDJ-3000 firmware 3.20, `sub_12f3f28`: UTF-16 path hash and shard.
@@ -419,6 +474,7 @@ fn layout(track: &SourceTrack, export_id: u32) -> Layout {
         // The two levels are how rekordbox spreads analysis across the tree
         // rather than putting a quarter of a million files in one directory.
         anlz_dir: format!("/PIONEER/USBANLZ/P{:03}/{export_id:08X}", export_id / 1000),
+        anlz_name: ANLZ_NAME.to_owned(),
         file_name,
     }
 }
@@ -603,15 +659,31 @@ fn layouts(tracks: &[SourceTrack], ids: &[u32], root: &str, previous: Option<&Ma
     let recorded: BTreeMap<_, _> = previous.into_iter().flat_map(|m| &m.tracks).map(|t| (t.key(), t)).collect();
     // Library files on the stick keep their names, and nothing copied may land
     // on one: not this run's, nor one an earlier run pointed at and left.
+    // Nor on a file the stick keeps as it has it: that track's rows, and the
+    // analysis whose PPTH names its path, stay as they are, so a selected
+    // track laid out on the same path is the one numbered. rekordbox never
+    // replaces a file already at a track's device path either:
+    // `DatabaseMediator::calc_device_file_path` (7.2.19 arm64 @0x1009b6e0c)
+    // tries `<name>-1.<ext>`, `<name>-2.<ext>`, … until one is free
+    // (@0x1009b6eb0..0x1009b70cc; see `device_import`) (#599).
     let mut used: BTreeSet<String> = in_place.iter().flatten().map(|path| path_key(path))
         .chain(previous_in_place.iter().cloned())
+        .chain(tracks.iter().filter_map(|t| t.device.as_ref().filter(|d| d.preserve)).map(|d| path_key(&d.audio)))
         .collect();
     tracks.iter().zip(ids).zip(in_place).map(|((track, id), in_place)| {
         let mut place = layout(track, *id);
         if let Some(device) = track.device.as_ref().filter(|d| d.preserve) {
             place.audio.clone_from(&device.audio);
             place.file_name = Path::new(&place.audio).file_name().unwrap_or_default().to_string_lossy().into_owned();
-            place.anlz_dir.clone_from(&device.analysis_dir);
+            place.anlz_dir = device.analysis_dir.replacen("/PIONEER/", &format!("/{root}/"), 1);
+            // In the slot rekordbox gave it, not over the track in `ANLZ0000`.
+            if let Some(name) = track.analysis_source.as_deref().and_then(Path::file_stem).and_then(|n| n.to_str()).filter(|n| anlz_slot(n)) {
+                name.clone_into(&mut place.anlz_name);
+            }
+            // Kept where the stick has it, never renamed: renaming the
+            // audio alone left its analysis under the old path's directory,
+            // which a player no longer finds.
+            return place;
         } else if let Some(audio) = in_place {
             place.audio.clone_from(audio);
             audio.rsplit('/').next().unwrap_or_default().clone_into(&mut place.file_name);
@@ -870,6 +942,97 @@ pub fn export_full(
     export_with_options(destination, tracks, playlists, my_tags, &ExportOptions { defaults, sync, ..Default::default() }, progress)
 }
 
+/// Add files already on a device to an existing device playlist without a
+/// desktop-library row or a second audio copy. A full export writes both
+/// database formats, so this operation refuses a device whose two libraries
+/// differ rather than overwrite edits held by only one of them.
+pub fn add_in_place_to_playlist(
+    root: &Path,
+    format: device_library::Format,
+    playlist_id: u32,
+    sources: &[SourceTrack],
+) -> Result<ExportReport> {
+    use device_library::Format;
+    let volume = rbl_core::durable::VolumeIdentity::capture(root)?;
+    let legacy = device_library::read(root, Format::DeviceLibrary)?;
+    let one = device_library::read(root, Format::OneLibrary)?;
+    if legacy.nodes != one.nodes || legacy.tracks != one.tracks {
+        return Err(ExportError::Conflict("This device's two libraries differ; a full export would overwrite a device-only edit. Nothing was changed.".into()));
+    }
+    let selected = match format {
+        Format::DeviceLibrary => &legacy,
+        Format::OneLibrary => &one,
+    };
+    if selected.node(playlist_id).is_none_or(|node| node.folder) {
+        return Err(ExportError::Conflict(
+            "That playlist is no longer on the device.".into(),
+        ));
+    }
+    if sources
+        .iter()
+        .any(|source| source.id != 0 || on_stick(root, &source.source_path).is_none())
+    {
+        return Err(ExportError::Conflict(
+            "Only files already on this device can be added in place.".into(),
+        ));
+    }
+    let before = snapshot::Snapshot::read(root)?;
+    let manifest = Manifest::load(root);
+    let record = sync_record::read(root);
+    if manifest.as_ref().is_some_and(|manifest| manifest.db_id != 0)
+        && record.as_ref().is_some_and(|record| record.db_id != 0 && Some(record.db_id) != manifest.as_ref().map(|manifest| manifest.db_id)) {
+        return Err(ExportError::Conflict("The device's sync owner differs from its last export. Nothing was changed.".into()));
+    }
+    let db_id = record.as_ref().map(|record| record.db_id).filter(|id| *id != 0)
+        .or_else(|| manifest.as_ref().map(|manifest| manifest.db_id)).unwrap_or(0);
+    let one_path = export_root(root).join("rekordbox/exportLibrary.db");
+    let one_db = rbl_onelibrary::ExportLibrary::open_read_only(&one_path).map_err(|error| ExportError::OneLibrary(error.to_string()))?;
+    let tag_id: u32 = one_db.connection().query_row("SELECT myTagMasterDBID FROM property LIMIT 1", [], |row| row.get(0))
+        .map_err(|error| ExportError::OneLibrary(error.to_string()))?;
+    drop(one_db);
+    let (mut tracks, mut playlists) = reconcile::all(root, &before, manifest.as_ref())?;
+    let playlist = playlists
+        .iter_mut()
+        .find(|node| node.device_id == playlist_id && !node.folder)
+        .ok_or_else(|| ExportError::Conflict("That playlist is no longer on the device.".into()))?;
+    let mut known: BTreeMap<String, usize> = tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, track)| {
+            on_stick(root, &track.source_path).map(|path| (path_key(&path), index))
+        })
+        .collect();
+    for source in sources {
+        let path = on_stick(root, &source.source_path)
+            .ok_or_else(|| ExportError::Conflict("A source file left this device.".into()))?;
+        let index = if let Some(index) = known.get(&path_key(&path)) {
+            *index
+        } else {
+            let index = tracks.len();
+            tracks.push(source.clone());
+            known.insert(path_key(&path), index);
+            index
+        };
+        if !playlist.track_indices.contains(&index) {
+            playlist.track_indices.push(index);
+        }
+    }
+    export_with_options(
+        root,
+        &tracks,
+        &playlists,
+        &[],
+        &ExportOptions {
+            keep_unlisted: true,
+            expected_volume: Some(&volume),
+            db_id_override: Some(db_id),
+            my_tag_master_db_id_override: Some(tag_id),
+            ..Default::default()
+        },
+        &mut |_| {},
+    )
+}
+
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CompatibilityFormat { Wav, Aiff, Mp3 }
@@ -901,6 +1064,8 @@ pub struct ExportOptions<'a> {
     /// their place, instead of being taken off. Export Playlist and Export
     /// Track add to a device as rekordbox's do; a SYNC leaves this off.
     pub keep_unlisted: bool,
+    pub db_id_override: Option<u64>,
+    pub my_tag_master_db_id_override: Option<u32>,
 }
 
 /// Export with optional conversion of audio outside the common CDJ formats.
@@ -948,7 +1113,7 @@ fn export_cancellable_inner(
     let _inspection = incremental::Inspection::new();
     let started = std::time::Instant::now();
     let requested_tracks = tracks;
-    let &ExportOptions { defaults, sync, compatibility, root, keep_unlisted: _, settings_files, cache, expected_volume, verify_all } = options;
+    let &ExportOptions { defaults, sync, compatibility, root, keep_unlisted: _, settings_files, cache, expected_volume, verify_all, db_id_override, my_tag_master_db_id_override } = options;
     if let Some(volume) = expected_volume { volume.check(destination)?; }
     if destination.exists() && !destination.is_dir() {
         return Err(ExportError::NotADirectory(destination.to_owned()));
@@ -1018,7 +1183,7 @@ fn export_cancellable_inner(
         previous.as_ref().and_then(|m| m.baseline.clone()).map_or_else(|| snapshot::Snapshot::read(destination), Ok)?
     } else { snapshot::Snapshot::read(destination)? };
     let trusted = incremental::trusted_paths(destination, previous.as_ref())?;
-    let db_id = sync.map_or(0, |s| s.db_id);
+    let db_id = db_id_override.unwrap_or_else(|| sync.map_or(0, |s| s.db_id));
     if let Some(old) = previous.as_mut().filter(|m| m.db_id == 0 && db_id != 0) {
         if sync_record::read(destination).is_some_and(|r| r.db_id == db_id) {
             // Old manifests lacked DBID. Upgrade only when rekordbox's own
@@ -1066,8 +1231,7 @@ fn export_cancellable_inner(
     }
     if let Some(cache) = cache {
         let recorded: BTreeMap<_, _> = previous.as_ref().into_iter().flat_map(|m| &m.tracks).map(|t| (t.key(), t)).collect();
-        let count = tracks.len();
-        for (index, track) in tracks.iter_mut().enumerate() {
+        for track in &mut tracks {
             if cancelled() { return Err(ExportError::Cancelled); }
             if !track.source_path.is_file() || track.device.as_ref().is_some_and(|d| d.preserve) || on_stick(destination, &track.source_path).is_some() { continue; }
             let old = recorded.get(&track_key(track.id, &track.source_path.to_string_lossy())).copied();
@@ -1080,22 +1244,15 @@ fn export_cancellable_inner(
                 if old.is_some() && !same_source { let _ = cache.properties(&track.source_path)?; }
                 let same_profile = old.is_some_and(|old| old.conversion == conversion.map_or("", rbl_audio::compatibility::Format::profile));
                 if (same_source || source_contents_unchanged.contains(&track_key(track.id, &track.source_path.to_string_lossy()))) && same_profile { return Ok(None); }
-                if let Some(target) = conversion {
-                    let (path, _, _) = cache.converted(&track.source_path, target, &mut |done, total| {
-                        progress(&ExportProgress { stage: "converting", done: usize::try_from(done).unwrap_or(usize::MAX), total: total.and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::from(track.duration_sec) * 1000), unit: "milliseconds", title: track.title.clone(), tracks_done: index, tracks_total: count, ..Default::default() });
-                    }, cancelled)?;
-                    Ok(Some(path))
-                } else if track.device.is_some() && old.is_none() {
-                    // Cold adoption is checked against the existing copy below.
-                    Ok(None)
-                } else { cache.original(&track.source_path, &mut |done, total| {
-                    progress(&ExportProgress { stage: "preparing", done: 0, total: 0, title: track.title.clone(), unit: "bytes", bytes_done: done, bytes_total: total, tracks_done: index, tracks_total: count, ..Default::default() });
-                }, cancelled).map(Some) }
+                // Preparation only determines the profile. Conversion happens
+                // while staging this track, so the cache never holds a whole
+                // selected batch of converted audio awaiting publication.
+                Ok(None)
             })();
             match prepared {
                 Ok(path) => track.prepared_audio = path,
                 Err(ExportError::Cancelled) => return Err(ExportError::Cancelled),
-                Err(ExportError::Io(error)) if matches!(error.kind(), std::io::ErrorKind::StorageFull | std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::NotADirectory) && std::fs::File::open(&track.source_path).is_ok() => {
+                Err(ExportError::Io(error)) if matches!(error.kind(), std::io::ErrorKind::StorageFull | std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::NotADirectory | std::io::ErrorKind::AlreadyExists) && std::fs::File::open(&track.source_path).is_ok() => {
                     track.cache_bypass = true;
                 }
                 Err(error) => {
@@ -1148,6 +1305,17 @@ fn export_cancellable_inner(
     // Artwork by where it comes from: two tracks of one album share one
     // image, and the stick carries it once.
     let mut artwork = Intern::default();
+    // A cover keeps the id it had on the stick. Numbered afresh, one new
+    // cover early in the selection moved every later one to another file,
+    // and a sync of a few tracks rewrote the whole library's artwork (#626).
+    for track in tracks {
+        let key = track_key(track.id, &track.source_path.to_string_lossy());
+        // Only an image the loop below will write, or its id stays held by a
+        // cover the stick no longer gets.
+        if let (Some(image), Some(entry)) = (track.artwork.as_deref().filter(|p| p.is_file()), stale.get(&key)) {
+            artwork.keep(&image.to_string_lossy(), artwork_id_from_path(&entry.artwork));
+        }
+    }
 
     let mut track_rows: Vec<Vec<u8>> = Vec::with_capacity(tracks.len());
     let mut one_library_tracks: Vec<OneLibraryTrack> = Vec::with_capacity(tracks.len());
@@ -1178,8 +1346,13 @@ fn export_cancellable_inner(
     // before this export: the databases keep naming it, as they did.
     let mut absent_audio: BTreeSet<String> = BTreeSet::new();
     let mut written_audio_paths = BTreeSet::new();
-    let mut written_analysis_paths: BTreeSet<String> = tracks.iter()
-        .filter_map(|t| t.device.as_ref().filter(|d| d.preserve).map(|d| path_key(&d.analysis_dir)))
+    // A carried track holds its directory's slot, not the whole directory: a
+    // carried track in rekordbox's `ANLZ0001` leaves `ANLZ0000` there to the
+    // selected track whose path hashes to it, which keeps its path and
+    // analysis rather than being copied again under a new name (#599).
+    let mut written_analysis_paths: BTreeSet<String> = tracks.iter().zip(&layouts)
+        .filter(|(t, _)| t.device.as_ref().is_some_and(|d| d.preserve))
+        .map(|(_, place)| analysis_slot_key(&place.anlz_dir, &place.anlz_name))
         .collect();
     for (index, track) in tracks.iter().enumerate() {
         // Reported before the track is dealt with, so a skip reports too:
@@ -1263,7 +1436,7 @@ fn export_cancellable_inner(
             let ext = original.extension().map_or(String::new(), |e| format!(".{}", e.to_string_lossy()));
             let parent = original.parent().unwrap_or(Path::new("/Contents"));
             let mut suffix = 0_u32;
-            while !written_analysis_paths.insert(path_key(&place.anlz_dir)) {
+            while !written_analysis_paths.insert(analysis_slot_key(&place.anlz_dir, &place.anlz_name)) {
                 suffix += 1;
                 if suffix > 200_003 { return Err(ExportError::Conflict("Analysis directory space exhausted".into())); }
                 place.file_name = format!("{stem}-{export_id}-{suffix}{ext}");
@@ -1393,16 +1566,26 @@ fn export_cancellable_inner(
                 Some(target) => {
                     report.converted += 1;
                     if let Some(cache) = cache.filter(|_| !track.cache_bypass) {
-                        match cache.converted(&track.source_path, target, &mut |done, total| {
-                            progress(&ExportProgress { stage: "converting", done: usize::try_from(done).unwrap_or(usize::MAX), total: total.and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::from(track.duration_sec) * 1000), title: track.title.clone(), unit: "milliseconds", reused: report.reused, converted: report.converted, tracks_done: index, tracks_total: tracks.len(), ..Default::default() });
-                        }, cancelled) {
-                            Ok((path, _, _)) => {
-                                copy_staged_observed(&path, &audio_dest, &mut |done, total| {
-                                    progress(&ExportProgress { stage: "copying", done: 0, total: 0, title: track.title.clone(), unit: "bytes", bytes_done: done, bytes_total: total, reused: report.reused, copied: report.tracks_added + report.tracks_updated, converted: report.converted, tracks_done: index, tracks_total: tracks.len() });
+                        let shared_progress = std::cell::RefCell::new(&mut *progress);
+                        match cache.with_converted(&track.source_path, target, &mut |done, total| {
+                            (*shared_progress.borrow_mut())(&ExportProgress { stage: "converting", done: usize::try_from(done).unwrap_or(usize::MAX), total: total.and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::from(track.duration_sec) * 1000), title: track.title.clone(), unit: "milliseconds", reused: report.reused, converted: report.converted, tracks_done: index, tracks_total: tracks.len(), ..Default::default() });
+                        }, cancelled, |path, _, _| {
+                                copy_staged_observed(path, &audio_dest, &mut |done, total| {
+                                    (*shared_progress.borrow_mut())(&ExportProgress { stage: "copying", done: 0, total: 0, title: track.title.clone(), unit: "bytes", bytes_done: done, bytes_total: total, reused: report.reused, copied: report.tracks_added + report.tracks_updated, converted: report.converted, tracks_done: index, tracks_total: tracks.len() });
                                     !cancelled()
-                                }).map(|(bytes, hash)| { copied_hash.set(Some(hash)); bytes })
-                            }
+                                }).map(|(bytes, hash)| { copied_hash.set(Some(hash)); bytes }).map_err(ExportError::Io)
+                        }) {
+                            Ok(bytes) => Ok(bytes),
                             Err(ExportError::Cancelled) => return Err(ExportError::Cancelled),
+                            Err(ExportError::Io(error)) if !audio_dest.exists() && matches!(error.kind(), std::io::ErrorKind::StorageFull | std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::NotADirectory | std::io::ErrorKind::AlreadyExists) => {
+                                // An unwritable/full internal cache or a single
+                                // conversion above its 2 GiB cap uses the
+                                // destination stage instead.
+                                rbl_audio::compatibility::convert_observed(&track.source_path, &audio_dest, target, &mut |done, total| {
+                                    progress(&ExportProgress { stage: "converting", done: usize::try_from(done).unwrap_or(usize::MAX), total: total.and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::from(track.duration_sec) * 1000), title: track.title.clone(), unit: "milliseconds", reused: report.reused, converted: report.converted, tracks_done: index, tracks_total: tracks.len(), ..Default::default() });
+                                    !cancelled()
+                                }).map_err(|e| std::io::Error::other(format!("{}: {e}", track.title)))
+                            }
                             Err(e) => Err(std::io::Error::other(e.to_string())),
                         }
                     } else {
@@ -1412,7 +1595,7 @@ fn export_cancellable_inner(
                         }).map_err(|e| std::io::Error::other(format!("{}: {e}", track.title)))
                     }
                 },
-                None => copy_staged_observed(track.prepared_audio.as_deref().unwrap_or(&track.source_path), &audio_dest, &mut |done, total| {
+                None => copy_staged_observed(&track.source_path, &audio_dest, &mut |done, total| {
                     progress(&ExportProgress { stage: "copying", done: 0, total: 0, title: track.title.clone(), unit: "bytes", bytes_done: done, bytes_total: total, reused: report.reused, copied: report.tracks_added + report.tracks_updated, converted: report.converted, tracks_done: index, tracks_total: tracks.len() });
                     !cancelled()
                 }).map(|(bytes, hash)| { copied_hash.set(Some(hash)); bytes }),
@@ -1497,7 +1680,15 @@ fn export_cancellable_inner(
                 let retained = carried.filter(|c| (unchanged || retained_audio || in_place || adopted || moved.is_some()) && !c.anlz_dir.is_empty());
                 let (kept, is_kept) = match retained {
                     Some(c) => {
-                        let fallback = SourceTrack { analysis_source: Some(under(destination, &format!("{}/ANLZ0000.DAT", c.anlz_dir))), ..Default::default() };
+                        // A retained manifest can name an analysis directory
+                        // that is not the database's current one. Validate
+                        // every companion before load_analysis reads any of
+                        // them, including optional EXT and 2EX files.
+                        let fallback_base = checked_under(destination, &format!("{}/ANLZ0000.DAT", c.anlz_dir))?;
+                        for extension in ["EXT", "2EX"] {
+                            checked_under(destination, &format!("{}/ANLZ0000.{extension}", c.anlz_dir))?;
+                        }
+                        let fallback = SourceTrack { analysis_source: Some(fallback_base), ..Default::default() };
                         if c.analysis_extensions.iter().all(|e| trusted.contains(&format!("{}/ANLZ0000.{e}", c.anlz_dir.trim_start_matches('/')))) {
                             (incremental::load_analysis(&fallback)?, true)
                         } else {
@@ -1580,10 +1771,10 @@ fn export_cancellable_inner(
             .is_some_and(|c| c.anlz_dir == place.anlz_dir && c.analysis == analysis_hash)
             && analysis
                 .iter()
-                .all(|(extension, bytes)| std::fs::read(anlz_dir.join(format!("ANLZ0000.{extension}"))).is_ok_and(|b| b == *bytes));
+                .all(|(extension, bytes)| std::fs::read(anlz_dir.join(format!("{}.{extension}", place.anlz_name))).is_ok_and(|b| b == *bytes));
         for extension in ["DAT", "EXT", "2EX"] {
-            if !track.analysis.iter().any(|(e, _)| e == extension) && anlz_dir.join(format!("ANLZ0000.{extension}")).exists() {
-                deletions.push(PathBuf::from(format!("{}/ANLZ0000.{extension}", place.anlz_dir.trim_start_matches('/'))));
+            if !track.analysis.iter().any(|(e, _)| e == extension) && anlz_dir.join(format!("{}.{extension}", place.anlz_name)).exists() {
+                deletions.push(PathBuf::from(format!("{}/{}.{extension}", place.anlz_dir.trim_start_matches('/'), place.anlz_name)));
             }
         }
         if !track.analysis.is_empty() && !analysis_current {
@@ -1591,14 +1782,14 @@ fn export_cancellable_inner(
             let failed = context(format!("Could not write the analysis of '{}'", track.title));
             std::fs::create_dir_all(&anlz_dir).map_err(&failed)?;
             for (extension, bytes) in analysis {
-                std::fs::write(anlz_dir.join(format!("ANLZ0000.{extension}")), bytes).map_err(&failed)?;
+                std::fs::write(anlz_dir.join(format!("{}.{extension}", place.anlz_name)), bytes).map_err(&failed)?;
                 report.analysis_files += 1;
             }
         }
         // The path the databases carry, whether or not the file was written
         // this run.
         let analyze_path = if track.analysis.iter().any(|(e, _)| e.eq_ignore_ascii_case("DAT")) {
-            format!("{}/ANLZ0000.DAT", place.anlz_dir)
+            format!("{}/{}.DAT", place.anlz_dir, place.anlz_name)
         } else {
             String::new()
         };
@@ -1651,14 +1842,19 @@ fn export_cancellable_inner(
         } else {
             copy_stamp(&under(publication.stage(), &place.audio))?
         };
+        // The record names a track's analysis by its directory, as
+        // `ANLZ0000` there. A stick's track in another slot is rekordbox's
+        // to keep, so the record names none for it rather than the files
+        // of the track in `ANLZ0000`; its analysis is read back each sync.
+        let in_slot = place.anlz_name != ANLZ_NAME;
         recorded.push(ManifestTrack {
-            analysis_hashes: analysis_reused.map_or_else(|| analysis.iter().map(|(e, b)| (e.clone(), manifest::hash(b))).collect(), |c| c.analysis_hashes.clone()),
-            analysis_extensions: analysis.iter().map(|(e, _)| e.clone()).collect(),
+            analysis_hashes: if in_slot { BTreeMap::new() } else { analysis_reused.map_or_else(|| analysis.iter().map(|(e, b)| (e.clone(), manifest::hash(b))).collect(), |c| c.analysis_hashes.clone()) },
+            analysis_extensions: if in_slot { Vec::new() } else { analysis.iter().map(|(e, _)| e.clone()).collect() },
             export_id,
             library_id: track.id,
             source: if track.source_unavailable { carried.map_or(source.clone(), |c| c.source.clone()) } else { source },
             audio: place.audio.clone(),
-            anlz_dir: if track.analysis.is_empty() { String::new() } else { place.anlz_dir.clone() },
+            anlz_dir: if track.analysis.is_empty() || in_slot { String::new() } else { place.anlz_dir.clone() },
             size: if track.source_unavailable { carried.map_or(size, |old| old.size) } else { size },
             modified: if track.source_unavailable { carried.map_or(modified, |old| old.modified) } else { modified },
             analysis: analysis_hash,
@@ -1740,6 +1936,8 @@ fn export_cancellable_inner(
             master_db_id: u32::try_from(master_db_id).unwrap_or(0),
             master_content_id: u32::try_from(library_id).unwrap_or(0),
             play_count: u16::try_from(track.metadata.play_count).unwrap_or(u16::MAX),
+            // The same contentLink exportLibrary.db gets (#640).
+            content_link: track.metadata.content_link,
             isrc: track.metadata.isrc.clone(),
             title: track.title.clone(),
             filename: place.file_name,
@@ -1747,6 +1945,7 @@ fn export_cancellable_inner(
             analyze_path,
             comment: track.comment.clone(),
             date_added: track.date_added.clone(),
+            date_created: track.metadata.date_created.clone(),
             release_date: track.release_date.clone(),
             ..TrackInput::default()
         }));
@@ -1858,13 +2057,14 @@ fn export_cancellable_inner(
         colors: settings.as_ref().or(defaults).map_or(&[], |s| &s.colors),
         device_name: settings.as_ref().or(defaults).map_or("", |s| s.device_name.as_str()),
         background: before.legacy_background,
+        menus: settings.as_ref().or(defaults),
     });
     report.pdb_bytes = pdb.len();
     let staged_db = publication.stage().join(root_name).join("rekordbox");
     std::fs::create_dir_all(&staged_db).map_err(context("Could not write export.pdb".to_owned()))?;
     std::fs::write(staged_db.join("export.pdb"), &pdb).map_err(context("Could not write export.pdb".to_owned()))?;
     // The tags and the tracks carrying them, for the player's Track Filter.
-    let master_db_id = my_tag_master_db_id(sync);
+    let master_db_id = my_tag_master_db_id_override.unwrap_or_else(|| my_tag_master_db_id(sync));
     let tagged: Vec<(u32, &[u64])> = one_library_tracks.iter().map(|t| (t.export_id, t.my_tags.as_slice())).collect();
     std::fs::write(staged_db.join("exportExt.pdb"), ext_pdb::build(my_tags, &tagged, master_db_id)).map_err(context("Could not write exportExt.pdb".to_owned()))?;
 
@@ -2021,8 +2221,10 @@ fn export_cancellable_inner(
     // Content reclamation was journaled. Empty folders are only cosmetic;
     // remove_dir refuses any directory another writer has populated.
     for (relative, directory) in obsolete {
-        if retained.contains(&relative.to_lowercase()) { continue; }
-        let path = checked_under(destination, &relative)?;
+        if relative.is_empty() || retained.contains(&relative.to_lowercase()) { continue; }
+        let path = checked_under(destination, &relative).map_err(|error| {
+            ExportError::Conflict(format!("Could not clean obsolete device path {relative:?} after publication: {error}"))
+        })?;
         let mut empty = if directory { Some(path.as_path()) } else { path.parent() };
         while let Some(dir) = empty.filter(|p| *p != destination && p.starts_with(destination)) {
             if std::fs::remove_dir(dir).is_err() { break; }
@@ -2055,12 +2257,48 @@ struct PdbTables<'a> {
     device_name: &'a str,
     /// "Background Color : Device Library", carried from the stick.
     background: u8,
+    /// The stick's browse categories and sorts; `None` writes the defaults.
+    menus: Option<&'a rbl_onelibrary::settings::StickSettings>,
+}
+
+/// The `categories` (type 17) and `sorts` (type 18) rows of `export.pdb`
+/// for a stick's device settings, in the order rekordbox writes them: the
+/// hidden rows by id, then the shown ones by position [OBS 7.2.11 reference
+/// rows]. A player that reads only `export.pdb`, such as the XDJ-1000, takes
+/// its Category, Sort and Column settings from these rows, not from
+/// `exportLibrary.db` (#619). The slots are numbered and filtered as
+/// `exportLibrary.db` gets them, so both describe the same menu. The
+/// defaults give rekordbox's reference bytes.
+#[must_use]
+pub fn menu_rows(settings: &rbl_onelibrary::settings::StickSettings) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    use rbl_onelibrary::build::reference::MENU_ITEMS;
+    use rbl_onelibrary::settings::{renumbered, MenuSlot};
+    let ordered = |slots: &[MenuSlot]| {
+        let known = |s: &MenuSlot| MENU_ITEMS.iter().any(|(id, _, _)| *id == s.menu_item);
+        let mut slots: Vec<MenuSlot> = renumbered(slots).into_iter().filter(known).collect();
+        slots.sort_by_key(|s| (s.visible, if s.visible { s.seq } else { s.id }));
+        slots
+    };
+    let id = |value: i64| u16::try_from(value).unwrap_or(0);
+    let categories = ordered(&settings.categories)
+        .iter()
+        .map(|s| rbl_pdb::rows::category_row(id(s.menu_item), id(s.id), s.visible, id(s.seq)))
+        .collect();
+    let sorts = ordered(&settings.sorts)
+        .iter()
+        .map(|s| {
+            let seq = u8::try_from(s.seq).unwrap_or(0);
+            rbl_pdb::rows::sort_row(id(s.menu_item), id(s.id), s.visible, seq, settings.sub_column == Some(s.menu_item))
+        })
+        .collect();
+    (categories, sorts)
 }
 
 /// Builds `export.pdb` with the twenty tables rekordbox writes, in its
 /// order: the eight the library fills, the eight colours, the artwork
 /// (type 13) among six that are always empty (types 9 to 15), the browse column
-/// names and the History menu's two tables (`rbl_pdb::reference`), and the
+/// names (`rbl_pdb::reference`), the browse categories and sorts
+/// ([`menu_rows`]), and the
 /// one `property` row: device name, track count, the export's date and the
 /// Device Library background colour [OBS 7.2.14]. A player looks the table
 /// list up by type, so the empty ones have to be there.
@@ -2112,8 +2350,9 @@ fn build_pdb(tables: &PdbTables<'_>) -> Vec<u8> {
     }
     let constant = |rows: &[&[u8]]| rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>();
     file.add_table(16, &constant(reference::COLUMNS));
-    file.add_table(17, &constant(reference::HISTORY_PLAYLISTS));
-    file.add_table(18, &constant(reference::HISTORY_ENTRIES));
+    let (categories, sorts) = menu_rows(&tables.menus.cloned().unwrap_or_default());
+    file.add_table(17, &categories);
+    file.add_table(18, &sorts);
     // The local day, as rekordbox dates the export where the machine is.
     let property = rbl_pdb::rows::PdbProperty {
         device_name: tables.device_name.to_owned(),
@@ -2187,6 +2426,7 @@ pub fn create_library_with_root(
         colors: defaults.map_or(&[], |s| &s.colors),
         device_name: defaults.map_or("", |s| s.device_name.as_str()),
         background: 0,
+        menus: defaults,
     });
     rbl_core::durable::write(&db_dir.join("export.pdb"), &pdb)?;
     // The library's tags go on even a stick with no tracks [OBS 7.2.11:
@@ -2200,13 +2440,26 @@ pub fn create_library_with_root(
 }
 
 /// The number `exportExt.pdb` and `exportLibrary.db`'s `property` row both
-/// carry as the tags' master database id. rekordbox wrote 1744129535 for
-/// this library, whose `DBID` is 1912725212, on every export; how it gets
-/// from one to the other is [UNKNOWN] (not the DBID, nor CRC32/FNV/Adler/
-/// MD5/SHA of the DBID or the device id). The two files only have to
-/// agree with each other, so the library's own id stands in.
+/// carry as the tags' master database id: the library's cloud database id
+/// when it has one, otherwise its `DBID` plus one, as rekordbox 7 writes it.
+///
+/// [OBS static, rekordbox 7.2.19 arm64]
+/// `DatabaseMediator::syncMyTagLocal` (`0x100c529c4`) takes `DBID + 1`
+/// (`DatabaseMediator+0x528`, set from `mstGetDBID` by `initMasterDB`),
+/// replaces it with `AppSyncDBController::getCloudDBID` when that is not 0,
+/// and hands it to the device controller. `DatabaseMediator::syncMyTag`
+/// (`0x100c520ec`) then reads the stick's value back: 0, `DBID + 1` or the
+/// cloud id are its own; `DBID` itself is what rekordbox 6 wrote and gets
+/// "You have to resync My Tag after starting rekordbox 6." (`0x100c52130`),
+/// which is what RBX's `DBID` produced (#640). The reference stick's
+/// 1744129535 against `DBID` 1912725212 fits a cloud id; that library's
+/// `djmdCloudProperty` was not read [UNKNOWN].
 fn my_tag_master_db_id(sync: Option<&SyncSource>) -> u32 {
-    sync.map_or(0, |s| u32::try_from(s.db_id & 0xffff_ffff).unwrap_or(0))
+    sync.map_or(0, |s| match (s.cloud_db_id, s.db_id & 0xffff_ffff) {
+        (0, 0) => 0,
+        (0, db_id) => u32::try_from(db_id).unwrap_or(0).wrapping_add(1),
+        (cloud, _) => cloud,
+    })
 }
 
 /// The subset of a track `exportLibrary.db` needs.
@@ -2734,6 +2987,18 @@ fn staged_files(root: &Path, named: &[&str]) -> std::io::Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
 
+    /// rekordbox 7's `syncMyTag` takes `DBID + 1` and the cloud id as its
+    /// own and `DBID` as rekordbox 6's (#640).
+    #[test]
+    fn the_my_tag_master_id_is_rekordbox_7s() {
+        let sync = |db_id, cloud_db_id| SyncSource { db_id, cloud_db_id, ..Default::default() };
+        assert_eq!(my_tag_master_db_id(Some(&sync(6_230_574, 0))), 6_230_575, "not DBID, rekordbox 6's");
+        assert_eq!(my_tag_master_db_id(Some(&sync(6_230_574, 3_942_139_879))), 3_942_139_879);
+        assert_eq!(my_tag_master_db_id(Some(&sync(u64::from(u32::MAX), 0))), 0, "a 32-bit add, as rekordbox's");
+        assert_eq!(my_tag_master_db_id(Some(&sync(0, 0))), 0);
+        assert_eq!(my_tag_master_db_id(None), 0);
+    }
+
     #[test]
     fn analysis_paths_match_independent_rekordbox_exports() {
         assert_eq!(analysis_directory("/Contents/Hosanna, Westend/Drum Death - Extended Mix/20130688_drum_death_(extended_mix).mp3", "PIONEER"), "/PIONEER/USBANLZ/P002/0002583E");
@@ -2759,6 +3024,25 @@ mod tests {
         // Unicode is fine on FAT32 long names.
         assert_eq!(fat_safe("Ébano — Tiësto"), "Ébano — Tiësto");
         assert_eq!(fat_safe("Kesa\u{308} (On Kaunis).aiff"), "Kesä (On Kaunis).aiff");
+    }
+
+    /// #844: syncing an artist, album or track named exactly a Windows
+    /// reserved device name failed every stick at once with `ERROR_INVALID_NAME`
+    /// (os error 123), because `CreateFile`/`CreateDirectory` reject these
+    /// names even written with an extension, and nothing sanitized them.
+    #[test]
+    fn fat_safe_escapes_windows_reserved_device_names() {
+        assert_eq!(fat_safe("CON"), "_CON");
+        assert_eq!(fat_safe("con"), "_con");
+        assert_eq!(fat_safe("Nul"), "_Nul");
+        assert_eq!(fat_safe("COM1"), "_COM1");
+        assert_eq!(fat_safe("lpt9"), "_lpt9");
+        assert_eq!(dir_name("AUX"), "_AUX");
+        assert_eq!(fat_file_name("PRN.mp3"), "_PRN.mp3");
+        // Not reserved: longer names and non-matching digits stay untouched.
+        assert_eq!(fat_safe("Content"), "Content");
+        assert_eq!(fat_safe("COM10"), "COM10");
+        assert_eq!(fat_safe("CONTACT"), "CONTACT");
     }
 
     #[test]
@@ -2810,5 +3094,16 @@ mod tests {
         assert_eq!(intern.id(""), 0);
         let names: Vec<&str> = intern.entries().map(|(_, n)| n).collect();
         assert_eq!(names, vec!["ARTBAT", "Meduza"]);
+    }
+
+    #[test]
+    fn new_names_fill_the_ids_kept_names_left_free() {
+        let mut intern = Intern::default();
+        intern.keep("one", 1);
+        intern.keep("three", 3);
+        intern.keep("huge", u32::MAX);
+        assert_eq!(intern.id("two"), 2);
+        assert_eq!(intern.id("four"), 4);
+        assert_eq!(intern.id("one"), 1);
     }
 }

@@ -648,6 +648,24 @@ function msAtStepIndex(times: Uint32Array, index: number): number {
   return from + (index - at) * (to - from);
 }
 
+/** Move a position by signed grid beats without losing its fractional-beat phase. */
+export function shiftByGridBeats(grid: BeatGrid, ms: number, beats: number): number | null {
+  const index = stepIndexAt(grid.times, ms);
+  return index === null ? null : msAtStepIndex(grid.times, index + beats);
+}
+
+/** Move an active loop and the head together; reject out-of-track ranges. */
+export function movedLoopByBeats(
+  grid: BeatGrid, fromMs: number, toMs: number, headMs: number, beats: number, durationMs: number,
+): { fromMs: number; toMs: number; headMs: number } | null {
+  const from = shiftByGridBeats(grid, fromMs, beats);
+  const to = shiftByGridBeats(grid, toMs, beats);
+  const head = shiftByGridBeats(grid, headMs, beats);
+  if (from === null || to === null || head === null || from < 0 || to > durationMs ||
+      to <= from || head < from || head >= to) return null;
+  return { fromMs: from, toMs: to, headMs: head };
+}
+
 /**
  * Where a hot cue called with Q on fires: the first place at or after the
  * playhead that sits at the same point of a quantize step as the cue does.
@@ -817,6 +835,44 @@ export function snapOffset(offset: number, ratio: number): number {
   if (!Number.isFinite(offset)) return 0;
   // `+ 0` folds the -0 that rounding a small negative slide gives.
   return Math.round(offset * scale) / scale + 0;
+}
+
+/**
+ * How many device pixels wide rekordbox draws the overview's playhead.
+ *
+ * rekordbox 7.2.19 (macOS arm64) draws it in `WidgetLoudView::drawTextures`
+ * as two one-pixel lines, at the head's place and one device pixel to its
+ * right (`drawVerticalLine` @0x100fd17dc / @0x100fd182c after
+ * `fadd s0, s10, #1.0`), whatever the waveform's colour type (#570).
+ */
+export const OVERVIEW_HEAD_DEVICE_PX = 2;
+
+/**
+ * The overview playhead's width in CSS pixels for a device pixel ratio: two
+ * device pixels, so two CSS pixels at 1x, one at 2x and 1.33 at 1.5x. A 1px
+ * line at 1x was one column the width of each waveform bar, and an RGB
+ * waveform's red bars swallowed the red head (#570).
+ */
+export function overviewHeadWidth(ratio: number): number {
+  const scale = Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
+  return OVERVIEW_HEAD_DEVICE_PX / scale;
+}
+
+/**
+ * The playhead's width in CSS pixels: whole device pixels, never less than one.
+ *
+ * rekordbox 7.2.14 at 150% scaling draws the detail's playhead as two full
+ * device columns of flat colour, (255, 0, 0) paused and (224, 224, 224)
+ * playing, over the waveform (#393, observed on chris-win11). A 1px CSS line
+ * at 1.5x covers one and a half device pixels, which the compositor spreads
+ * over two columns at three quarters of the colour, (176, 38, 26) for the red
+ * and blended into the waveform under it: the line rekordbox paints solid
+ * reads faint. Rounding the width up to whole device pixels keeps one CSS
+ * pixel at 1x and 2x and gives 1.5x its two solid columns.
+ */
+export function playheadWidth(ratio: number): number {
+  const scale = Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
+  return Math.max(1, Math.ceil(scale - 1e-9)) / scale;
 }
 
 /**

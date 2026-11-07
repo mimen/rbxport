@@ -33,6 +33,11 @@ pub struct RowDto {
     pub hot_cues: Vec<RowCueDto>,
     /// Saved memory-cue positions in milliseconds, including memory-loop starts.
     pub memory_cues: Vec<u32>,
+    /// Each memory cue's own colour, in `memory_cues` order: `djmdCue.Color`
+    /// 0 to 7, or 255 for none. Left out when none has a colour, which is
+    /// nearly every row, so a page costs nothing it did not before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memory_cue_colours: Vec<u8>,
     /// Deterministic tint, drawn when a track has no artwork — a little under
     /// half the reference library.
     pub artwork_hue: u16,
@@ -656,6 +661,21 @@ pub struct TrackFilterDto {
     pub ratings: Option<Vec<u8>>,
     #[serde(default)]
     pub colors: Option<Vec<String>>,
+    /// One entry per ticked My Tag column with tags picked.
+    #[serde(default)]
+    pub tags: Vec<TagPickDto>,
+}
+
+/// A My Tag column's picks: the category by its position in the list the bar
+/// was drawn from, the tags by name, and the column's AND / OR switch.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagPickDto {
+    pub category: usize,
+    #[serde(default)]
+    pub any: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// A value the filter bar can offer, and how many tracks of the list carry it.

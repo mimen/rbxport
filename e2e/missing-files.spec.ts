@@ -169,6 +169,107 @@ test("a missing track does not load:the deck keeps its track and the status bar 
   await expect(title).toHaveText(loaded);
 });
 
+test("a cached missing row loads after its audio file returns at the same path (#644)", async ({ page }) => {
+  await open(page, "?missing=7");
+  await showAttribute(page);
+  await rowOf(page, 0).locator('[data-col="title"]').dblclick();
+  const title = page.getByTestId("player-title").first();
+  const recovered = rowOf(page, 1);
+  const recoveredTitle = await recovered.locator('[data-col="title"]').innerText();
+  await recovered.locator('[data-col="title"]').click();
+  await expect(recovered.getByRole("img", { name: "File is Missing" })).toHaveCount(1);
+
+  // This changes the mock's file status without refetching the browser row.
+  await page.evaluate(() => {
+    (window as unknown as { __setFileMissing: (id: string, missing: boolean) => void })
+      .__setFileMissing("100001", false);
+  });
+  await expect(recovered.getByRole("img", { name: "File is Missing" })).toHaveCount(1);
+  await recovered.locator('[data-col="title"]').dblclick();
+  await expect(title).toHaveText(recoveredTitle);
+  await expect(page.getByRole("alert")).not.toHaveText("Load error. The file could not be found.");
+});
+
+test("a file gone since row fetch leaves the current deck loaded (#644)", async ({ page }) => {
+  await open(page, "?missing=7");
+  await rowOf(page, 0).locator('[data-col="title"]').dblclick();
+  const title = page.getByTestId("player-title").first();
+  const loaded = await title.innerText();
+  const next = rowOf(page, 2);
+  await next.locator('[data-col="title"]').click();
+  await page.evaluate(() => {
+    (window as unknown as { __setFileMissing: (id: string, missing: boolean) => void })
+      .__setFileMissing("100002", true);
+  });
+  await next.locator('[data-col="title"]').dblclick();
+  await expect(page.getByRole("alert")).toHaveText("Load error. The file could not be found.");
+  await expect(title).toHaveText(loaded);
+});
+
+test("eject cancels a file check pending for the same deck (#644)", async ({ page }) => {
+  await open(page, "?missing=7");
+  const title = page.getByTestId("player-title").first();
+  await rowOf(page, 0).locator('[data-col="title"]').dblclick();
+  await expect(title).not.toHaveText("");
+  await page.evaluate(() => {
+    (window as unknown as { __holdFileCheck: (id: string) => void }).__holdFileCheck("100002");
+  });
+  await rowOf(page, 2).locator('[data-col="title"]').dblclick();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __pendingFileChecks: (id: string) => number }).__pendingFileChecks("100002"),
+  )).toBeGreaterThan(0);
+  const pending = await page.evaluate(() =>
+    (window as unknown as { __pendingFileChecks: (id: string) => number }).__pendingFileChecks("100002"),
+  );
+  await page.getByRole("button", { name: "Eject" }).first().click();
+  await expect(title).toHaveText("");
+  await page.evaluate(() => {
+    (window as unknown as { __releaseFileCheck: (id: string) => void }).__releaseFileCheck("100002");
+  });
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __completedFileChecks: () => number }).__completedFileChecks(),
+  )).toBe(pending);
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(title).toHaveText("");
+});
+
+test("the latest load wins when file checks finish in reverse order (#644)", async ({ page }) => {
+  await open(page, "?missing=7");
+  const title = page.getByTestId("player-title").first();
+  const secondTitle = await rowOf(page, 2).locator('[data-col="title"]').innerText();
+  await page.evaluate(() => {
+    const hooks = window as unknown as { __holdFileCheck: (id: string) => void };
+    hooks.__holdFileCheck("100000");
+    hooks.__holdFileCheck("100002");
+  });
+  await rowOf(page, 0).locator('[data-col="title"]').dblclick();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __pendingFileChecks: (id: string) => number }).__pendingFileChecks("100000"),
+  )).toBeGreaterThan(0);
+  const firstPending = await page.evaluate(() =>
+    (window as unknown as { __pendingFileChecks: (id: string) => number }).__pendingFileChecks("100000"),
+  );
+  await rowOf(page, 2).locator('[data-col="title"]').dblclick();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __pendingFileChecks: (id: string) => number }).__pendingFileChecks("100002"),
+  )).toBeGreaterThan(0);
+  const secondPending = await page.evaluate(() =>
+    (window as unknown as { __pendingFileChecks: (id: string) => number }).__pendingFileChecks("100002"),
+  );
+  await page.evaluate(() => {
+    (window as unknown as { __releaseFileCheck: (id: string) => void }).__releaseFileCheck("100002");
+  });
+  await expect(title).toHaveText(secondTitle);
+  await page.evaluate(() => {
+    (window as unknown as { __releaseFileCheck: (id: string) => void }).__releaseFileCheck("100000");
+  });
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __completedFileChecks: () => number }).__completedFileChecks(),
+  )).toBe(firstPending + secondPending);
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(title).toHaveText(secondTitle);
+});
+
 test("the Missing File Manager lists every missing track and relocates them", async ({ page }) => {
   // The manager, then three rescans: longer than one view.
   test.setTimeout(60_000);
@@ -210,4 +311,99 @@ test("the Missing File Manager lists every missing track and relocates them", as
 
   await manager.getByRole("button", { name: "OK" }).click();
   await expect(manager).toHaveCount(0);
+});
+
+/** The Track Title cells of the rows drawn, top to bottom. */
+async function titles(manager: ReturnType<Page["getByRole"]>) {
+  const rows = manager.getByRole("grid", { name: "Missing files" }).locator("[role=row]:has([role=gridcell])");
+  const all = await rows.evaluateAll((elements) => elements
+    .map((row) => ({ top: parseFloat((row as HTMLElement).style.top), title: row.firstElementChild?.textContent ?? "" }))
+    .sort((a, b) => a.top - b.top)
+    .map((row) => row.title));
+  return all;
+}
+
+test("a heading sorts the Missing File Manager forwards, then backwards (#541)", async ({ page }) => {
+  await open(page);
+  const manager = await openManager(page);
+  await expect(manager).toContainText("286 Track");
+  const grid = manager.getByRole("grid", { name: "Missing files" });
+  const heading = grid.getByRole("columnheader", { name: "Track Title" });
+  // [OBS rekordbox 7.2.14] Nothing is sorted when it opens.
+  await expect(heading).toHaveAttribute("aria-sort", "none");
+
+  // Pick the third row: after a sort the selection stays on the third row.
+  await grid.getByRole("row").nth(3).click();
+  const collator = new Intl.Collator("en-US");
+  await heading.click();
+  await expect(heading).toHaveAttribute("aria-sort", "ascending");
+  await expect(heading.locator("svg")).toHaveCount(1);
+  await expect.poll(async () => {
+    const shown = await titles(manager);
+    return shown.length > 5 && shown.every((title, at) => at === 0 || collator.compare(shown[at - 1] ?? "", title) <= 0);
+  }).toBe(true);
+  const ascending = await titles(manager);
+  await expect(grid.getByRole("row", { selected: true })).toHaveCount(1);
+  await expect(grid.getByRole("row", { selected: true }).getByRole("gridcell").first()).toHaveText(ascending[2] ?? "");
+
+  await heading.click();
+  await expect(heading).toHaveAttribute("aria-sort", "descending");
+  await expect.poll(async () => {
+    const shown = await titles(manager);
+    return shown.length > 5 && shown.every((title, at) => at === 0 || collator.compare(shown[at - 1] ?? "", title) >= 0);
+  }).toBe(true);
+  // Another column starts forwards, and only one heading shows an arrow.
+  const artist = grid.getByRole("columnheader", { name: "artist" });
+  await artist.click();
+  await expect(artist).toHaveAttribute("aria-sort", "ascending");
+  await expect(heading).toHaveAttribute("aria-sort", "none");
+  await expect(grid.locator("[role=columnheader] svg")).toHaveCount(1);
+});
+
+test("the Missing File Manager and its columns resize (#541)", async ({ page }) => {
+  await open(page);
+  const manager = await openManager(page);
+  await expect(manager).toContainText("286 Track");
+  const grid = manager.getByRole("grid", { name: "Missing files" });
+
+  // A column from its heading's right edge; the others keep their widths.
+  const title = grid.getByRole("columnheader", { name: "Track Title" });
+  const artist = grid.getByRole("columnheader", { name: "artist" });
+  const before = { title: (await title.boundingBox())!.width, artist: (await artist.boundingBox())!.width };
+  const grip = title.getByRole("separator", { name: "Resize Track Title" });
+  const at = (await grip.boundingBox())!;
+  await page.mouse.move(at.x + at.width / 2, at.y + at.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(at.x + at.width / 2 + 80, at.y + at.height / 2, { steps: 5 });
+  await page.mouse.up();
+  expect((await title.boundingBox())!.width).toBeCloseTo(before.title + 80, 0);
+  expect((await artist.boundingBox())!.width).toBeCloseTo(before.artist, 0);
+  // Dragging an edge does not sort.
+  await expect(title).toHaveAttribute("aria-sort", "none");
+
+  // The window from its bottom-right corner, up to rekordbox's 1024 x 768.
+  const box = (await manager.boundingBox())!;
+  await page.mouse.move(box.x + box.width - 3, box.y + box.height - 3);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width + 100, box.y + box.height + 50, { steps: 5 });
+  await page.mouse.up();
+  const grown = (await manager.boundingBox())!;
+  expect(grown.x).toBeCloseTo(box.x, 0);
+  expect(grown.width).toBeCloseTo(box.width + 103, 0);
+  expect(grown.height).toBeCloseTo(box.height + 53, 0);
+  await page.mouse.move(grown.x + grown.width - 3, grown.y + grown.height - 3);
+  await page.mouse.down();
+  await page.mouse.move(grown.x + grown.width + 1000, grown.y + grown.height + 1000, { steps: 5 });
+  await page.mouse.up();
+  const largest = (await manager.boundingBox())!;
+  expect(largest.width).toBe(1024);
+  expect(largest.height).toBe(768);
+  // And down to 400 x 300.
+  await page.mouse.move(largest.x + largest.width - 3, largest.y + largest.height - 3);
+  await page.mouse.down();
+  await page.mouse.move(largest.x, largest.y, { steps: 5 });
+  await page.mouse.up();
+  const smallest = (await manager.boundingBox())!;
+  expect(smallest.width).toBe(400);
+  expect(smallest.height).toBe(300);
 });

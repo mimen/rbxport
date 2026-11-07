@@ -2191,6 +2191,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "icu_collator"
+version = "2.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08984ed58ac439ebf3e13d2cf26b0c46a60afcd21721c1d14087c0b240344dda"
+dependencies = [
+ "icu_collator_data",
+ "icu_collections",
+ "icu_locale_core",
+ "icu_locale_fallback",
+ "icu_normalizer",
+ "icu_properties",
+ "icu_provider",
+ "smallvec",
+ "utf16_iter",
+ "utf8_iter",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_collator_data"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7d7e54efdddeb1208c08dd5d32b53a879ac00d2d3d051b2255fd26821d16368"
+
+[[package]]
 name = "icu_collections"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2212,10 +2237,31 @@ checksum = "d56e28588da92eee5c3201a6eff33fabdd49b62269c8938d4ff050ce4d900deb"
 dependencies = [
  "displaydoc",
  "litemap",
+ "serde",
  "tinystr",
  "writeable",
  "zerovec",
 ]
+
+[[package]]
+name = "icu_locale_fallback"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "251af8e57c9400e3eb58242fe5b8b1152b2a64fdf4cf632f923c38ccee6f2fa9"
+dependencies = [
+ "icu_locale_core",
+ "icu_locale_fallback_data",
+ "icu_provider",
+ "potential_utf",
+ "tinystr",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_locale_fallback_data"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "decf2a22ec8fa68f1a0c1129a3f8583f8f8bc24e8b9ccbe98ead99f62a4dc3a8"
 
 [[package]]
 name = "icu_normalizer"
@@ -2228,6 +2274,9 @@ dependencies = [
  "icu_properties",
  "icu_provider",
  "smallvec",
+ "utf16_iter",
+ "utf8_iter",
+ "write16",
  "zerovec",
 ]
 
@@ -2266,6 +2315,8 @@ checksum = "d27bbb9d3abbefac45d55f647c9de1d44aafcd1186eb91879afef17c396c3e73"
 dependencies = [
  "displaydoc",
  "icu_locale_core",
+ "serde",
+ "stable_deref_trait",
  "writeable",
  "yoke",
  "zerofrom",
@@ -3689,6 +3740,8 @@ version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
 dependencies = [
+ "serde_core",
+ "writeable",
  "zerovec",
 ]
 
@@ -3949,7 +4002,7 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
 name = "rbl-analysis"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "rbl-anlz",
  "rbl-audio",
@@ -3957,6 +4010,8 @@ dependencies = [
  "rbl-index",
  "realfft",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
@@ -3965,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-anlz"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "dirs 5.0.1",
  "rbl-core",
@@ -3979,7 +4034,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-audio"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "mp3lame-encoder",
  "rbl-core",
@@ -3993,7 +4048,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-backup"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "crc32fast",
  "dirs 5.0.1",
@@ -4013,7 +4068,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-core"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -4029,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-db"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "base64 0.22.1",
  "blowfish",
@@ -4052,7 +4107,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-dbserver"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "socket2",
  "thiserror 2.0.20",
@@ -4061,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-deck"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "cc",
  "cpal",
@@ -4079,7 +4134,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-devices"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "dirs 5.0.1",
  "objc2-core-foundation",
@@ -4098,7 +4153,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-difftool"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "flate2",
  "rbl-db",
@@ -4112,7 +4167,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-export"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "blake3",
  "fs2",
@@ -4136,7 +4191,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-fakecdj"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "rbl-dbserver",
  "rbl-nfs",
@@ -4148,9 +4203,11 @@ dependencies = [
 
 [[package]]
 name = "rbl-index"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "crc32fast",
+ "icu_collator",
+ "icu_locale_core",
  "memchr",
  "parking_lot",
  "rbl-core",
@@ -4165,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-link"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "alphatheta-connect",
  "core-foundation 0.10.1",
@@ -4192,7 +4249,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-nfs"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "if-addrs",
  "nix",
@@ -4205,7 +4262,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-onelibrary"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "flate2",
  "rbl-anlz",
@@ -4218,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-pdb"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
@@ -4226,7 +4283,7 @@ dependencies = [
 
 [[package]]
 name = "rbl-prolink"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4237,14 +4294,17 @@ dependencies = [
 
 [[package]]
 name = "rbxport"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
  "dirs 5.0.1",
  "drag",
+ "icu_collator",
+ "icu_locale_core",
  "if-addrs",
  "libc",
+ "lofty",
  "midir",
  "minisign-verify",
  "objc2",
@@ -6069,6 +6129,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1e27c91459209c2986af3dcf603a5a74a4368754ce37414f59acc971167f643"
 dependencies = [
  "displaydoc",
+ "serde_core",
  "zerovec",
 ]
 
@@ -6599,6 +6660,12 @@ dependencies = [
  "unic-ucd-ident",
  "url",
 ]
+
+[[package]]
+name = "utf16_iter"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8232dd3cdaed5356e0f716d285e4b40b932ac434100fe9b7e0e8e935b9e6246"
 
 [[package]]
 name = "utf8-zero"
@@ -7653,6 +7720,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "write16"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1890f4022759daae28ed4fe62859b1236caebfc61ede2f63ed4e695f3f6d936"
+
+[[package]]
 name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7882,6 +7955,7 @@ dependencies = [
  "displaydoc",
  "yoke",
  "zerofrom",
+ "zerovec",
 ]
 
 [[package]]
@@ -7890,6 +7964,7 @@ version = "0.11.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb0464e17806c1d976d5cba29399c7f08e516e279e2ba493f63123b5fca67dd8"
 dependencies = [
+ "serde",
  "yoke",
  "zerofrom",
  "zerovec-derive",

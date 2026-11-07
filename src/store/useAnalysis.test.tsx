@@ -3,7 +3,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAnalysis, type Analysis } from "./useAnalysis";
-import type { AnalysisPreferences } from "@/lib/preferences";
+import { DEFAULT_PREFERENCES, type AnalysisPreferences } from "@/lib/preferences";
+import { PreferencesProvider } from "./usePreferences";
 import type { AnalysisResult } from "@/ipc/types";
 
 const held = vi.hoisted(() => ({ analyseTrack: vi.fn() }));
@@ -24,7 +25,7 @@ beforeEach(() => {
 it("appends to a running batch, stops waiting work, and starts the next run fresh", async () => {
   const finish = new Map<string, (result: AnalysisResult) => void>();
   held.analyseTrack.mockImplementation((id: string) => new Promise<AnalysisResult>(resolve => { finish.set(id, resolve); }));
-  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true }} />); await Promise.resolve(); });
   await act(async () => { analysis.add([{ id: "a", title: "First" }, { id: "b", title: "Second" }]); await Promise.resolve(); });
   await act(async () => { analysis.add([{ id: "a", title: "First" }, { id: "c", title: "Added" }]); await Promise.resolve(); });
   expect(analysis.total).toBe(3);
@@ -46,34 +47,34 @@ it("appends to a running batch, stops waiting work, and starts the next run fres
 afterEach(() => { act(() => root.unmount()); host.remove(); vi.unstubAllGlobals(); });
 
 it("captures each batch's settings before preference changes or another batch", async () => {
-  await act(async () => { root.render(<Harness preferences={{ mode: "rekordbox", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rekordbox", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true }} />); await Promise.resolve(); });
   await act(async () => { analysis.add([{ id: "a", title: "First" }, { id: "b", title: "Waiting" }]); await Promise.resolve(); });
   const defaults = { mode: "rekordbox", bpmGrid: true, key: true, highPrecision: true, minBpm: 70, maxBpm: 180, firstBeatCue: false };
   expect(held.analyseTrack).toHaveBeenCalledWith("a", "rekordbox", defaults);
   const chosen = { mode: "rbxport" as const, bpmGrid: false, key: true, highPrecision: false, minBpm: 98, maxBpm: 195, firstBeatCue: true };
   await act(async () => {
-    root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false }} />);
+    root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true }} />);
     analysis.add([{ id: "c", title: "Key only" }], chosen);
     await Promise.resolve();
   });
   chosen.key = false;
   expect(analysis.state.pending.map(item => item.analysis)).toEqual([defaults, { ...chosen, key: true }]);
   // Once more slots open, both waiting tracks use their own saved choices.
-  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 3, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 3, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true }} />); await Promise.resolve(); });
   expect(held.analyseTrack).toHaveBeenCalledWith("b", "rekordbox", defaults);
   expect(held.analyseTrack).toHaveBeenCalledWith("c", "rbxport", { ...chosen, key: true });
 });
 
 it("queues automatic batches with the first-beat cue preference captured", async () => {
-  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: true, bpmRange: "70-180", writeKeyTag: false }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: true, bpmRange: "70-180", writeKeyTag: false, detectKey: true }} />); await Promise.resolve(); });
   await act(async () => { analysis.add([{ id: "a", title: "Imported" }, { id: "b", title: "Waiting" }]); await Promise.resolve(); });
   expect(held.analyseTrack).toHaveBeenCalledWith("a", "rbxport", expect.objectContaining({ firstBeatCue: true }));
-  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true }} />); await Promise.resolve(); });
   expect(analysis.state.pending[0]?.analysis?.firstBeatCue).toBe(true);
 });
 
 it("re-analysis asked for during Auto Relocate waits, says so, and runs once the relocate ends (#286)", async () => {
-  const preferences: AnalysisPreferences = { mode: "rbxport", concurrentTracks: 3, auto: false, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false };
+  const preferences: AnalysisPreferences = { mode: "rbxport", concurrentTracks: 3, auto: false, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true };
   await act(async () => { root.render(<Harness preferences={preferences} held />); await Promise.resolve(); });
   await act(async () => { analysis.add([{ id: "moved", title: "Moved" }]); await Promise.resolve(); });
   expect(held.analyseTrack).not.toHaveBeenCalled();
@@ -85,27 +86,41 @@ it("re-analysis asked for during Auto Relocate waits, says so, and runs once the
 });
 
 it("queues automatic batches with the Preferences BPM Range", async () => {
-  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "108-215", writeKeyTag: false }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "108-215", writeKeyTag: false, detectKey: true }} />); await Promise.resolve(); });
   await act(async () => { analysis.add([{ id: "a", title: "Imported" }, { id: "b", title: "Waiting" }]); await Promise.resolve(); });
   expect(held.analyseTrack).toHaveBeenCalledWith("a", "rbxport", expect.objectContaining({ minBpm: 108, maxBpm: 215 }));
-  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true }} />); await Promise.resolve(); });
   expect(analysis.state.pending[0]?.analysis).toEqual(expect.objectContaining({ minBpm: 108, maxBpm: 215 }));
 });
 
 it("asks for the key to be written into the file only with Write the value to the ID3 tag on (#204)", async () => {
-  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 2, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 2, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true }} />); await Promise.resolve(); });
   await act(async () => { analysis.add([{ id: "off", title: "Off" }]); await Promise.resolve(); });
   expect(held.analyseTrack).toHaveBeenLastCalledWith("off", "rbxport", expect.anything());
   // On: in the key display format, which is Classic by default.
-  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 2, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: true }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 2, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: true, detectKey: true }} />); await Promise.resolve(); });
   await act(async () => { analysis.add([{ id: "on", title: "On" }]); await Promise.resolve(); });
   expect(held.analyseTrack).toHaveBeenLastCalledWith("on", "rbxport", expect.anything(), "classic");
+});
+
+it("passes Alphanumeric display to analysis even when tag writing is off (#646)", async () => {
+  const preferences: AnalysisPreferences = { mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true };
+  await act(async () => {
+    root.render(
+      <PreferencesProvider value={{ preferences: { ...DEFAULT_PREFERENCES, view: { ...DEFAULT_PREFERENCES.view, keyDisplay: "alphanumeric" } }, update: () => {}, reset: () => {} }}>
+        <Harness preferences={preferences} />
+      </PreferencesProvider>,
+    );
+    await Promise.resolve();
+  });
+  await act(async () => { analysis.add([{ id: "key", title: "Detected" }]); await Promise.resolve(); });
+  expect(held.analyseTrack).toHaveBeenCalledWith("key", "rbxport", expect.anything(), undefined, undefined, "alphanumeric");
 });
 
 it("analyses a deck's track next, ahead of a batch, and asks for it to be drawn", async () => {
   const finish = new Map<string, (result: AnalysisResult) => void>();
   held.analyseTrack.mockImplementation((id: string) => new Promise<AnalysisResult>(resolve => { finish.set(id, resolve); }));
-  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: false, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false }} />); await Promise.resolve(); });
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: false, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: true }} />); await Promise.resolve(); });
   await act(async () => { analysis.add([{ id: "a", title: "First" }, { id: "b", title: "Waiting" }]); await Promise.resolve(); });
   await act(async () => { analysis.draw({ id: "deck", title: "Loaded" }); await Promise.resolve(); });
   expect(analysis.state.pending.map(item => item.id)).toEqual(["deck", "b"]);
@@ -117,4 +132,10 @@ it("analyses a deck's track next, ahead of a batch, and asks for it to be drawn"
   expect(held.analyseTrack.mock.calls.at(-1)).toEqual(["deck", "rbxport", defaults, undefined, true]);
   // The batch's own tracks are not drawn.
   expect(held.analyseTrack.mock.calls[0]).toEqual(["a", "rbxport", defaults]);
+});
+
+it("queues tracks without key analysis when Analyze key is off", async () => {
+  await act(async () => { root.render(<Harness preferences={{ mode: "rbxport", concurrentTracks: 1, auto: true, firstBeatCue: false, bpmRange: "70-180", writeKeyTag: false, detectKey: false }} />); await Promise.resolve(); });
+  await act(async () => { analysis.add([{ id: "a", title: "First" }]); await Promise.resolve(); });
+  expect(held.analyseTrack).toHaveBeenCalledWith("a", "rbxport", expect.objectContaining({ bpmGrid: true, key: false }));
 });

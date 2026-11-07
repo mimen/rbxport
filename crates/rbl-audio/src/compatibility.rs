@@ -51,16 +51,14 @@ impl Format {
 fn error(e: impl std::fmt::Display) -> AudioError {
     AudioError::Unsupported(e.to_string())
 }
-fn open(path: &Path) -> Result<Box<dyn symphonia::core::formats::FormatReader>> {
-    let stream = MediaSourceStream::new(
-        Box::new(File::open(path)?),
-        MediaSourceStreamOptions::default(),
-    );
+fn open(path: &Path) -> Result<(Box<dyn symphonia::core::formats::FormatReader>, crate::aifc::Aifc)> {
+    let (source, aifc) = crate::aifc::open(path)?;
+    let stream = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
         hint.with_extension(ext);
     }
-    Ok(symphonia::default::get_probe()
+    let format = symphonia::default::get_probe()
         .format(
             &hint,
             stream,
@@ -70,8 +68,9 @@ fn open(path: &Path) -> Result<Box<dyn symphonia::core::formats::FormatReader>> 
             },
             &MetadataOptions::default(),
         )
-        .map_err(error)?
-        .format)
+        .map_err(|e| error(aifc.describe(e)))?
+        .format;
+    Ok((format, aifc))
 }
 
 /// Conservative common denominator for USB-capable CDJs: MPEG-1 MP3 or
@@ -91,7 +90,7 @@ pub struct AudioProperties {
 }
 
 pub fn inspect(path: &Path) -> Result<AudioProperties> {
-    let format = open(path)?;
+    let (format, aifc) = open(path)?;
     let track = format.default_track().ok_or(AudioError::NoTrack)?;
     let p = &track.codec_params;
     let ext = path
@@ -102,7 +101,11 @@ pub fn inspect(path: &Path) -> Result<AudioProperties> {
     let codec_ok = match ext.as_str() {
         "mp3" => p.codec == CODEC_TYPE_MP3,
         "wav" => p.codec == CODEC_TYPE_PCM_S16LE || p.codec == CODEC_TYPE_PCM_S24LE,
-        "aif" | "aiff" => p.codec == CODEC_TYPE_PCM_S16BE || p.codec == CODEC_TYPE_PCM_S24BE,
+        // A player reads the compression type itself, so an alias symphonia
+        // is shown past (`in24` for `NONE`) is converted, not copied.
+        "aif" | "aiff" => {
+            !aifc.aliased && (p.codec == CODEC_TYPE_PCM_S16BE || p.codec == CODEC_TYPE_PCM_S24BE)
+        }
         _ => false,
     };
     Ok(AudioProperties { compatible: codec_ok
@@ -118,9 +121,11 @@ struct Output {
     encoder: Option<mp3lame_encoder::Encoder>,
     bytes: Vec<u8>,
     frames: u64,
+    byte_limit: Option<u64>,
+    bytes_written: u64,
 }
 impl Output {
-    fn new(path: &Path, format: Format) -> Result<Self> {
+    fn new(path: &Path, format: Format, byte_limit: Option<u64>) -> Result<Self> {
         // create_new also prevents accidentally overwriting a source path.
         let mut file = BufWriter::new(File::options().write(true).create_new(true).open(path)?);
         let encoder = if format == Format::Mp3 {
@@ -158,7 +163,15 @@ impl Output {
             encoder,
             bytes: Vec::with_capacity(16384),
             frames: 0,
+            byte_limit,
+            bytes_written: if format == Format::Mp3 { 0 } else if format == Format::Wav { 44 } else { 54 },
         })
+    }
+    fn check_bytes(byte_limit: Option<u64>, bytes_written: u64, additional: usize) -> Result<()> {
+        if byte_limit.is_some_and(|limit| bytes_written.saturating_add(additional as u64) > limit) {
+            return Err(AudioError::Io(std::io::Error::new(std::io::ErrorKind::StorageFull, "conversion exceeds internal cache limit")));
+        }
+        Ok(())
     }
     fn write(&mut self, left: &[f32], right: &[f32]) -> Result<()> {
         self.bytes.clear();
@@ -190,7 +203,9 @@ impl Output {
                 }
             }
         }
+        Self::check_bytes(self.byte_limit, self.bytes_written, self.bytes.len())?;
         self.file.write_all(&self.bytes)?;
+        self.bytes_written += self.bytes.len() as u64;
         self.frames += left.len() as u64;
         Ok(())
     }
@@ -204,7 +219,9 @@ impl Output {
             encoder
                 .flush_to_vec::<mp3lame_encoder::FlushGap>(&mut self.bytes)
                 .map_err(error)?;
+            Self::check_bytes(self.byte_limit, self.bytes_written, self.bytes.len())?;
             self.file.write_all(&self.bytes)?;
+            self.bytes_written += self.bytes.len() as u64;
             // Replace the reserved Info frame with duration/delay/padding.
             self.bytes.clear();
             self.bytes.reserve(encoder.lame_tag_size());
@@ -272,7 +289,14 @@ pub fn convert(source: &Path, destination: &Path, target: Format) -> Result<u64>
 /// Progress is decoded milliseconds; false cancels between audio packets.
 #[allow(clippy::too_many_lines, reason = "linear streaming decode and resample loop")]
 pub fn convert_observed(source: &Path, destination: &Path, target: Format, progress: &mut dyn FnMut(u64, Option<u64>) -> bool) -> Result<u64> {
-    let mut format = open(source)?;
+    convert_observed_limited(source, destination, target, None, progress)
+}
+
+/// Limit the bytes written to a conversion staging file. The limit is checked
+/// before each encoded packet is written, including the final MP3 flush.
+#[allow(clippy::too_many_lines, reason = "linear streaming decode and resample loop")]
+pub fn convert_observed_limited(source: &Path, destination: &Path, target: Format, byte_limit: Option<u64>, progress: &mut dyn FnMut(u64, Option<u64>) -> bool) -> Result<u64> {
+    let (mut format, _) = open(source)?;
     let track = format.default_track().ok_or(AudioError::NoTrack)?;
     let track_id = track.id;
     let params = &track.codec_params;
@@ -302,7 +326,7 @@ pub fn convert_observed(source: &Path, destination: &Path, target: Format, progr
     let mut decoder = symphonia::default::get_codecs()
         .make(params, &DecoderOptions::default())
         .map_err(error)?;
-    let mut output = Output::new(destination, target)?;
+    let mut output = Output::new(destination, target, byte_limit)?;
     let mut resampler = if rate == RATE {
         None
     } else {
@@ -405,6 +429,16 @@ mod tests {
     use super::*;
     fn fixture() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stereo-96k.flac")
+    }
+
+    #[test]
+    fn limited_conversion_stops_before_exceeding_cache_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("limited.wav");
+        let limit = 1024;
+        let error = convert_observed_limited(&fixture(), &dest, Format::Wav, Some(limit), &mut |_, _| true).unwrap_err();
+        assert!(matches!(error, AudioError::Io(ref io) if io.kind() == std::io::ErrorKind::StorageFull));
+        assert!(std::fs::metadata(&dest).unwrap().len() <= limit);
     }
 
     #[test]

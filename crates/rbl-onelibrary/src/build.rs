@@ -21,9 +21,16 @@ use reference::{COLORS, MENU_ITEMS};
 /// `dbVersion` written into `property`, as the reference export carries it.
 pub const DB_VERSION: &str = "1000";
 
+/// Other `dbVersion` strings rekordbox writes into `exportLibrary.db`, for
+/// which a sync may rebuild the database when the tables and columns match
+/// [`DB_VERSION`]'s. "10000" is read from two reporters' diagnostic logs
+/// (issues #618 and #796) [OBS]; the tables on those sticks were not seen
+/// [UNKNOWN], hence the structural check.
+pub const ALSO_READABLE_DB_VERSIONS: &[&str] = &["10000"];
+
 /// The schema, verbatim from a real export. Twenty-two tables, several of
 /// which stay empty but must exist.
-const SCHEMA: &[&str] = &[
+pub(crate) const SCHEMA: &[&str] = &[
     "CREATE TABLE album(album_id integer primary key, name varchar, artist_id integer, image_id integer, isComplation integer, nameForSearch varchar)",
     "CREATE TABLE artist(artist_id integer primary key, name varchar, nameForSearch varchar)",
     "CREATE TABLE category(category_id integer primary key, menuItem_id integer, sequenceNo integer, isVisible integer)",
@@ -359,9 +366,13 @@ impl Builder {
             ],
         )?;
         self.conn.execute(
-            "UPDATE content SET discNo=?2,bitDepth=?3,djPlayCount=?4,analysedBits=?5,isHotCueAutoLoadOn=?6,dateCreated=?7,isrc=?8,fileType=?9 WHERE content_id=?1",
+            "UPDATE content SET discNo=?2,bitDepth=?3,djPlayCount=?4,analysedBits=?5,isHotCueAutoLoadOn=?6,dateCreated=?7,isrc=?8,fileType=?9,contentLink=?10 WHERE content_id=?1",
             params![track.content_id,track.metadata.disc_number,track.metadata.bit_depth,track.metadata.play_count,
-                track.metadata.analysed & !64,track.metadata.hot_cue_auto_load,track.metadata.date_created,track.metadata.isrc,track.file_type],
+                track.metadata.analysed & !64,track.metadata.hot_cue_auto_load,track.metadata.date_created,track.metadata.isrc,track.file_type,
+                // rekordbox reads the analysis flags here as whether the
+                // stick's analysis is its own version's (#640); an unknown
+                // link stays empty, as it always was.
+                (track.metadata.content_link != 0).then_some(track.metadata.content_link)],
         )?;
         self.tracks += 1;
         Ok(())

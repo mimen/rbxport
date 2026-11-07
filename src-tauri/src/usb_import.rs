@@ -2,7 +2,7 @@
 use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::Arc};
 use serde::Serialize;
 use tauri::{State, Manager};
-use crate::{commands::{blocking, reload, write_error}, dto::{DeviceLibraryTreeDto, DevicePlaylistNodeDto}, error::{AppError, AppResult, ErrorKind}, state::AppState};
+use crate::{commands::{announce_history, blocking, reload, write_error, wrote_outside_history}, dto::{DeviceLibraryTreeDto, DevicePlaylistNodeDto}, error::{AppError, AppResult, ErrorKind}, state::AppState};
 
 mod ratings;
 
@@ -70,7 +70,13 @@ pub async fn import_usb<R: tauri::Runtime>(app: tauri::AppHandle<R>, state: Stat
     let result = blocking("import_usb", move || import(&worker, &editor, Path::new(&path), cues, history, settings, ratings)).await;
     match result {
         Ok(result) => {
-            if result.tracks > 0 || result.histories > 0 || result.ratings > 0 { reload(app.clone(), state).await?; }
+            if result.tracks > 0 || result.histories > 0 || result.ratings > 0 {
+                // Cues, histories and ratings written outside the library
+                // history: a Redo must not put back a rating this replaced.
+                wrote_outside_history(&state, false);
+                reload(app.clone(), Arc::clone(&state)).await?;
+                announce_history(&app, &state);
+            }
             for id in &result.changed {
                 let _ = tauri::Emitter::emit(&app, "grid:changed", id);
                 let _ = tauri::Emitter::emit(&app, "cues:changed", id);
@@ -79,7 +85,10 @@ pub async fn import_usb<R: tauri::Runtime>(app: tauri::AppHandle<R>, state: Stat
         }
         Err(e) => {
             tracing::error!(path = %log_path, cues, history, settings, ratings, error = %e, "USB import failed");
-            let _ = reload(app, state).await;
+            // Part of it may have landed before the failure.
+            wrote_outside_history(&state, false);
+            let _ = reload(app.clone(), Arc::clone(&state)).await;
+            announce_history(&app, &state);
             Err(e)
         }
     }
@@ -145,6 +154,16 @@ fn import(state: &AppState, editor: &crate::grid::GridEditor, root: &Path, cues:
             // an hour (#284).
             if editor.is_locked(id) || state.read_db(|db| crate::grid::locked_in(db, id)).map_err(write_error)? { report.skipped += 1; continue; }
             if analysis.is_empty() { report.skipped += 1; continue; }
+            let source_path = root.join(analysis.trim_start_matches('/'));
+            match std::fs::metadata(&source_path) {
+                Ok(_) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    report.skipped += 1;
+                    report.warnings.push(format!("Track {id}: USB analysis file is missing ({analysis}); cues and grid were left unchanged."));
+                    continue;
+                }
+                Err(e) => return Err(err(e)),
+            }
             let source = within(root, analysis)?;
             let source_dat = rbl_anlz::Anlz::read(&source).map_err(err)?;
             // `source` is canonical and `root` need not be (a symlinked mount),
@@ -260,17 +279,22 @@ fn retain_live(state: &AppState, tracks: &mut HashMap<u32, (String, String)>) ->
 /// would write for `entries`. Compared as a set: the order rows were
 /// inserted in carries no meaning.
 fn database_cues_match(state: &AppState, id: &str, entries: &[rbl_anlz::CueEntry]) -> AppResult<bool> {
-    type Row = (i64, Option<i64>, i64, i64, String);
+    // A memory cue's colour is its `Color`, 0-7; any other value is none,
+    // as rekordbox reads it, so 255 and -1 compare as one.
+    type Row = (i64, Option<i64>, i64, Option<i64>, i64, String);
     let mut wanted: Vec<Row> = entries.iter().map(|cue| {
-        let kind = if cue.hot_cue >= 4 { cue.hot_cue + 1 } else { cue.hot_cue };
         let end = (cue.kind == 2).then_some(i64::from(cue.loop_time_ms));
-        (i64::from(cue.time_ms), end, i64::from(kind), i64::from(cue.color_code.unwrap_or(cue.color_id)), cue.comment.clone().unwrap_or_default())
+        let memory = Some(cue.library_color()).filter(|c| (0..=7).contains(c) && cue.hot_cue == 0);
+        (i64::from(cue.time_ms), end, i64::from(cue.library_kind()), memory, i64::from(cue.library_color_table_index()), cue.comment.clone().unwrap_or_default())
     }).collect();
     let mut stored: Vec<Row> = state.read_db(|db| {
         let mut q = db.connection().prepare(
-            "SELECT COALESCE(InMsec,0), OutMsec, COALESCE(Kind,0), COALESCE(ColorTableIndex,0), COALESCE(Comment,'') FROM djmdCue WHERE ContentID=?1 AND rb_local_deleted=0",
+            "SELECT COALESCE(InMsec,0), OutMsec, COALESCE(Kind,0),
+                    CASE WHEN Kind IN (0,4) AND Color BETWEEN 0 AND 7 THEN Color END,
+                    COALESCE(ColorTableIndex,0), COALESCE(Comment,'')
+             FROM djmdCue WHERE ContentID=?1 AND rb_local_deleted=0",
         )?;
-        let rows = q.query_map([id], |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.filter(|end| *end >= 0), r.get(2)?, r.get(3)?, r.get(4)?)))?
+        let rows = q.query_map([id], |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.filter(|end| *end >= 0), r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
             .collect::<Result<Vec<Row>, _>>()?;
         Ok(rows)
     }).map_err(write_error)?;
@@ -347,7 +371,29 @@ mod tests {
         editor.set_locked(&id, true).unwrap();
         assert_eq!(import(&state, &editor, &usb, true, false, false, false).unwrap().skipped, 1);
         editor.set_locked(&id, false).unwrap();
+        // A USB database can still name an analysis file that has been
+        // removed. Preserve the other USB bytes and the local library, then
+        // make the same attempt twice: the missing track must not abort sync.
+        let usb_dat = usb.join(anlz).join("ANLZ0000.DAT");
+        std::fs::remove_file(&usb_dat).unwrap();
+        let marker = usb.join("unrelated.bin");
+        std::fs::write(&marker, b"keep this USB file").unwrap();
+        let before = (stamp(&state), std::fs::read(&target).unwrap(), std::fs::read(&marker).unwrap());
+        for _ in 0..2 {
+            let missing = import(&state, &editor, &usb, true, false, false, false).unwrap();
+            assert_eq!((missing.tracks, missing.skipped), (0, 1));
+            assert_eq!(missing.warnings.len(), 1);
+            assert!(missing.warnings[0].contains("analysis file is missing"));
+            assert_eq!((stamp(&state), std::fs::read(&target).unwrap(), std::fs::read(&marker).unwrap()), before);
+        }
         let mut manifest = rbl_export::Manifest::load(&usb).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("ANLZ0000.DAT"), std::fs::read(&target).unwrap()).unwrap();
+        manifest.tracks[0].anlz_dir = "../outside".into();
+        manifest.save(&usb).unwrap();
+        assert!(import(&state, &editor, &usb, true, false, false, false).is_err(), "an analysis path outside the USB is rejected");
+        assert_eq!((stamp(&state), std::fs::read(&target).unwrap(), std::fs::read(&marker).unwrap()), before, "failed import leaves library and unrelated USB bytes intact");
         manifest.tracks[0].anlz_dir.clear();
         manifest.save(&usb).unwrap();
         // Identity remains available for history even without cue analysis.
@@ -466,11 +512,22 @@ mod tests {
         cues[1].comment = "Break".into();
         write_stick(&usb.join(anlz), &cues);
         import_then_unchanged("hot cue A renamed");
-        // A memory cue's colour row lives only in the analysis files (the
-        // row keeps `Color` 255), so only the file comparison can see it.
+        // A memory cue's colour row is stored one down in `Color`, as
+        // rekordbox reads it back (#617): row 3 is Orange, 2.
+        let memory_colour = |state: &AppState| state.read_db(|db| Ok(db.connection().query_row(
+            "SELECT Color FROM djmdCue WHERE ContentID=?1 AND rb_local_deleted=0 AND InMsec=1000", [&id], |r| r.get::<_, i64>(0))?)).unwrap();
+        assert_eq!(memory_colour(&state), 255, "no colour row, no colour");
         cues[0].color_id = 3;
         write_stick(&usb.join(anlz), &cues);
         import_then_unchanged("memory cue colour row changed");
+        assert_eq!(memory_colour(&state), 2, "colour row 3 is Orange");
+        // The library's colour alone differing is a change too: the stick's
+        // is written back.
+        let memory: String = state.read_db(|db| Ok(db.connection().query_row(
+            "SELECT ID FROM djmdCue WHERE ContentID=?1 AND rb_local_deleted=0 AND InMsec=1000", [&id], |r| r.get(0))?)).unwrap();
+        state.write(|w| w.set_cue_colour(&memory, Some(6))).unwrap();
+        import_then_unchanged("memory cue recoloured in the library");
+        assert_eq!(memory_colour(&state), 2);
         assert!(rows(&state).contains(&(2000, None, 1, 46, Some("Break".into()))));
         assert!(rows(&state).contains(&(3500, None, 6, 1, Some(String::new()))));
 
@@ -548,6 +605,15 @@ mod tests {
         let editor = crate::grid::GridEditor::at(state.backup_dir());
         let cues = import(&state, &editor, &usb, true, false, false, false).unwrap();
         assert_eq!((cues.tracks, cues.skipped), (1, 2), "the live track's cues come in; the other two are skipped");
+        let local_before = std::fs::read(&target).unwrap();
+        let usb_db_before = std::fs::read(&one).unwrap();
+        std::fs::remove_file(usb.join(".PIONEER/USBANLZ/P000/00000001/ANLZ0000.DAT")).unwrap();
+        let missing = import(&state, &editor, &usb, true, false, false, false).unwrap();
+        assert_eq!((missing.tracks, missing.skipped), (0, 3));
+        assert_eq!(missing.warnings.len(), 1);
+        assert!(missing.warnings[0].contains("analysis file is missing"));
+        assert_eq!(std::fs::read(&target).unwrap(), local_before);
+        assert_eq!(std::fs::read(&one).unwrap(), usb_db_before);
         let history = import(&state, &editor, &usb, false, true, false, false).unwrap();
         assert_eq!(history.histories, 1, "the session of library tracks comes in");
         assert_eq!(history.skipped, 2);
@@ -590,6 +656,41 @@ mod tests {
         }
         builder.finish("Playlist 1 HFS+", "2026-10-09", 0).unwrap();
         (state, location, usb, tracks)
+    }
+
+    #[test]
+    fn a_missing_usb_analysis_file_does_not_block_other_cue_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, location, usb, tracks) = library_and_stick(dir.path());
+        let mut local = Vec::new();
+        for index in 0..2 {
+            let id = rbl_db::fixture::track_id(index);
+            let relative = state.write(|w| w.analysis_data_path_for(&id)).unwrap();
+            state.write(|w| w.register_analysis(&id, &rbl_db::write::AnalysisRegistration {
+                bpm_x100: 12000, key: None, analysis_data_path: &relative,
+            })).unwrap();
+            let target = rbl_anlz::resolve(&location.share_root, &relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let mut original = rbl_anlz::write::AnlzBuilder::new();
+            original.path("/original.mp3").beat_grid(&[rbl_anlz::Beat { beat_number: 1, tempo_x100: 12000, time_ms: 0 }]).cue_lists(true);
+            std::fs::write(&target, original.finish()).unwrap();
+            local.push(target);
+        }
+        let missing = usb.join("PIONEER/USBANLZ/P000/00000001/ANLZ0000.DAT");
+        std::fs::remove_file(&missing).unwrap();
+        let before_missing = std::fs::read(&local[0]).unwrap();
+        let usb_db = usb.join("PIONEER/rekordbox/exportLibrary.db");
+        let before_usb_db = std::fs::read(&usb_db).unwrap();
+        let editor = crate::grid::GridEditor::at(state.backup_dir());
+        let report = import(&state, &editor, &usb, true, false, false, false).unwrap();
+        assert_eq!((report.tracks, report.skipped), (1, tracks - 1));
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("analysis file is missing"));
+        assert_eq!(std::fs::read(&local[0]).unwrap(), before_missing);
+        assert_eq!(rbl_anlz::Anlz::read(&local[1]).unwrap().beat_grid().unwrap()[0].time_ms, 250);
+        assert_eq!(std::fs::read(&usb_db).unwrap(), before_usb_db);
+        let repeat = import(&state, &editor, &usb, true, false, false, false).unwrap();
+        assert_eq!((repeat.tracks, repeat.unchanged, repeat.skipped), (0, 1, tracks - 1));
     }
 
     /// Importing cues reads two things from the library for each track on

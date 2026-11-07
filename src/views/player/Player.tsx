@@ -41,8 +41,10 @@ import {
   detailSpan,
   dragSeconds,
   JUMP_SIZE_ID,
+  type JumpSize,
   jumpSizeById,
   jumpStepSeconds,
+  movedLoopByBeats,
   zoomBy,
   createWheelZoomGate,
   isWheelNotch,
@@ -50,6 +52,8 @@ import {
   OVERDRAW,
   scrollOffset,
   snapOffset,
+  overviewHeadWidth,
+  playheadWidth,
   pressCue,
   releaseCue,
   beatCountText,
@@ -83,12 +87,13 @@ import { TempoToggle } from "./TempoToggle";
 import { TempoSlider } from "./TempoSlider";
 import type { HotCueColor } from "@/lib/preferences";
 import { hotCueColour } from "@/lib/hotCueColours";
+import { memoryCueMarkerColour } from "@/lib/memoryCueColours";
 import { formatKey, quantizeFraction } from "@/lib/preferences";
 import { loadDeckQuantize, saveDeckQuantize } from "@/lib/deckQuantize";
 import {
   beatNudgeFor, beatWait, inPhaseAt, MAX_TEMPO, MIN_TEMPO, syncTo, tempoFor, type Deck as SyncDeck,
 } from "@/lib/sync";
-import { detectPlatform, dispatchBinding, matchBinding, type Action } from "@/lib/shortcuts";
+import { detectPlatform, dispatchBinding, FIXED_JUMPS, matchBinding, type Action } from "@/lib/shortcuts";
 import { runCommand, type CommandHandler, type CommandHandlers, type CommandInput } from "@/lib/commands";
 import { useCommands } from "@/store/useCommands";
 import { keyMap } from "@/lib/keyPresets";
@@ -97,6 +102,7 @@ import { SimplePlayer } from "./SimplePlayer";
 import { JumpMenu } from "./JumpMenu";
 import { VocalStrip } from "./VocalStrip";
 import { useTrackCues } from "./useTrackCues";
+import { usePlayRecorder } from "./usePlayRecorder";
 import { previousRestarts } from "@/lib/continuousPlay";
 import { useTrackDetails } from "./useTrackDetails";
 import { useTrackGrid } from "./useTrackGrid";
@@ -105,6 +111,7 @@ import { nudgeGrid } from "@/lib/gridEdit";
 import { listenEditHistory } from "@/lib/editHistory";
 import { registerDeck } from "@/lib/scripting";
 import { useHoldRepeat } from "./useHoldRepeat";
+import { jumpHead } from "./beatJump";
 import { DeckInfo } from "./DeckInfo";
 import { DualControls, DualHead } from "./DualDeck";
 import { READ_ONLY_REASON, useMemoryCues } from "./useMemoryCues";
@@ -192,6 +199,17 @@ export interface PlayerProps {
    */
   publishZoom?: ((zoom: (by: number) => void) => void) | undefined;
   /**
+   * The pair's zoom, for the wheel over this deck's detail waveform.
+   *
+   * rekordbox 7.2.19's `djplay::PlayerWaveView::mouseWheelMove` @0x100c93584
+   * hands a wheel step to `WaveViewArea::triggerZoomInOut` @0x100c936e0, the
+   * same call the + and − buttons make, and that steps both decks. A wheel
+   * that zoomed one deck alone let the two drift apart, so the cluster then
+   * zoomed one closer than the other (#602). Left out, the wheel zooms this
+   * deck, which is all a deck on its own has.
+   */
+  onWheelZoom?: ((by: number) => void) | undefined;
+  /**
    * The waveform zoom and the beat-jump size, when something outside is
    * driving them.
    *
@@ -222,7 +240,15 @@ export interface PlayerProps {
    * the flag, since the master is the shell's to name.
    */
   synced?: boolean;
+  /**
+   * BEAT SYNC lit. The master's can be lit too, as in rekordbox, but the
+   * master leads rather than follows, so `synced` is false for it. Defaults
+   * to `synced`.
+   */
+  syncOn?: boolean | undefined;
   onSyncToggle?: (() => void) | undefined;
+  /** This deck started playing: the first deck to play takes MASTER. */
+  onStartPlaying?: (() => void) | undefined;
   /**
    * The tempo the master is playing at, in hundredths of a BPM, or null
    * with no master track. A synced deck re-matches whenever it changes —
@@ -277,8 +303,8 @@ export interface PlayerProps {
  *
  * A hot cue always gets one: its own, or the default View › Color › HOT CUE
  * color gives its slot when it has none (`hotCueColour`), as rekordbox draws
- * an uncoloured cue. A memory cue only gets its own; without one the
- * stylesheet's fallback draws it. An empty pad gets none.
+ * an uncoloured cue. A memory cue gets its marker colour on the waveforms
+ * (`memoryCueMarkerColour`), red when it has none. An empty pad gets none.
  */
 export function cueStyle(
   left: string | undefined,
@@ -289,8 +315,8 @@ export function cueStyle(
   if (left !== undefined) style.left = left;
   if (cue && !cue.memory && cue.letter !== "") {
     style["--cue-colour"] = hotCueColour(cue.colour, cue.letter, cue.outMs > cue.positionMs, hotCueColor);
-  } else if (cue?.colour) {
-    style["--cue-colour"] = cue.colour;
+  } else if (cue?.memory) {
+    style["--cue-colour"] = memoryCueMarkerColour(cue.colour);
   }
   return style;
 }
@@ -303,15 +329,17 @@ export function cueStyle(
  * draws no line through the waveform at all — four hot cues, four badges, and
  * the waveform under them unbroken.
  *
- * A memory cue is a small red head at its position. The capture has one beside
+ * A memory cue is a small head at its position, in its own colour, red for
+ * none (`memoryCueColours.ts`). The capture has one beside
  * each badge, which looked at first like part of the hot cue marker; the live
  * `djmdCue` says otherwise — the measured track carries a `Kind` 0 cue at the
  * same `InMsec` as each of its four hot cues, so the red belongs to those.
  *
  * The detail draws the same two things larger, measured off the user's crop of
- * a hot cue there: a 16pt red triangle pointing down from 8.25pt under the
- * band's top for the memory cue, and the 11pt badge centred on the cue 15pt
- * down for the hot cue. The white line belongs to the beat grid; an off-grid
+ * a hot cue there: a 16pt red triangle pointing down for the memory cue, and
+ * the 11pt badge centred on the cue for the hot cue. Both keep to a lane along
+ * the band's top, above the beat heads and the waveform, so neither covers the
+ * audio: the order rekordbox 7.2.14 draws them in (#393). The white line belongs to the beat grid; an off-grid
  * hot cue has a badge at its saved position without an extra vertical line.
  *
  * A badge takes the colour rekordbox paints for the cue's `ColorTableIndex`.
@@ -557,8 +585,9 @@ const JUMPS = [
 /**
  * What the waveform leaves clear at the top and bottom of its band: the
  * `--s-wave-inset-*` tokens, read once. The strip above carries the bar
- * count and the heads of the cue markers, and the beat markers reach 15px
- * past the waveform at both ends, which is why it is inset as far as it is.
+ * count and the cue markers' lane. The beat-marker heads overlap the waveform
+ * at its top edge, as rekordbox does, while the bottom inset keeps the feet
+ * clear of the band's edge.
  * The overview does not take it: its own grid row is already the 30pt the
  * capture paints.
  */
@@ -578,9 +607,6 @@ function waveInsetOf(): { top: number; bottom: number } {
 const PADS = ["A", "B", "C", "D", "E", "F", "G", "H"] as const;
 /** The beat loops the key map has a command for: `beatLoop1` to `beatLoop32`. */
 const BEAT_LOOP_BEATS = [1, 2, 4, 8, 16, 32] as const;
-
-/** Seconds of a track sounding before its play goes on the history. */
-const PLAY_RECORD_SECONDS = 60;
 
 /**
  * The key that sets each pad, for its tooltip: the Export preset binds `1`,
@@ -852,9 +878,9 @@ export const Player = memo(function Player({
   track, onEject, onError, onAnalyse, onDropTrack, onLoadSelected, onSkipTrack, selectedTrackId = null,
   onExportTrack, devices = [], onExportLoop,
   dragging = false, deck = "a",
-  simple = false, transportSlot, flipped = false, dual = false, publishZoom,
+  simple = false, transportSlot, flipped = false, dual = false, publishZoom, onWheelZoom,
   bars: linkedBars, onBars, jumpSize: linkedJump, onJumpSize,
-  publishSync, peerSync, isMaster = false, onMaster, synced = false, onSyncToggle,
+  publishSync, peerSync, isMaster = false, onMaster, synced = false, syncOn = synced, onSyncToggle, onStartPlaying,
   leaderBpmX100 = null, onPlayingBpm, onKeyShift, onGridNudge, publishGridFollow, readOnly = false,
   drawing = false,
 }: PlayerProps) {
@@ -1124,13 +1150,27 @@ export const Player = memo(function Player({
    * the deck only updates its canvas anchor when the buffered slice runs out.
    */
   useEffect(() => {
+    // Both heads in whole device pixels, at their width and their place: a
+    // line straddling a pixel boundary is blended at partial colour into
+    // the waveform under it, where rekordbox paints it solid (#393).
+    const ratio = globalThis.devicePixelRatio;
+    const headWidth = `${playheadWidth(ratio)}px`;
     const x = (headPercent() / 100) * detail.width;
-    if (detailHead.current) detailHead.current.style.transform = `translateX(${x}px)`;
+    if (detailHead.current) {
+      detailHead.current.style.width = headWidth;
+      detailHead.current.style.transform = `translateX(${snapOffset(x, ratio)}px)`;
+    }
     if (barsLabel.current) barsLabel.current.style.transform = `translateX(${x}px)`;
+    // The deck overview's head is two device pixels wide and slides by whole
+    // device pixels, as rekordbox draws it (#570): two CSS pixels at 1x, one
+    // at 2x. The simple player shares this ref but keeps its own 1pt head from
+    // its stylesheet, measured from its own capture, so it is left alone.
+    if (overviewHead.current && !simple) overviewHead.current.style.width = `${overviewHeadWidth(ratio)}px`;
     const apply = (seconds: number) => {
       const at = total > 0 ? Math.min(seconds / total, 1) : 0;
       if (overviewHead.current) {
-        overviewHead.current.style.transform = `translateX(${Math.max(0, at) * overview.width}px)`;
+        const ox = Math.max(0, at) * overview.width;
+        overviewHead.current.style.transform = `translateX(${simple ? ox : snapOffset(ox, ratio)}px)`;
       }
       if (scrubFill.current) scrubFill.current.style.transform = `scaleX(${Math.max(0, at)})`;
       // The detail head does not move at all: the layer under it does, by a
@@ -1189,8 +1229,10 @@ export const Player = memo(function Player({
     // Line and page modes (mice on some platforms) report lines, not pixels.
     const px = event.deltaY * (event.deltaMode === 1 ? 33 : event.deltaMode === 2 ? 400 : 1);
     const direction = wheelGate.current(px, event.timeStamp, isWheelNotch({ deltaMode: event.deltaMode, ctrlKey: event.ctrlKey, wheelDeltaY: (event.nativeEvent as { wheelDeltaY?: number }).wheelDeltaY }));
-    if (direction !== 0) setBars((current) => zoomBy(current, direction));
-  }, [setBars]);
+    if (direction === 0) return;
+    if (onWheelZoom) onWheelZoom(direction);
+    else setBars((current) => zoomBy(current, direction));
+  }, [setBars, onWheelZoom]);
 
   const zoom = useCallback((by: number) => {
     setBars((current) => {
@@ -1261,14 +1303,44 @@ export const Player = memo(function Player({
   });
   const seekInPhase = useCallback((at: number) => playback.seek(inPhase(at)), [playback, inPhase]);
 
+  const [beatLoop, setBeatLoop] = useState<LoopRange | null>(null);
+
   /** Moves by the chosen size: a number of beats, or the fine nudge. */
-  const jump = useCallback(
-    (direction: number) => {
-      const step = jumpStepSeconds(jumpSizeById(jumpSizeId), bpmX100);
-      if (step === 0) return;
-      seekInPhase(playback.positionRef.current + step * direction);
+  const jumpBySize = useCallback(
+    (size: JumpSize, direction: number) => {
+      const beats = size.beats * direction;
+      const now = playback.positionNow();
+      const commandedLoop = playback.currentLoop();
+      if (commandedLoop?.active && size.beats > 0) {
+        const old = commandedLoop;
+        const fixed = jumpStepSeconds(size, bpmX100) * direction * 1000;
+        const moved = grid.times.length >= 2
+          ? movedLoopByBeats(grid, old.inSeconds * 1000, old.outSeconds * 1000,
+              now * 1000, beats, playback.duration * 1000)
+          : fixed !== 0 && old.inSeconds * 1000 + fixed >= 0 &&
+              old.outSeconds * 1000 + fixed <= playback.duration * 1000
+            ? { fromMs: old.inSeconds * 1000 + fixed, toMs: old.outSeconds * 1000 + fixed,
+                headMs: now * 1000 + fixed }
+            : null;
+        if (!moved) return;
+        if (beatLoop && sameLoopRange(old, beatLoop)) {
+          setBeatLoop({ inSeconds: moved.fromMs / 1000, outSeconds: moved.toMs / 1000 });
+        }
+        playback.moveLoop(moved.fromMs / 1000, moved.toMs / 1000,
+          (moved.headMs - now * 1000) / 1000, Array.from(grid.times), beats);
+        return;
+      }
+      jumpHead(playback, grid, size, bpmX100, now, direction, phaseLocked, seekInPhase);
     },
-    [jumpSizeId, bpmX100, playback, seekInPhase],
+    [bpmX100, playback, seekInPhase, grid, beatLoop, phaseLocked],
+  );
+  const jump = useCallback(
+    (direction: number) => jumpBySize(jumpSizeById(jumpSizeId), direction),
+    [jumpSizeId, jumpBySize],
+  );
+  const jumpBeats = useCallback(
+    (beats: number, direction: number) => jumpBySize({ id: `fixed-${beats}`, label: `${beats}Beats`, beats }, direction),
+    [jumpBySize],
   );
 
 
@@ -1396,10 +1468,13 @@ export const Player = memo(function Player({
   // The hot cue list's drag: the slot being dragged, and the one it is over.
   const [dragSlot, setDragSlot] = useState<string | null>(null);
   const [dropSlot, setDropSlot] = useState<string | null>(null);
+  // The Auto Beat Loop's length while it is the loop playing (#411); read at
+  // press time, so `beatLoopOn` and `loopBeats`, declared below, are set by then.
+  const beatLoopBeats = useEventCallback(() => (beatLoopOn ? loopBeats : null));
   const hot = useHotCues({
     trackId: playback.idle ? null : track?.id ?? null,
     cues, positionSeconds, seek, play: playFromCue, playing: deckPlaying, jumpAt, setLoop: playback.setLoop,
-    activeLoop: playingLoop, exitLoop: leaveLoop,
+    activeLoop: playingLoop, beatLoopBeats, exitLoop: leaveLoop,
     quantiseTo: quantize ? quantizeGrid : null, readOnly, onError,
   });
   // The hooks own editability, so the disabled state and its explanation
@@ -1483,7 +1558,6 @@ export const Player = memo(function Player({
    * `CueState::clearAutoBeatLoopState`). A called memory loop of four beats
    * is not shown as the field's 32 (#352).
    */
-  const [beatLoop, setBeatLoop] = useState<LoopRange | null>(null);
   const beatLoopOn = activeLoop && beatLoop !== null && playback.loop !== null && sameLoopRange(playback.loop, beatLoop);
   // A locked deck loops on whole beats: a loop IN between two beats, or a
   // length such as 1.5 beats, takes the deck off the master's beat.
@@ -1496,14 +1570,34 @@ export const Player = memo(function Player({
     setBeatLoop({ inSeconds: range[0] / 1000, outSeconds: range[1] / 1000 });
     playback.setLoop(range[0] / 1000, range[1] / 1000);
   }, [playback, grid, loopSnap]);
+  /**
+   * The length field. Lit, it exits its beat loop. Unlit with a memory, hot
+   * or manual loop playing, it does not exit that loop: the loop becomes a
+   * beat loop of the field's length from its own in point, the field lights,
+   * and a head past the new out point goes back to the in point. [OBS]
+   * rekordbox 7, Winrig (#537): a hot loop of 8 beats launched with the
+   * field at an unlit 4, then the field clicked, plays 4 beats from the hot
+   * loop's in point with the field lit; a second click exits.
+   */
   const autoLoop = useCallback(() => {
     if (playback.idle) return;
-    if (activeLoop) {
+    const loop = playback.loop;
+    if (beatLoopOn) {
       playback.setLoopActive(false);
       return;
     }
-    loopOfBeats(loopBeats);
-  }, [playback, activeLoop, loopOfBeats, loopBeats]);
+    if (!loop?.active) {
+      loopOfBeats(loopBeats);
+      return;
+    }
+    // Rounded, so a loop from an on-beat IN finds its beat on the grid.
+    const range = beatLoopRange(grid, null, Math.round(loop.inSeconds * 1000), loopBeats);
+    if (!range) return;
+    const [from, to] = [range[0] / 1000, range[1] / 1000];
+    setBeatLoop({ inSeconds: from, outSeconds: to });
+    playback.setLoop(from, to);
+    if (playback.positionNow() >= to) playback.seek(from);
+  }, [playback, beatLoopOn, loopOfBeats, loopBeats, grid]);
   /** The head in seconds, on the loop snap grid when Q is on. */
   const loopPoint = useCallback(() => {
     const ms = playback.positionNow() * 1000;
@@ -1600,7 +1694,6 @@ export const Player = memo(function Player({
     autoLoop, loopOfBeats, markLoopIn, loopOut]);
   // MEMORY: the cue point, or the loop playing as a memory loop with the
   // Auto Beat Loop's length when it is the one AU set (#411).
-  const beatLoopBeats = useEventCallback(() => (beatLoopOn ? loopBeats : null));
   const memory = useMemoryCues({
     trackId: playback.idle ? null : track?.id ?? null,
     cues, positionSeconds, seek, setLoop: playback.setLoop, playingLoop, beatLoopBeats,
@@ -1608,30 +1701,16 @@ export const Player = memo(function Player({
   });
   // Editability and its explanation come from the hook, as for the hot cues.
   const memoryCueEditReason = memory.canEdit ? undefined : READ_ONLY_REASON;
-  // A play is recorded after a minute of the track sounding, once per load,
-  // when Preferences › Advanced › History says so and the library can be
-  // written. rekordbox's own threshold is not recorded; a minute is what
-  // tells a track played from one auditioned [ASSUME].
-  const playedSeconds = useRef(0);
-  const recordedFor = useRef<string | null>(null);
-  const recordHistory = advancedPrefs.recordHistory;
-  useEffect(() => {
-    playedSeconds.current = 0;
-    recordedFor.current = null;
-  }, [track?.id]);
-  useEffect(() => {
-    if (!playback.playing || !track || !recordHistory || readOnly) return undefined;
-    const id = track.id;
-    const timer = globalThis.setInterval(() => {
-      playedSeconds.current += 1;
-      if (playedSeconds.current < PLAY_RECORD_SECONDS || recordedFor.current === id) return;
-      recordedFor.current = id;
-      void getBackend()
-        .then((backend) => backend.edits.recordPlay(id))
-        .catch((e: unknown) => onError?.(e instanceof Error ? e.message : "The play could not be recorded."));
-    }, 1000);
-    return () => globalThis.clearInterval(timer);
-  }, [playback.playing, track, recordHistory, readOnly, onError]);
+  // A play is recorded after Preferences › Advanced › Browse › Playback time
+  // setting's seconds of the track sounding, once per load, when Advanced ›
+  // History says so and the library can be written (#540).
+  usePlayRecorder({
+    trackId: track?.id ?? null,
+    playing: playback.playing,
+    enabled: advancedPrefs.recordHistory && !readOnly,
+    seconds: advancedPrefs.playbackTime,
+    onError,
+  });
 
   /** A list row: a cue is a jump, a memory loop is the loop itself. */
   const callCue = useCallback(
@@ -1766,7 +1845,7 @@ export const Player = memo(function Player({
   // same PLAY a click gives: see `src/lib/scripting.ts`.
   const scriptTrack = useEventCallback(() => track?.id ?? null);
   const scriptIdle = useEventCallback(() => playback.idle);
-  const scriptPlaying = useEventCallback(() => playback.playing);
+  const scriptPlaying = useEventCallback(() => playback.wantsPlaying());
   const scriptError = useEventCallback(() => playback.error);
   const scriptPlay = useEventCallback(() => togglePlay());
   useEffect(
@@ -1897,9 +1976,16 @@ export const Player = memo(function Player({
       matchLeader();
       return;
     }
-    if (!synced) matchLeader();
+    // Lighting it on a deck with a master to follow matches it now; the
+    // master's own, or one pressed before either deck has played, only lights.
+    if (!syncOn && !isMaster && leaderBpmX100 !== null) matchLeader();
     onSyncToggle();
-  }, [onSyncToggle, synced, matchLeader]);
+  }, [onSyncToggle, syncOn, isMaster, leaderBpmX100, matchLeader]);
+
+  // The first deck to play takes MASTER [rekordbox 7.2.18 manual p.121].
+  useEffect(() => {
+    if (playback.playing) onStartPlaying?.();
+  }, [playback.playing, onStartPlaying]);
 
   // Following: the tempo alone, with the bar left where the press put it.
   // The master's BPM arrives from the shell rather than being read through
@@ -2015,6 +2101,13 @@ export const Player = memo(function Player({
       onLoadSelected();
       return true;
     },
+    // Shift+Enter is the same, onto Player 2 — only exists as a deck in
+    // two-player mode, so there's nothing to guard beyond the deck check.
+    loadPlayer2: () => {
+      if (deck !== "b" || !onLoadSelected || selectedTrackId === null) return false;
+      onLoadSelected();
+      return true;
+    },
     // The engine's click, not the deck's: the next of the three sounds.
     metronomeSound: () => {
       const sound = preferences.audio.metronomeSound;
@@ -2041,7 +2134,11 @@ export const Player = memo(function Player({
     // auto-repeat then ran the pair thirty times a second for as long as the
     // key was held. `keyup` below lets go.
     cue: once(holdCue),
-    quantize: live(toggleQuantize),
+    // Q is a deck setting, and its button is usable even before a track loads.
+    quantize: () => {
+      toggleQuantize();
+      return true;
+    },
     memoryCue: once(memory.store),
     previousMemoryCue: live(memory.callPrevious),
     nextMemoryCue: live(memory.callNext),
@@ -2066,6 +2163,11 @@ export const Player = memo(function Player({
     shiftGridRight: live(() => gridEditor.shift(1)),
     shiftGridToCenter: once(gridEditor.align),
   };
+  // A fixed-distance jump moves by its own beats, the menu's size aside; a
+  // held key repeats it, as the menu-driven jumps repeat.
+  for (const { action, beats, direction } of FIXED_JUMPS) {
+    deckCommands[action] = live(() => jumpBeats(beats, direction));
+  }
   // A beat loop sets the length and starts the loop, as the pad does.
   for (const beats of BEAT_LOOP_BEATS) {
     deckCommands[`beatLoop${beats}` as Action] = once(() => {
@@ -2081,6 +2183,7 @@ export const Player = memo(function Player({
     deckCommands[`clearHotCue${letter}` as Action] = once(() => hot.clear(letter));
   }
   useCommands(deckCommands, deck);
+  const runQuantize = () => { runCommand("quantize", { scope: deck }); };
   const onDeckKey = useEventCallback((event: KeyboardEvent) => {
     const hit = dispatchBinding(event, platform, event.target as HTMLElement | null, keyOverrides);
     if (hit?.action === undefined || !Object.hasOwn(deckCommands, hit.action)) return;
@@ -2373,17 +2476,21 @@ export const Player = memo(function Player({
               ) : null}
               <CueMarkers cues={cues} totalMs={total * 1000} loop={playback.loop} />
               <OverviewTempoMarkers grid={grid} totalMs={total * 1000} />
-              <span
-                ref={overviewHead}
-                className={styles.playhead}
-                data-testid="player-head"
-                aria-hidden
-              />
             </div>
             {/* How far through the track the head is, under the overview. */}
             <div className={styles.scrub} aria-hidden>
               <div ref={scrubFill} className={styles.scrubFill} />
             </div>
+            {/* The head spans the whole band, not just the waveform: from
+                the band's top, through the position bar, to its bottom, as
+                rekordbox's does (#570). Over a red RGB waveform the part
+                above and below the music is what keeps it findable. */}
+            <span
+              ref={overviewHead}
+              className={styles.playhead}
+              data-testid="player-head"
+              aria-hidden
+            />
           </div>
   );
 
@@ -2422,7 +2529,7 @@ export const Player = memo(function Player({
             baseBpmX100={bpmX100}
             onBpmChange={setDisplayedBpm}
             onBeatSync={beatSync}
-            synced={synced}
+            synced={syncOn}
             isMaster={isMaster}
             onMaster={onMaster}
           />
@@ -2450,13 +2557,13 @@ export const Player = memo(function Player({
                 type="button"
                 className={styles.chip}
                 aria-label="Beat sync"
-                aria-pressed={synced}
-                data-on={synced ? "" : undefined}
-                disabled={!track || isMaster}
+                aria-pressed={syncOn}
+                data-on={syncOn ? "" : undefined}
+                disabled={!track}
                 title={tip(
                   isMaster
                     ? "This deck is the master; sync the other one to it."
-                    : synced
+                    : syncOn
                       ? "Following the master's tempo; press to stop."
                       : "Match this deck to the master's tempo and bar, and keep its tempo.",
                 )}
@@ -2508,7 +2615,7 @@ export const Player = memo(function Player({
             readOnly={readOnly}
             memory={memory}
             quantize={quantize}
-            onQuantize={toggleQuantize}
+            onQuantize={runQuantize}
             loop={dualLoop}
           />
         ) : null}
@@ -2516,9 +2623,9 @@ export const Player = memo(function Player({
         <div className={styles.detailRow}>
           {/* The two-deck layout's zoom is the shell's, one for the pair. */}
           {dual ? null : (
-          <div className={styles.zoom}>
+          <div className={styles.zoom} data-own-activation="">
             <button type="button" aria-label="Zoom in" onClick={() => zoom(-1)}>+</button>
-            <span className={styles.rst} aria-hidden>RST</span>
+            <button type="button" className={styles.rst} aria-label="Reset zoom" title={tip("Reset the zoom ratio")} onClick={() => setBars(DETAIL_BARS)}>RST</button>
             <button type="button" aria-label="Zoom out" onClick={() => zoom(1)}>−</button>
           </div>
           )}
@@ -2809,8 +2916,8 @@ export const Player = memo(function Player({
                   className={styles.pageNumber}
                   data-on={beatLoopOn || undefined}
                   aria-pressed={beatLoopOn}
-                  aria-label={activeLoop ? "Exit loop" : `${loopBeats} beat loop`}
-                  title={tip(activeLoop ? "Exit the loop" : `${loopBeatsLabel(loopBeats)} Beat Loop`)}
+                  aria-label={beatLoopOn ? "Exit loop" : `${loopBeats} beat loop`}
+                  title={tip(beatLoopOn ? "Exit the loop" : `${loopBeatsLabel(loopBeats)} Beat Loop`)}
                   disabled={playback.idle || grid.times.length < 2}
                   onClick={autoLoop}
                 >
@@ -2871,7 +2978,7 @@ export const Player = memo(function Player({
             aria-label="Quantize"
             aria-pressed={quantize}
             data-on={quantize ? "" : undefined}
-            onClick={toggleQuantize}
+            onClick={runQuantize}
           >
             Q
           </button>
@@ -2935,19 +3042,27 @@ export const Player = memo(function Player({
           /* Eight slots, always: an empty one is a slot you can fill, and
              hiding it makes the list read as a shorter track. A row rather
              than a button, as the memory list's are, because the ✕ inside a
-             set row is one: the row calls the cue, the ✕ clears it. */
+             set row is one: the row calls the cue, the ✕ clears it. An empty
+             row is the empty pad: rekordbox 7.2.19's
+             `djplay::HotCueComp::mouseDown` @0x100689788 posts the same
+             unshifted hot cue key press for a row whether or not its slot is
+             set (`isValid` @0x1006898e4 gates only the right-click colour
+             menu), so a click on an empty row sets that hot cue, as the pad
+             would (#532). With the library read-only it stays dead. */
           <div className={styles.cueList}>
             {PADS.map((letter) => {
               const cue = hot.at(letter);
               const movable = cue !== null && hot.canEdit && cue.id !== "";
+              const live = cue !== null || hot.canEdit;
               return (
                 <div
                   key={letter}
                   role="button"
-                  tabIndex={cue ? 0 : -1}
+                  tabIndex={live ? 0 : -1}
                   className={styles.cueRow}
                   aria-label={`Hot cue ${letter}`}
-                  aria-disabled={cue ? undefined : true}
+                  aria-disabled={live ? undefined : true}
+                  title={cue ? undefined : tip(hotCueEditReason ?? `Set Hot Cue ${letter}`)}
                   data-empty={cue ? undefined : ""}
                   data-dragging={dragSlot === letter ? "" : undefined}
                   data-drop={dragSlot !== null && dropSlot === letter && dragSlot !== letter ? "" : undefined}
@@ -2970,7 +3085,7 @@ export const Player = memo(function Player({
                     setDragSlot(null);
                     setDropSlot(null);
                   } : undefined}
-                  onClick={cue ? () => hot.press(letter) : undefined}
+                  onClick={live ? () => hot.press(letter) : undefined}
                   onContextMenu={cue ? (event) => {
                     event.preventDefault(); event.stopPropagation();
                     setCueColorMenu({x: event.clientX, y: event.clientY, cue});
@@ -3051,14 +3166,31 @@ export const Player = memo(function Player({
                     orange, and red for the Active Loop (`Kind` 4):
                     `MemoryCueComp::addCue` shows the button when the out
                     point is set and toggles it on for kind 4 [OBS static,
-                    rekordbox 7 @0x1006864e8]. Shown, not a control: setting
-                    the Active Loop is a write rbx does not make yet. */}
+                    rekordbox 7 @0x1006864e8]. It is a toggle, tooltip "Set
+                    Active Loop" (`lookAndFeelChanged` @0x100685d14):
+                    `buttonClicked` @0x100685f80 asks to set it when off and
+                    to reset it when on (#577). */}
                 {cue.outMs > cue.positionMs ? (
-                  <CueLoopIcon
-                    className={styles.cueLoopIcon}
-                    data-testid="memory-cue-loop"
-                    data-active={cue.activeLoop ? "" : undefined}
-                  />
+                  <button
+                    type="button"
+                    className={styles.cueLoopButton}
+                    aria-label="Set Active Loop"
+                    aria-pressed={cue.activeLoop === true}
+                    title={tip(memoryCueEditReason ?? "Set Active Loop")}
+                    disabled={!memory.canEdit || cue.id === ""}
+                    onClick={(event) => {
+                      // The row underneath calls the cue; the toggle is not
+                      // also a jump.
+                      event.stopPropagation();
+                      writeCue((edits) => edits.setActiveLoop(cue.id, cue.activeLoop !== true));
+                    }}
+                  >
+                    <CueLoopIcon
+                      className={styles.cueLoopIcon}
+                      data-testid="memory-cue-loop"
+                      data-active={cue.activeLoop ? "" : undefined}
+                    />
+                  </button>
                 ) : null}
                 <CueName cue={cue} renaming={renamingCue} setRenaming={setRenamingCue}
                   canEdit={!readOnly} onSave={(text) => writeCue((edits) => edits.setCueComment(cue.id, text))} />

@@ -13,7 +13,7 @@
 import { ANALYSIS_SLOTS, SLOTS } from "./queue";
 import { KEY_PRESETS, type KeyPreset } from "./keyPresets";
 import type { KeyChord } from "./shortcuts";
-import { toCamelot, type TrafficLightReach } from "./camelot";
+import { fromCamelot, toCamelot, type TrafficLightReach } from "./camelot";
 import type {
   KeyDisplay, MenuSlot, OverviewWaveform, WaveformColor, WaveformPosition,
 } from "@/ipc/types";
@@ -159,6 +159,12 @@ export interface ViewPreferences {
 }
 
 export interface AudioPreferences {
+  /**
+   * The output device's stable id, or `null` for the system default. It is
+   * kept even while that device is unplugged: the engine falls back to the
+   * default for the time being and uses it again when it returns.
+   */
+  outputDevice: string | null;
   sampleRate: SampleRate;
   /** Frames per device buffer; one of `BUFFER_SIZES`. */
   bufferSize: number;
@@ -202,6 +208,12 @@ export interface AnalysisPreferences {
    * default, as it is in rekordbox.
    */
   writeKeyTag: boolean;
+  /**
+   * Key Analysis > "Analyze key": off keeps the keys a track already has, such
+   * as ones from Mixed In Key, for automatic analysis and as the default of
+   * the Analysis Setting window's KEY box. On by default.
+   */
+  detectKey: boolean;
 }
 
 /**
@@ -273,6 +285,14 @@ export interface AdvancedPreferences {
   relocateVideo: boolean;
   relocateDesktop: boolean;
   relocateUserFolders: boolean;
+  /**
+   * Browse › My Tag › Add "My Tag" to the "Comments" (#605): a track's My
+   * Tags are written after its comment in a slash-star block
+   * (`Comment /* Peak / Warm-up`, then a closing star-slash), as rekordbox's
+   * `writeMytag` does. Off by default, as it is in rekordbox. The switch
+   * rewrites every tagged track's comment before it changes.
+   */
+  myTagComments: boolean;
   /** Library Protection: refuse every edit, whatever rekordbox is doing. */
   protectLibrary: boolean;
   /** Edit Library › Double-click to edit; off is a click on a selected row. */
@@ -291,9 +311,19 @@ export interface AdvancedPreferences {
   checkUpdates: boolean;
   /** How often that automatic check runs: every start, once a day, once a week. */
   updateFrequency: UpdateFrequency;
-  /** A track played for a minute goes on today's history and its count goes up. */
+  /** A track played for `playbackTime` seconds goes on today's history and its count goes up. */
   recordHistory: boolean;
+  /**
+   * Browse › Playback time setting: how many seconds of a track playing on
+   * the deck before it is added to history and coloured as played (#540).
+   * rekordbox 7.2.19 keeps 1–60, 60 by default (`SettingIF::getCurrentPlayedTime`
+   * @0x1015d43f8, `setPlayedTime` @0x1015d448c) [OBS static].
+   */
+  playbackTime: number;
 }
+
+/** Browse › Playback time setting's range in seconds, and its default. */
+export const PLAYBACK_TIME = { min: 1, max: 60, default: 60 } as const;
 
 /**
  * Keyboard: rekordbox's preset the keys start from (`keyPresets.ts`), and
@@ -361,6 +391,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
     waveformClick: true,
   },
   audio: {
+    outputDevice: null,
     // The capture shows 96000 Hz and 512 samples [OBS]; the rate is what
     // that machine's device ran at, and 48000 is what most do.
     sampleRate: 48_000,
@@ -375,6 +406,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
     firstBeatCue: false,
     bpmRange: "70-180",
     writeKeyTag: false,
+    detectKey: true,
   },
   djSystem: {
     waveformColor: "3band",
@@ -396,6 +428,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
     relocateVideo: true,
     relocateDesktop: true,
     relocateUserFolders: false,
+    myTagComments: false,
     protectLibrary: true,
     doubleClickToEdit: false,
     duplicateTracks: "ask",
@@ -407,6 +440,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
     checkUpdates: true,
     updateFrequency: "start",
     recordHistory: true,
+    playbackTime: PLAYBACK_TIME.default,
   },
   keyboard: {
     preset: "export",
@@ -414,9 +448,10 @@ export const DEFAULT_PREFERENCES: Preferences = {
   },
 };
 
-/** `Ebm` as the library stores it, or `2A` when the window says Alphanumeric. */
+/** Show either notation regardless of how the library stored the key. */
 export function formatKey(key: string, display: KeyDisplay): string {
-  if (display !== "alphanumeric" || key === "") return key;
+  if (key === "") return key;
+  if (display === "classic") return fromCamelot(key) || key;
   // A key the wheel does not know — a blank, "Unknown", a typo — is shown as
   // it is rather than hidden.
   return toCamelot(key) || key;
@@ -541,6 +576,7 @@ export function sanitisePreferences(value: unknown): Preferences {
       waveformClick: bool(view.waveformClick, d.view.waveformClick),
     },
     audio: {
+      outputDevice: typeof audio.outputDevice === "string" && audio.outputDevice !== "" ? audio.outputDevice : null,
       sampleRate: oneOfNumber(audio.sampleRate, SAMPLE_RATES, d.audio.sampleRate),
       bufferSize: oneOfNumber(audio.bufferSize, BUFFER_SIZES, d.audio.bufferSize),
       metronomeSound: oneOfNumber(audio.metronomeSound, METRONOME_SOUNDS, d.audio.metronomeSound),
@@ -553,6 +589,7 @@ export function sanitisePreferences(value: unknown): Preferences {
       firstBeatCue: bool(analysis.firstBeatCue, d.analysis.firstBeatCue),
       bpmRange: oneOf(analysis.bpmRange, BPM_RANGES, d.analysis.bpmRange),
       writeKeyTag: bool(analysis.writeKeyTag, d.analysis.writeKeyTag),
+      detectKey: bool(analysis.detectKey, d.analysis.detectKey),
     },
     djSystem: {
       waveformColor: oneOf(dj.waveformColor, WAVEFORM_COLORS, d.djSystem.waveformColor),
@@ -580,10 +617,16 @@ export function sanitisePreferences(value: unknown): Preferences {
         strings(advanced.relocateFolders).length > 0 || d.advanced.relocateUserFolders,
       ),
       recordHistory: bool(advanced.recordHistory, d.advanced.recordHistory),
+      // Out of range is the default, as rekordbox reads a stored value.
+      playbackTime: typeof advanced.playbackTime === "number" && Number.isInteger(advanced.playbackTime) &&
+        advanced.playbackTime >= PLAYBACK_TIME.min && advanced.playbackTime <= PLAYBACK_TIME.max
+        ? advanced.playbackTime
+        : d.advanced.playbackTime,
       // A stored object predates this switch when the key is absent. Preserve
       // that user's writable library; only a truly empty store gets defaults.
       protectLibrary: bool(advanced.protectLibrary, hasStoredSection ? false : d.advanced.protectLibrary),
       doubleClickToEdit: bool(advanced.doubleClickToEdit, d.advanced.doubleClickToEdit),
+      myTagComments: bool(advanced.myTagComments, d.advanced.myTagComments),
       duplicateTracks: oneOf(advanced.duplicateTracks, DUPLICATE_TRACKS, d.advanced.duplicateTracks),
       deviceImportMissing: oneOf(advanced.deviceImportMissing, DEVICE_IMPORT_MISSING, d.advanced.deviceImportMissing),
       folderDropClash: oneOf(advanced.folderDropClash, FOLDER_DROP_CLASH, d.advanced.folderDropClash),

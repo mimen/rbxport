@@ -85,6 +85,13 @@ rating import reads the old values as the same stars.
   the stick's own playlists are kept. A playlist still in your library is
   updated to what it holds now; one deleted from your library stays as the
   stick has it.
+- Dragging does the same as those menus, as in rekordbox: drop tracks on a
+  stick's row under **Devices** (or on its Device Library, OneLibrary or All
+  Tracks) to export just those tracks, as **Export Track** does, and drop a
+  playlist or folder on the stick's row to export it, as **Export Playlist**
+  and **Export Folder** do. The tree shows one section at a time, so open the
+  Sub-Browser to have your playlists beside the stick. Tracks dropped on one
+  of the stick's own playlists are not exported there.
 - Sync Manager makes each ticked stick hold exactly the ticked playlists: a
   playlist from your library that is no longer ticked, or that was deleted
   from your library, is taken off the stick.
@@ -141,14 +148,22 @@ When importing a playlist from a device**:
   fails, the copies it made are removed again. Importing the same playlist
   again uses the earlier copies instead of copying the files a second time.
 - **Ask each import**: rekordbox's question, with how many files would be
-  copied, their size and where they go. OK copies, Cancel imports nothing.
-- **Import only already-matched tracks**: the track is left out and the note
-  says how many were. If none of the tracks are in the collection, nothing
-  is imported.
+  copied, their size and where they go. **Change…** picks another folder
+  for the copies, as in rekordbox; OK is unavailable while that folder's
+  drive has too little free space. OK copies, Cancel imports nothing.
+- **Don't copy**: only tracks already matched to your collection are imported.
+  Unmatched tracks are left out, and the note says how many. If none match,
+  no playlist is created. This does not add playable references to files that
+  exist only on the USB device.
 - **Cancel when any track is missing**: nothing is imported, and the note
   says how many tracks are missing.
 
-A copied track is imported from its file's tags. The stick is only read.
+A copied track comes in with what the stick knows of it, as in rekordbox:
+its BPM and key, its waveforms and beat grid (the stick's analysis files,
+copied into your library), and its hot cues, memory cues and loops. Its
+other details come from the file's tags. A track the stick never analysed
+takes the stick's BPM and key only. Tracks already in your collection are
+left as they are. The stick is only read.
 
 ## Music already on the device
 
@@ -179,6 +194,8 @@ and ALAC, is converted to the selected output format:
 | MP3 | 320 kbps CBR, 44.1 kHz, stereo; smaller files with lossy compression. |
 
 Compatible MP3 and integer PCM WAV/AIFF at 44.1 or 48 kHz are copied as-is.
+An AIFF-C file that labels plain PCM with `in24`, `in32`, `FL32` or `FL64`
+plays and analyzes, and is converted rather than copied.
 Selecting MP3 does not recompress a compatible WAV or MP3. This targets older
 USB-capable players; filesystem and model-specific library requirements
 still apply. The [CDJ-350 specifications](https://www.pioneerdj.com/en/product/player/cdj-350/)
@@ -187,9 +204,20 @@ are one format reference, not proof of every player's compatibility.
 ## Conversion and incremental sync
 
 When playlists or export preferences change, Sync Manager updates each USB's
-space bar with projected additional use and space left. The separate temporary
-space line includes the room needed to keep the previous library recoverable.
-Conversion estimates are approximate until a completed cached copy is available.
+space bar with projected additional use and space left. The temporary-space
+line describes space needed on the destination USB to keep the previous
+export recoverable while new files are staged. Ordinary
+tracks are copied from their source directly into that destination stage;
+they do not make a second full-size copy on the computer's internal disk.
+Converted tracks may use the app's internal cache for reuse across several
+USBs. Completed cache files are reduced to 6 GiB before a conversion, and a
+single conversion's internal staging file is limited to 2 GiB, for up to
+8 GiB of managed internal cache files during export, plus small metadata
+overhead. Interrupted conversion files are cleaned up at the next cache
+prune. If the internal cache is
+full or a converted file would exceed 2 GiB, conversion runs in the
+destination stage instead. Conversion size estimates remain approximate
+until a completed converted file is available.
 An identical sync says “Already up to date”; a playlist-only edit leaves
 unchanged audio, analysis, and artwork alone. Several sticks can share one
 conversion while retaining independent progress and results.
