@@ -5,7 +5,6 @@ html[data-rbxfork-remote] [aria-label="Master level"],
 html[data-rbxfork-remote] [aria-label="Master output"],
 html[data-rbxfork-remote] [role="tab"][aria-label="Devices"],
 html[data-rbxfork-remote] [role="tab"][aria-label="Explorer"],
-html[data-rbxfork-remote] [aria-label="Sync Manager"],
 html[data-rbxfork-remote] [data-testid="link-deck-strip"] {
   display: none !important;
 }

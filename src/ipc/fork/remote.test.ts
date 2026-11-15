@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IpcError } from "../invoke";
-import { BUILD_VERSION, checkHost, isHostEvent, reachHost, remoteArtworkUrl, remoteHost, setRemoteHost, watchHost, withRemote } from "./remote";
+import { BUILD_VERSION, checkHost, isHostEvent, NO_ESTIMATE_NOTE, reachHost, remoteArtworkUrl, remoteHost, setRemoteHost, watchHost, withRemote } from "./remote";
 
 const store = new Map<string, string>();
 vi.stubGlobal("localStorage", {
@@ -65,13 +65,60 @@ describe("withRemote", () => {
 
   it("runs window and update commands here, and refuses what only the host can do", async () => {
     await expect(withRemote(local)("check_for_update")).resolves.toBe("local check_for_update");
-    await expect(withRemote(local)("eject_device", { path: "/Volumes/X" })).rejects.toMatchObject({ kind: "hostOnly" });
+    await expect(withRemote(local)("import_usb", { path: "/Volumes/X" })).rejects.toMatchObject({ kind: "hostOnly" });
+    await expect(withRemote(local)("device_playlist_edit", {})).rejects.toMatchObject({ kind: "hostOnly" });
     expect(fetch).not.toHaveBeenCalled();
   });
 
   it("says when the host cannot be reached", async () => {
     hostAnswers(() => Promise.reject(new TypeError("Load failed")));
     await expect(withRemote(local)("playlist_tree")).rejects.toMatchObject({ kind: "remote", message: expect.stringContaining("host.example.ts.net") });
+  });
+});
+
+describe("a stick on this machine", () => {
+  const USB = "rbxfork://localhost/usb/";
+
+  it("lists, ejects and reads its sticks here", async () => {
+    for (const command of ["list_devices", "eject_device", "format_device", "cancel_export", "export_progress", "device_settings", "open_sync_window"]) {
+      await expect(withRemote(local)(command, { path: "/Volumes/X" })).resolves.toBe(`local ${command}`);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("writes host tracks to a stick here, with the host named for usb.rs", async () => {
+    fetch.mockImplementation(() => Promise.resolve(Response.json([{ path: "/Volumes/X", ejected: false }])));
+    const args = { playlists: ["5"], destinations: ["/Volumes/X"], ejectAfterSync: true };
+    await expect(withRemote(local)("sync_devices", args)).resolves.toEqual([{ path: "/Volumes/X", ejected: false }]);
+    const [url, init] = fetch.mock.calls[0] ?? [];
+    expect(url).toBe(`${USB}sync_devices`);
+    expect(JSON.parse(init?.body as string)).toEqual({ host: { url: "http://host.example.ts.net:48650", token: "t0k" }, args });
+    expect(ran).toEqual([]);
+  });
+
+  it("routes each export entry point and the stick's sync state through usb.rs", async () => {
+    fetch.mockImplementation(() => Promise.resolve(Response.json({})));
+    for (const command of ["export_playlist", "export_tracks_to_device", "device_sync_state"]) await withRemote(local)(command, {});
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual(["export_playlist", "export_tracks_to_device", "device_sync_state"].map((c) => `${USB}${c}`));
+  });
+
+  it("keeps an export's own refusal", async () => {
+    fetch.mockImplementation(() => Promise.resolve(Response.json({ kind: "cancelled", message: "Export cancelled." }, { status: 422 })));
+    const call = withRemote(local)("export_playlist", { playlist: "5", destination: "/Volumes/X" });
+    await expect(call).rejects.toBeInstanceOf(IpcError);
+    await expect(call).rejects.toMatchObject({ kind: "cancelled", message: "Export cancelled." });
+  });
+
+  it("gives every stick no space estimate, without asking anyone", async () => {
+    const found = await withRemote(local)<{ path: string; error: string; unknownSize: boolean }[]>("estimate_sync", { playlists: ["5"], destinations: ["/Volumes/A", "/Volumes/B"] });
+    expect(found.map((e) => [e.path, e.error, e.unknownSize])).toEqual([["/Volumes/A", NO_ESTIMATE_NOTE, true], ["/Volumes/B", NO_ESTIMATE_NOTE, true]]);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(ran).toEqual([]);
+  });
+
+  it("hears its own export and device events", () => {
+    for (const event of ["export:progress", "export:done", "sync:progress", "devices:changed"]) expect(isHostEvent(event)).toBe(false);
+    expect(isHostEvent("import:progress")).toBe(true);
   });
 });
 

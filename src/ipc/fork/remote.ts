@@ -56,10 +56,15 @@ export function setRemoteHost(host: RemoteHost | null): void {
  *
  * - `local`: this machine's own window, menus, updates, scripting, and the
  *   audio engine that the hidden decks would use.
- * - `hostOnly`: needs a file on this machine, a stick or a CDJ at the host,
- *   or plays through the host's speakers. Refused with `HOST_ONLY_NOTE`.
+ * - `hostOnly`: needs a file on this machine, a CDJ at the host, a stick's
+ *   contents in the library, or plays through the host's speakers. Refused
+ *   with `HOST_ONLY_NOTE`.
+ * - `usb`: writes host library tracks to a stick on this machine, through
+ *   `src-tauri/src/fork/usb.rs`.
+ * - `noEstimate`: the Sync Manager's space estimate, which would need every
+ *   file's size from the host. Answered here with no estimate.
  */
-export const ROUTES: Readonly<Record<string, "local" | "hostOnly">> = {
+export const ROUTES: Readonly<Record<string, "local" | "hostOnly" | "usb" | "noEstimate">> = {
   app_diagnostics: "local",
   app_version: "local",
   check_for_update: "local",
@@ -114,12 +119,28 @@ export const ROUTES: Readonly<Record<string, "local" | "hostOnly">> = {
   deck_metronome: "local",
   deck_metronome_grid: "local",
   deck_key_shift: "local",
+  list_devices: "local",
+  eject_device: "local",
+  format_device: "local",
+  cancel_export: "local",
+  export_progress: "local",
+  open_sync_window: "local",
+  device_settings: "local",
+  save_device_settings: "local",
+  write_device_defaults: "local",
+  reference_stick_settings: "local",
+  device_libraries: "local",
+
+  sync_devices: "usb",
+  export_playlist: "usb",
+  export_tracks_to_device: "usb",
+  device_sync_state: "usb",
+  estimate_sync: "noEstimate",
 
   deck_load: "hostOnly",
   drag_tracks: "hostOnly",
   dropped_file_paths: "hostOnly",
   reveal_track: "hostOnly",
-  open_sync_window: "hostOnly",
   open_backup_directory: "hostOnly",
   set_backup_directory: "hostOnly",
   start_link_export: "hostOnly",
@@ -127,17 +148,10 @@ export const ROUTES: Readonly<Record<string, "local" | "hostOnly">> = {
   link_set_master: "hostOnly",
   link_nudge_master: "hostOnly",
   link_take_master_tempo: "hostOnly",
-  export_playlist: "hostOnly",
-  export_tracks_to_device: "hostOnly",
-  sync_devices: "hostOnly",
-  eject_device: "hostOnly",
-  format_device: "hostOnly",
   import_usb: "hostOnly",
   device_playlist_edit: "hostOnly",
   device_playlist_import: "hostOnly",
   ensure_device_library: "hostOnly",
-  write_device_defaults: "hostOnly",
-  save_device_settings: "hostOnly",
   import_files: "hostOnly",
   import_files_slice: "hostOnly",
   list_import_files: "hostOnly",
@@ -159,10 +173,13 @@ export const ROUTES: Readonly<Record<string, "local" | "hostOnly">> = {
 const LOCAL_EVENTS: ReadonlySet<string> = new Set([
   "menu", "preferences:reset", "script:request", "update:progress", "rbxfork:reload",
   "deck:tick", "deck:meters", "deck:loaded", "deck:error", "deck:reset",
+  "export:progress", "export:done", "sync:progress", "devices:changed",
 ]);
 
 export const HOST_ONLY_NOTE =
-  "With a remote host set, the decks, USB sticks, PRO DJ LINK, and importing or exporting files run on the host machine.";
+  "With a remote host set, the decks, PRO DJ LINK, importing from a USB stick, editing a stick's own playlists, and importing or exporting files run on the host machine.";
+
+export const NO_ESTIMATE_NOTE = "No space estimate is available for a library on another machine.";
 
 type Invoke = <T>(command: string, args?: InvokeArgs) => Promise<T>;
 
@@ -237,6 +254,26 @@ async function callHost<T>(host: RemoteHost, command: string, args?: InvokeArgs)
   return (await response.arrayBuffer()) as T;
 }
 
+/** One of `usb.rs`'s commands: this machine's stick, the host's library. */
+async function callUsb<T>(host: RemoteHost, command: string, args?: InvokeArgs): Promise<T> {
+  const response = await fetch(`${convertFileSrc("", "rbxfork")}usb/${command}`, {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: JSON.stringify({ host, args: args ?? {} }),
+  });
+  const body: unknown = await response.json().catch(() => null);
+  if (!response.ok) throw new IpcError(body ?? { kind: "remote", message: `The USB export answered ${response.status}.` });
+  return body as T;
+}
+
+function noEstimate<T>(args?: InvokeArgs): T {
+  const { destinations } = (args ?? {}) as { destinations?: string[] };
+  return (destinations ?? []).map((path) => ({
+    path, copyBytes: 0, reuseBytes: 0, freeBytes: 0, tracksNew: 0, tracksChanged: 0, tracksKept: 0, tracksRemoved: 0, tracksMissing: 0,
+    approximate: true, unknownSize: true, error: NO_ESTIMATE_NOTE,
+  })) as T;
+}
+
 /** `tauriInvoke`'s function, routed per `ROUTES` when a host is set. */
 export function withRemote(local: Invoke): Invoke {
   const host = remoteHost();
@@ -245,6 +282,8 @@ export function withRemote(local: Invoke): Invoke {
     switch (ROUTES[command]) {
       case "local": return local<T>(command, args);
       case "hostOnly": throw new IpcError({ kind: "hostOnly", message: HOST_ONLY_NOTE });
+      case "usb": return callUsb<T>(host, command, args);
+      case "noEstimate": return noEstimate<T>(args);
       default: return callHost<T>(host, command, args);
     }
   };
