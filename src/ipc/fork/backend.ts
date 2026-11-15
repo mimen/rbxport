@@ -84,8 +84,6 @@ export function remoteBackend(backend: Backend): Backend {
     ...backend,
     ...Object.fromEntries(DIALOGS.map((name) => [name, refuse])),
     ...preview((message, title) => backend.tell(message, title)),
-    listDevices: () => Promise.resolve([]),
-    onDevicesChanged: () => () => {},
     explorerRoots: () => Promise.resolve([]),
     linkPeers: () => Promise.resolve([]),
     onLinkPeers: () => () => {},
