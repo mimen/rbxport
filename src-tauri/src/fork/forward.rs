@@ -32,7 +32,7 @@ pub struct Forwards(Mutex<HashMap<String, u16>>);
 
 /// Only a `MagicDNS` name, which the CSP allowed before this existed, so a
 /// script in the page cannot use the forward to reach anything else.
-fn tailnet_name(host: &str) -> bool {
+pub(crate) fn tailnet_name(host: &str) -> bool {
     host.len() > ".ts.net".len()
         && host.ends_with(".ts.net")
         && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')

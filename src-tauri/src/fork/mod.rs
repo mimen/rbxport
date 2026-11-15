@@ -3,13 +3,14 @@
 //!
 //! Upstream reaches this through one plugin, registered in `run`. The plugin
 //! starts the server when Serve library is on, and answers the Preferences
-//! pane, and a client's forward to its host and check of it, on the
-//! `rbxfork://` scheme.
+//! pane, a client's forward to its host and check of it, and a client's
+//! USB exports from the host's library, on the `rbxfork://` scheme.
 
 pub mod commands;
 pub mod forward;
 pub mod server;
 pub mod settings;
+pub mod usb;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -60,6 +61,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
                 let response = match request.uri().path() {
                     "/forward" => forward_to(&app, &request),
                     "/reach" => reach(&request).await,
+                    path if path.starts_with("/usb/") => usb::handle(&app, &request).await,
                     _ => preferences(&app, request).await,
                 };
                 responder.respond(response);

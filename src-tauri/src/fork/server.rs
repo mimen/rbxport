@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -32,6 +32,9 @@ use crate::state::AppState;
 /// The header a client names its build in; the WebSocket, which cannot set
 /// headers, sends it as `?v=`.
 pub const VERSION_HEADER: &str = "x-rbxport-version";
+
+/// A stick's manifest names every track on it, so it can outgrow axum's 2 MB default.
+const STICK_FILES_LIMIT: usize = 256 * 1024 * 1024;
 
 pub struct Ctx<R: Runtime> {
     pub app: AppHandle<R>,
@@ -52,12 +55,15 @@ pub fn router<R: Runtime>(ctx: Ctx<R>) -> Router {
     let versioned = Router::new()
         .route("/invoke/{command}", post(invoke::<R>))
         .route("/events", get(events::<R>))
+        .route("/usb/selection", post(super::usb::selection::<R>).layer(DefaultBodyLimit::max(STICK_FILES_LIMIT)))
+        .route("/usb/sync-state", post(super::usb::sync_state::<R>).layer(DefaultBodyLimit::max(STICK_FILES_LIMIT)))
         .route_layer(middleware::from_fn_with_state(ctx.clone(), same_version::<R>));
     Router::new()
         .merge(versioned)
         .route("/version", get(version::<R>))
         .route("/artwork/{track}", get(artwork::<R>))
         .route("/audio/{track}", get(audio::<R>))
+        .route("/usb/file", get(super::usb::file))
         .route_layer(middleware::from_fn_with_state(ctx.clone(), authorized::<R>))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(ctx)
@@ -65,11 +71,11 @@ pub fn router<R: Runtime>(ctx: Ctx<R>) -> Router {
 
 /// A refusal in the shape of upstream's `AppErrorDto`, which the client's
 /// `IpcError` already reads.
-fn refuse(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
+pub(crate) fn refuse(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
     (status, Json(json!({ "kind": kind, "message": message.into() }))).into_response()
 }
 
-fn query_value(uri: &Uri, key: &str) -> Option<String> {
+pub(crate) fn query_value(uri: &Uri, key: &str) -> Option<String> {
     Query::<HashMap<String, String>>::try_from_uri(uri).ok()?.0.remove(key)
 }
 
@@ -377,6 +383,38 @@ mod tests {
         assert_eq!(send(&router, post("/invoke/playlist_tree", LOOPBACK, &[])).await.0, StatusCode::OK, "local tools");
         let query = format!("/invoke/playlist_tree?token={TOKEN}&v={VERSION}");
         assert_eq!(send(&router, post(&query, TAILNET, &[])).await.0, StatusCode::OK, "token in the query");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_usb_file_is_served_only_once_a_selection_listed_it() {
+        let (app, _) = echo_app();
+        let router = router(ctx(&app));
+        let dir = tempfile::tempdir().unwrap();
+        let (listed, unlisted) = (dir.path().join("listed.mp3"), dir.path().join("unlisted.mp3"));
+        std::fs::write(&listed, b"listed audio").unwrap();
+        std::fs::write(&unlisted, b"other audio").unwrap();
+        super::super::usb::serve(listed.clone());
+        let get = |path: &std::path::Path| {
+            let mut request = Request::builder()
+                .uri(format!("/usb/file?path={}", path.display()))
+                .header("authorization", "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfo(TAILNET));
+            request
+        };
+
+        let response = router.clone().oneshot(get(&listed)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()[..], b"listed audio");
+        for refused in [unlisted.as_path(), std::path::Path::new("/etc/passwd")] {
+            let (status, body) = send(&router, get(refused)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{}", refused.display());
+            assert_eq!(body["kind"], "notFound");
+        }
+        let mut no_token = get(&listed);
+        no_token.headers_mut().remove("authorization");
+        assert_eq!(send(&router, no_token).await.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test(flavor = "multi_thread")]
