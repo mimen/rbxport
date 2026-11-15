@@ -75,6 +75,9 @@ if-addrs = "0.15"
 tokio = { version = "1", features = ["macros", "net", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
+# fork: remote-usb (src-tauri/src/fork/usb.rs): a client fetches the host's files over plain http on the tailnet
+ureq = { version = "3", default-features = false }
+filetime = "0.2"
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }

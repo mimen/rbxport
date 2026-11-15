@@ -1340,7 +1340,7 @@ fn held_on_stick(state: &AppState, library: &rbl_index::Library, stick: &std::pa
 
 /// What Export Playlist / Export Folder writes to `stick`: what it already
 /// holds, then `chosen` (a playlist or a folder) after it.
-fn playlist_export_selection(
+pub(crate) fn playlist_export_selection( // fork: remote-usb
     state: &AppState,
     library: &rbl_index::Library,
     share: &std::path::Path,
@@ -1642,7 +1642,7 @@ pub async fn export_tracks_to_device<R: tauri::Runtime>(
 
 /// What Export Track writes to `stick`: what it already holds, with
 /// `tracks` added in no playlist.
-fn track_export_selection(
+pub(crate) fn track_export_selection( // fork: remote-usb
     state: &AppState,
     library: &rbl_index::Library,
     share: &std::path::Path,
@@ -2120,15 +2120,15 @@ static EXPORT_CACHE: std::sync::LazyLock<rbl_export::cache::PreparationCache> = 
 });
 static NEXT_EXPORT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-struct ExportReservation<R: tauri::Runtime> {
+pub(crate) struct ExportReservation<R: tauri::Runtime> { // fork: remote-usb
     app: tauri::AppHandle<R>, path: String, id: String,
-    cancel: Arc<std::sync::atomic::AtomicBool>, started: std::time::Instant,
-    volume: Option<rbl_core::durable::VolumeIdentity>,
-    verify_all: bool,
+    pub(crate) cancel: Arc<std::sync::atomic::AtomicBool>, started: std::time::Instant, // fork: remote-usb
+    pub(crate) volume: Option<rbl_core::durable::VolumeIdentity>, // fork: remote-usb
+    pub(crate) verify_all: bool, // fork: remote-usb
 }
 
 impl<R: tauri::Runtime> ExportReservation<R> {
-    fn check(&self, destination: &std::path::Path) -> AppResult<()> {
+    pub(crate) fn check(&self, destination: &std::path::Path) -> AppResult<()> { // fork: remote-usb
         if self.cancel.load(std::sync::atomic::Ordering::Relaxed) { return Err(AppError::new(ErrorKind::Cancelled, "Export cancelled.")); }
         self.volume.as_ref().ok_or_else(|| AppError::internal("The export has finished."))?
             .check(destination).map_err(|e| AppError::new(ErrorKind::NotFound, e.to_string()))
@@ -2153,7 +2153,7 @@ impl<R: tauri::Runtime> Drop for ExportReservation<R> {
     }
 }
 
-fn reserve_export<R: tauri::Runtime>(app: &tauri::AppHandle<R>, destination: &std::path::Path) -> AppResult<ExportReservation<R>> {
+pub(crate) fn reserve_export<R: tauri::Runtime>(app: &tauri::AppHandle<R>, destination: &std::path::Path) -> AppResult<ExportReservation<R>> { // fork: remote-usb
     if rbl_db::is_rekordbox_app_running() { return Err(AppError::new(ErrorKind::ReadOnly, "Quit rekordbox before syncing this USB.")); }
     if !destination.is_dir() {
         return Err(AppError::new(ErrorKind::NotFound, "That device is no longer connected. It may have been unplugged or renamed."));
@@ -2176,7 +2176,7 @@ fn reserve_export<R: tauri::Runtime>(app: &tauri::AppHandle<R>, destination: &st
     Ok(ExportReservation { app: app.clone(), path, id, cancel, started: std::time::Instant::now(), volume: Some(volume), verify_all: false })
 }
 
-fn set_export_stage<R: tauri::Runtime>(app: &tauri::AppHandle<R>, destination: &std::path::Path, state: &'static str) {
+pub(crate) fn set_export_stage<R: tauri::Runtime>(app: &tauri::AppHandle<R>, destination: &std::path::Path, state: &'static str) { // fork: remote-usb
     let path = destination.to_string_lossy().into_owned();
     let progress = if let Ok(mut jobs) = EXPORT_PROGRESS.lock() {
         if let Some(job) = jobs.get_mut(&path) {
@@ -2192,7 +2192,7 @@ fn set_export_stage<R: tauri::Runtime>(app: &tauri::AppHandle<R>, destination: &
     if let Some(progress) = progress { let _ = tauri::Emitter::emit(app, "export:progress", progress); }
 }
 
-fn set_export_failure<R: tauri::Runtime>(
+pub(crate) fn set_export_failure<R: tauri::Runtime>( // fork: remote-usb
     app: &tauri::AppHandle<R>,
     destination: &std::path::Path,
     message: String,
@@ -2301,7 +2301,7 @@ fn disconnected_during_export(destination: &std::path::Path, error: AppError) ->
     .with_detail(detail)
 }
 
-fn write_export_registered<R: tauri::Runtime>(
+pub(crate) fn write_export_registered<R: tauri::Runtime>( // fork: remote-usb
     app: &tauri::AppHandle<R>,
     destination: &std::path::Path,
     selection: &ExportSelection,
