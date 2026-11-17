@@ -12,7 +12,7 @@ use std::path::Path;
 use crate::manifest::{track_key, Manifest};
 use crate::snapshot::Snapshot;
 use crate::{
-    in_place_paths, owns_library_file, path_key, previous_in_place, source_stamp, under,
+    in_place_paths, owns_library_file, path_key, previous_in_place, same_file, source_stamp, under,
     CompatibilityFormat, SourceTrack,
 };
 
@@ -120,6 +120,14 @@ pub(crate) fn estimate_inspected(
         if on_stick.get(index).is_some_and(Option::is_some) {
             result.tracks_kept += 1;
             result.actions.insert(key, AudioAction::InPlace);
+            continue;
+        }
+        // fork: estimate-retained. A track carried from the stick whose file is still at its own path,
+        // which the sync keeps as it is (`retained_audio` in the export).
+        if track.device.as_ref().is_some_and(|d| d.preserve && same_file(&track.source_path, &under(destination, &d.audio))) {
+            result.tracks_kept += 1;
+            result.reuse_bytes += size;
+            result.actions.insert(key, AudioAction::Reuse);
             continue;
         }
         let conversion = compatibility

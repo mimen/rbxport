@@ -39,6 +39,8 @@ Upstream releases from `dev`, tags each release `vX.Y.Z`, and fast-forwards `mai
 | `src-tauri/Cargo.toml` | Server mode: axum, tokio, tower, tower-http and if-addrs for the library server; ureq and filetime for Remote USB's downloads |
 | `Cargo.lock` | The server's and Remote USB's dependencies |
 | `src-tauri/src/commands.rs` | Remote USB: `pub(crate)` on the selection builders, `reserve_export`, `ExportReservation` and the fields and check it uses, `write_export_registered`, `set_export_stage`, `set_export_failure` |
+| `crates/rbl-export/src/estimate.rs` | Upstream fix carried: a track carried from the stick whose file is still at its own path counts as kept, not copied, as the export already treats it (`retained_audio`). Without it the first sync of a stick rekordbox exported asks for space for every track already on it |
+| `crates/rbl-export/tests/rekordbox_stick.rs` | The test for that fix |
 | `src/ipc/invoke.ts` | Server mode: `tauriInvoke` wraps its function in `withRemote` |
 | `src/ipc/client.ts` | Server mode: `subscribe` takes host events, `getBackend` wraps the backend, native drag-out off on a client |
 | `src/ipc/artwork.ts` | Server mode: artwork from the host on a client |

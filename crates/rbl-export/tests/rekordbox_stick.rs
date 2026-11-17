@@ -656,3 +656,19 @@ fn valid_zero_and_positive_bpm_still_sync() {
         }
     }
 }
+
+#[test]
+fn the_tracks_a_rekordbox_stick_keeps_are_not_counted_as_copies() {
+    let (src, dest) = (tempfile::tempdir().unwrap(), common::stick());
+    exported_elsewhere(src.path(), dest.path(), 4, DB_ID);
+    let tracks = vec![track(src.path(), 5, 0)];
+    let playlists = vec![SourcePlaylist { id: 20, name: "New".into(), track_indices: vec![0], ..Default::default() }];
+    let options = rbl_export::ExportOptions { sync: Some(&sync(DB_ID)), ..Default::default() };
+
+    let plan = rbl_export::plan::preview(dest.path(), &tracks, &playlists, &[], &options).unwrap();
+    assert_eq!(plan.tracks.len(), 5, "the stick's own four tracks are carried");
+    assert_eq!((plan.estimate.copy_bytes, plan.estimate.tracks_new), (2048, 1), "only the selected track is copied: {:?}", plan.estimate);
+
+    let report = sync_to(dest.path(), &tracks, &playlists, DB_ID).unwrap();
+    assert_eq!(report.bytes_copied, 2048);
+}
